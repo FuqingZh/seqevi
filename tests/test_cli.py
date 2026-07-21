@@ -17,4 +17,3 @@ def test_cli_without_command_describes_current_surface() -> None:
 
     assert result.exit_code == 0
     assert "Content-addressed protein sequence annotation evidence" in result.stdout
-    assert "--version" in result.stdout

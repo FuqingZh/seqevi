@@ -13,13 +13,11 @@ jobs:
         python-version: ["3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+      - uses: actions/checkout@v7
       - uses: pdm-project/setup-pdm@v4
         with:
           version: 2.26.9
+          python-version: ${{ matrix.python-version }}
           cache: true
       - run: pdm install --frozen-lockfile -G dev
       - run: pdm run check
