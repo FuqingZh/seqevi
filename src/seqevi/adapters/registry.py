@@ -10,6 +10,7 @@ from typing import NoReturn
 from seqevi.errors import AdapterUnavailableError
 
 from .base import AnnotationAdapter
+from .interpro_pfam import InterProPfamAdapter
 
 
 class AdapterName(StrEnum):
@@ -31,12 +32,16 @@ class AdapterConfiguration:
 def create_adapter(configuration: AdapterConfiguration) -> AnnotationAdapter:
     """Create an official adapter implemented by the installed release."""
 
-    phase = 3 if configuration.name is AdapterName.INTERPRO_PFAM else 4
-    _raise_unavailable(configuration.name, phase)
+    if configuration.name is AdapterName.INTERPRO_PFAM:
+        return InterProPfamAdapter(
+            executable=configuration.executable,
+            database=configuration.database,
+        )
+    _raise_unavailable(configuration.name, 4)
 
 
 def _raise_unavailable(name: AdapterName, phase: int) -> NoReturn:
     raise AdapterUnavailableError(
         f"adapter {name.value!r} is declared for v1 but is implemented in Phase "
-        f"{phase}; this Phase 2 release provides the runner and package contract"
+        f"{phase}; it is not implemented in this release"
     )

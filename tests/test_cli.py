@@ -42,7 +42,7 @@ def test_annotate_help_uses_concrete_external_input_names() -> None:
     assert "_resolve_executable" not in result.stdout
 
 
-def test_annotate_cli_runs_injected_phase_two_adapter(
+def test_annotate_cli_runs_injected_adapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fasta = tmp_path / "proteins.fasta"
@@ -87,7 +87,7 @@ def test_annotate_cli_runs_injected_phase_two_adapter(
     assert (output / "datapackage.json").is_file()
 
 
-def test_declared_adapter_reports_its_unimplemented_phase(tmp_path: Path) -> None:
+def test_eggnog_adapter_reports_its_unimplemented_phase(tmp_path: Path) -> None:
     fasta = tmp_path / "proteins.fasta"
     fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
     executable = write_fixture_tool(tmp_path / "fixture-tool")
@@ -98,7 +98,7 @@ def test_declared_adapter_reports_its_unimplemented_phase(tmp_path: Path) -> Non
         [
             "annotate",
             "--adapter",
-            "interpro-pfam",
+            "eggnog",
             "--fasta",
             str(fasta),
             "--store",
@@ -113,5 +113,5 @@ def test_declared_adapter_reports_its_unimplemented_phase(tmp_path: Path) -> Non
     )
 
     assert result.exit_code == 1
-    assert "implemented in Phase 3" in result.stderr
+    assert "implemented in Phase 4" in result.stderr
     assert not (tmp_path / "store").exists()

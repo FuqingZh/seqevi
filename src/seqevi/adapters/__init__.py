@@ -6,6 +6,12 @@ from .base import (
     AdapterSequenceResult,
     AnnotationAdapter,
 )
+from .interpro_pfam import (
+    ADAPTER_CONTRACT_VERSION,
+    INTERPRO_PFAM_EVIDENCE_SCHEMA,
+    InterProPfamAdapter,
+    InterProPfamParameters,
+)
 from .registry import AdapterConfiguration, AdapterName, create_adapter
 
 __all__ = [
@@ -15,5 +21,9 @@ __all__ = [
     "AdapterName",
     "AdapterSequenceResult",
     "AnnotationAdapter",
+    "ADAPTER_CONTRACT_VERSION",
+    "INTERPRO_PFAM_EVIDENCE_SCHEMA",
+    "InterProPfamAdapter",
+    "InterProPfamParameters",
     "create_adapter",
 ]

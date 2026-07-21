@@ -10,15 +10,15 @@ result package for the current FASTA.
 
 ## Status
 
-The target architecture and v1 contracts are approved. Phases 1 and 2 now
-implement strict protein sequence identity, the single-host SQLite/POSIX Store,
-the external tool runner, exact cache-miss orchestration, and atomic Data Package
+The target architecture and v1 contracts are approved. Phases 1 and 2 implement
+strict protein sequence identity, the single-host SQLite/POSIX Store, the
+external tool runner, exact cache-miss orchestration, and atomic Data Package
 materialization.
 
-The `annotate` command is implemented and fixture-tested, but the official
-`interpro-pfam` and `eggnog` adapters are Phase 3 and Phase 4 work. The shared
-Store service is also not implemented yet. The examples below show the frozen
-public command shape for those adapters.
+The Phase 3 `interpro-pfam` adapter is implemented with native InterProScan TSV
+validation and fixture parity coverage. Acceptance against the official
+InterProScan 5.77-108.0 runtime and data package is still required before Phase
+3 is closed. The `eggnog` adapter and shared Store service are not implemented.
 
 ## Why SeqEvi
 
@@ -55,7 +55,7 @@ seqevi annotate \
   --store https://seqevi.example.org \
   --output results/pfam \
   --executable /opt/interproscan/interproscan.sh \
-  --database /data/interproscan-5.77-108.0
+  --database /data/interproscan-5.77-108.0/data
 ```
 
 Shared deployments expose the same Store contract:
