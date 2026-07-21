@@ -15,10 +15,10 @@ strict protein sequence identity, the single-host SQLite/POSIX Store, the
 external tool runner, exact cache-miss orchestration, and atomic Data Package
 materialization.
 
-The Phase 3 `interpro-pfam` adapter is implemented with native InterProScan TSV
-validation and fixture parity coverage. Acceptance against the official
-InterProScan 5.77-108.0 runtime and data package is still required before Phase
-3 is closed. The `eggnog` adapter and shared Store service are not implemented.
+The `interpro-pfam` and eggNOG-mapper 2.x `eggnog` adapters are implemented with
+native-output validation and fixture parity coverage. Acceptance against the
+official external runtimes and databases is still required before their
+scientific parity gates are closed. The shared Store service is not implemented.
 
 ## Why SeqEvi
 
@@ -45,7 +45,7 @@ seqevi annotate \
   --store /data/seqevi-store \
   --output results/eggnog \
   --executable /opt/eggnog-mapper/emapper.py \
-  --database /data/eggnog
+  --database /data/eggnog-5.0.2
 ```
 
 ```bash

@@ -10,6 +10,7 @@ from typing import NoReturn
 from seqevi.errors import AdapterUnavailableError
 
 from .base import AnnotationAdapter
+from .eggnog import EggnogAdapter
 from .interpro_pfam import InterProPfamAdapter
 
 
@@ -34,6 +35,11 @@ def create_adapter(configuration: AdapterConfiguration) -> AnnotationAdapter:
 
     if configuration.name is AdapterName.INTERPRO_PFAM:
         return InterProPfamAdapter(
+            executable=configuration.executable,
+            database=configuration.database,
+        )
+    if configuration.name is AdapterName.EGGNOG:
+        return EggnogAdapter(
             executable=configuration.executable,
             database=configuration.database,
         )

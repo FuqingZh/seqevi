@@ -6,6 +6,11 @@ from .base import (
     AdapterSequenceResult,
     AnnotationAdapter,
 )
+from .eggnog import (
+    EGGNOG_EVIDENCE_SCHEMA,
+    EggnogAdapter,
+    EggnogParameters,
+)
 from .interpro_pfam import (
     ADAPTER_CONTRACT_VERSION,
     INTERPRO_PFAM_EVIDENCE_SCHEMA,
@@ -21,6 +26,9 @@ __all__ = [
     "AdapterName",
     "AdapterSequenceResult",
     "AnnotationAdapter",
+    "EGGNOG_EVIDENCE_SCHEMA",
+    "EggnogAdapter",
+    "EggnogParameters",
     "ADAPTER_CONTRACT_VERSION",
     "INTERPRO_PFAM_EVIDENCE_SCHEMA",
     "InterProPfamAdapter",

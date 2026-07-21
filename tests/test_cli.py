@@ -85,33 +85,3 @@ def test_annotate_cli_runs_injected_adapter(
     assert result.exit_code == 0, result.output
     assert "1 unique sequences (0 cached, 1 computed)" in result.stdout
     assert (output / "datapackage.json").is_file()
-
-
-def test_eggnog_adapter_reports_its_unimplemented_phase(tmp_path: Path) -> None:
-    fasta = tmp_path / "proteins.fasta"
-    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
-    executable = write_fixture_tool(tmp_path / "fixture-tool")
-    database = write_fixture_database(tmp_path / "database")
-
-    result = runner.invoke(
-        app,
-        [
-            "annotate",
-            "--adapter",
-            "eggnog",
-            "--fasta",
-            str(fasta),
-            "--store",
-            str(tmp_path / "store"),
-            "--output",
-            str(tmp_path / "output"),
-            "--executable",
-            str(executable),
-            "--database",
-            str(database),
-        ],
-    )
-
-    assert result.exit_code == 1
-    assert "implemented in Phase 4" in result.stderr
-    assert not (tmp_path / "store").exists()
