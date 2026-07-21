@@ -42,6 +42,24 @@ def test_annotate_help_uses_concrete_external_input_names() -> None:
     assert "_resolve_executable" not in result.stdout
 
 
+def test_serve_help_exposes_only_deployment_inputs() -> None:
+    result = runner.invoke(
+        app,
+        ["serve", "--help"],
+        env={"COLUMNS": "200"},
+        terminal_width=200,
+    )
+    compact = "".join(result.stdout.split())
+
+    assert result.exit_code == 0
+    assert "--database-url" in compact
+    assert "--artifacts-dir" in compact
+    assert "--maximum-batch-size" in compact
+    assert "--maximum-artifact-bytes" in compact
+    assert "--adapter" not in result.stdout
+    assert "--fasta" not in result.stdout
+
+
 def test_annotate_cli_runs_injected_adapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

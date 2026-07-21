@@ -19,5 +19,5 @@ jobs:
           version: 2.26.9
           python-version: ${{ matrix.python-version }}
           cache: true
-      - run: pdm install --frozen-lockfile -G dev
+      - run: pdm install --frozen-lockfile -G dev -G server
       - run: pdm run check

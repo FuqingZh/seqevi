@@ -16,7 +16,7 @@ from .adapters import (
 )
 from .annotate import run_annotation
 from .errors import AnnotationError, FastaValidationError, StoreError
-from .store import LocalStore
+from .store import open_evidence_store
 
 app = typer.Typer(
     name="seqevi",
@@ -116,7 +116,7 @@ def annotate_command(
         typer.Option(
             "--store",
             envvar="SEQEVI_STORE",
-            help="Local evidence Store path.",
+            help="Local Store path or shared Store HTTP(S) URL.",
         ),
     ] = None,
     timeout_seconds: Annotated[
@@ -138,12 +138,12 @@ def annotate_command(
                 database=database,
             )
         )
-        with LocalStore.open(store) as local_store:
+        with open_evidence_store(store) as evidence_store:
             summary = run_annotation(
                 fasta_path=fasta,
                 output_dir=output,
                 adapter=configured_adapter,
-                store=local_store,
+                store=evidence_store,
                 timeout_seconds=timeout_seconds,
             )
     except (AnnotationError, FastaValidationError, StoreError) as error:
@@ -155,6 +155,67 @@ def annotate_command(
         f"({summary.cache_hits} cached, {summary.computed} computed); "
         f"output: {summary.output_dir}"
     )
+
+
+@app.command("serve")
+def serve_command(
+    database_url: Annotated[
+        str,
+        typer.Option(
+            "--database-url",
+            envvar="SEQEVI_DATABASE_URL",
+            help="PostgreSQL SQLAlchemy URL for shared metadata.",
+        ),
+    ],
+    artifacts_dir: Annotated[
+        Path,
+        typer.Option(
+            "--artifacts-dir",
+            envvar="SEQEVI_ARTIFACTS_DIR",
+            file_okay=False,
+            dir_okay=True,
+            writable=True,
+            resolve_path=True,
+            help="Writable POSIX directory for content-addressed artifacts.",
+        ),
+    ],
+    host: Annotated[
+        str,
+        typer.Option("--host", help="HTTP bind address."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", min=1, max=65535, help="HTTP bind port."),
+    ] = 8000,
+    maximum_batch_size: Annotated[
+        int,
+        typer.Option("--maximum-batch-size", min=1, max=10000),
+    ] = 1000,
+    maximum_artifact_bytes: Annotated[
+        int,
+        typer.Option("--maximum-artifact-bytes", min=1),
+    ] = 512 * 1024 * 1024,
+) -> None:
+    """Run the passive PostgreSQL/POSIX shared Store service."""
+
+    try:
+        import uvicorn
+
+        from .service import ServiceSettings, create_service_app
+
+        settings = ServiceSettings(
+            database_url=database_url,
+            artifacts_dir=artifacts_dir,
+            maximum_batch_size=maximum_batch_size,
+            maximum_artifact_bytes=maximum_artifact_bytes,
+        )
+        uvicorn.run(create_service_app(settings), host=host, port=port)
+    except ImportError as error:
+        typer.echo(
+            "Error: shared Store dependencies are missing; install seqevi[server]",
+            err=True,
+        )
+        raise typer.Exit(code=1) from error
 
 
 def main() -> None:

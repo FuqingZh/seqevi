@@ -1,0 +1,184 @@
+"""Versioned HTTP transport models for the shared evidence Store."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from seqevi.evidence import (
+    ArtifactPayload,
+    CommitOutcome,
+    EvidenceCommit,
+    EvidenceKey,
+    EvidenceQuery,
+    EvidenceRecord,
+    EvidenceStatus,
+)
+from seqevi.sequence import SequenceIdentity
+
+Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+SequenceId = Annotated[str, Field(pattern=r"^SQ\.[A-Za-z0-9_-]{32}$")]
+
+
+class TransportModel(BaseModel):
+    """Strict base for the public Store wire contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SequenceModel(TransportModel):
+    sequence_id: SequenceId
+    md5: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    length: Annotated[int, Field(gt=0)]
+    sequence: str
+
+    @classmethod
+    def from_domain(cls, value: SequenceIdentity) -> SequenceModel:
+        return cls(
+            sequence_id=value.sequence_id,
+            md5=value.md5,
+            length=value.length,
+            sequence=value.sequence,
+        )
+
+    def to_domain(self) -> SequenceIdentity:
+        return SequenceIdentity(**self.model_dump())
+
+
+class EvidenceKeyModel(TransportModel):
+    sequence_id: SequenceId
+    adapter_contract_version: str
+    tool_runtime_digest: str
+    resource_id: str
+    semantic_parameters_json: str
+
+    @classmethod
+    def from_domain(cls, value: EvidenceKey) -> EvidenceKeyModel:
+        return cls(
+            sequence_id=value.sequence_id,
+            adapter_contract_version=value.adapter_contract_version,
+            tool_runtime_digest=value.tool_runtime_digest,
+            resource_id=value.resource_id,
+            semantic_parameters_json=value.semantic_parameters_json,
+        )
+
+    def to_domain(self) -> EvidenceKey:
+        return EvidenceKey(**self.model_dump())
+
+
+class EvidenceQueryModel(TransportModel):
+    identity: SequenceModel
+    key: EvidenceKeyModel
+
+    @classmethod
+    def from_domain(cls, value: EvidenceQuery) -> EvidenceQueryModel:
+        return cls(
+            identity=SequenceModel.from_domain(value.identity),
+            key=EvidenceKeyModel.from_domain(value.key),
+        )
+
+    def to_domain(self) -> EvidenceQuery:
+        return EvidenceQuery(self.identity.to_domain(), self.key.to_domain())
+
+
+class ArtifactReferenceModel(TransportModel):
+    digest: Sha256
+    media_type: str
+    byte_size: Annotated[int, Field(ge=0)]
+
+
+class EvidenceRecordModel(TransportModel):
+    key: EvidenceKeyModel
+    status: EvidenceStatus
+    payload_digest: Sha256
+    normalized_artifact_digest: Sha256 | None
+    raw_artifact_digest: Sha256 | None
+    created_at: datetime
+
+    @classmethod
+    def from_domain(cls, value: EvidenceRecord) -> EvidenceRecordModel:
+        return cls(
+            key=EvidenceKeyModel.from_domain(value.key),
+            status=value.status,
+            payload_digest=value.payload_digest,
+            normalized_artifact_digest=value.normalized_artifact_digest,
+            raw_artifact_digest=value.raw_artifact_digest,
+            created_at=value.created_at,
+        )
+
+    def to_domain(self) -> EvidenceRecord:
+        return EvidenceRecord(
+            key=self.key.to_domain(),
+            status=self.status,
+            payload_digest=self.payload_digest,
+            normalized_artifact_digest=self.normalized_artifact_digest,
+            raw_artifact_digest=self.raw_artifact_digest,
+            created_at=self.created_at,
+        )
+
+
+class LookupRequest(TransportModel):
+    queries: list[EvidenceQueryModel]
+
+
+class LookupResponse(TransportModel):
+    records: list[EvidenceRecordModel]
+
+
+class FetchRequest(TransportModel):
+    key: EvidenceKeyModel
+
+
+class FetchResponse(TransportModel):
+    record: EvidenceRecordModel | None
+
+
+class CommitModel(TransportModel):
+    identity: SequenceModel
+    key: EvidenceKeyModel
+    status: EvidenceStatus
+    payload_digest: Sha256
+    normalized_artifact: ArtifactReferenceModel | None
+    raw_artifact: ArtifactReferenceModel | None
+
+    @classmethod
+    def from_domain(cls, value: EvidenceCommit) -> CommitModel:
+        def reference(
+            payload: ArtifactPayload | None,
+        ) -> ArtifactReferenceModel | None:
+            if payload is None:
+                return None
+            return ArtifactReferenceModel(
+                digest=payload.digest,
+                media_type=payload.media_type,
+                byte_size=len(payload.data),
+            )
+
+        return cls(
+            identity=SequenceModel.from_domain(value.identity),
+            key=EvidenceKeyModel.from_domain(value.key),
+            status=value.status,
+            payload_digest=value.payload_digest,
+            normalized_artifact=reference(value.normalized_artifact),
+            raw_artifact=reference(value.raw_artifact),
+        )
+
+
+class CommitRequest(TransportModel):
+    commits: list[CommitModel]
+
+
+class CommitResponse(TransportModel):
+    outcomes: list[CommitOutcome]
+
+
+class ArtifactUploadResponse(TransportModel):
+    status: Literal["created", "existing"]
+    artifact: ArtifactReferenceModel
+
+
+class HealthResponse(TransportModel):
+    status: Literal["ok"] = "ok"
+    api_version: Literal["v1"] = "v1"

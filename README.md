@@ -18,7 +18,9 @@ materialization.
 The `interpro-pfam` and eggNOG-mapper 2.x `eggnog` adapters are implemented with
 native-output validation and fixture parity coverage. Acceptance against the
 official external runtimes and databases is still required before their
-scientific parity gates are closed. The shared Store service is not implemented.
+scientific parity gates are closed. The Phase 5 shared Store service, HTTP
+client, streamed POSIX artifacts, and PostgreSQL persistence are implemented and
+covered by local/shared plus provisioned PostgreSQL integration tests.
 
 ## Why SeqEvi
 
