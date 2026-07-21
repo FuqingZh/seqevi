@@ -1,0 +1,103 @@
+[project]
+name = "seqevi"
+version = "0.1.0"
+description = "Content-addressed, reusable protein sequence annotation evidence."
+authors = [
+    {name = "Fuqing Zhang", email = "fu.qing.zhang.work@gmail.com"},
+    {name = "FuqingZhang", email = "103730099+FuqingZh@users.noreply.github.com"},
+]
+dependencies = [
+    "alembic>=1.18,<2",
+    "biopython>=1.87,<2",
+    "dplib-py>=1.1,<2",
+    "httpx>=0.28,<1",
+    "polars>=1.40,<2",
+    "pydantic>=2.12,<3",
+    "sqlalchemy>=2.0,<3",
+    "typer>=0.27,<1",
+    "cliguards>=0.1.0",
+]
+requires-python = ">=3.12"
+readme = "README.md"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+license = "MIT"
+
+[project.urls]
+Homepage = "https://github.com/FuqingZh/seqevi"
+Repository = "https://github.com/FuqingZh/seqevi"
+Issues = "https://github.com/FuqingZh/seqevi/issues"
+
+[project.scripts]
+seqevi = "seqevi.cli:main"
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.116,<1",
+    "psycopg[binary]>=3.2,<4",
+    "pydantic-settings>=2.10,<3",
+    "uvicorn>=0.35,<1",
+]
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.150,<7",
+    "pyright>=1.1.411,<2",
+    "pytest>=9,<10",
+    "pytest-cov>=7,<8",
+    "pytest-randomly>=4,<5",
+    "pytest-timeout>=2.4,<3",
+    "pytest-xdist>=3.8,<4",
+    "ruff>=0.15,<0.16",
+]
+
+[tool.pdm]
+distribution = true
+
+[tool.pdm.scripts]
+format = "ruff format ."
+format-check = "ruff format --check ."
+lint = "ruff check ."
+typecheck = "pyright"
+test = {cmd = "pytest", env = {PYTHONPATH = "src"}}
+check = {composite = ["format-check", "lint", "typecheck", "test"]}
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.pyright]
+include = ["src", "tests"]
+exclude = [".venv"]
+extraPaths = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = ["-ra", "--import-mode=importlib", "--randomly-seed=42"]
+strict_config = true
+strict_markers = true
+xfail_strict = true
+timeout = 120
+markers = [
+    "requires_postgres: requires a configured PostgreSQL service",
+    "requires_tool(name): requires an external annotation executable",
+    "slow: expected to exceed the normal fast-test budget",
+]

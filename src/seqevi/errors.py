@@ -1,0 +1,45 @@
+"""Domain errors exposed by SeqEvi's core contracts."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class FastaIssue:
+    """One invalid FASTA record discovered during whole-input validation."""
+
+    record_number: int
+    input_id: str | None
+    message: str
+
+    def describe(self) -> str:
+        label = self.input_id if self.input_id is not None else "<missing>"
+        return f"record {self.record_number} ({label}): {self.message}"
+
+
+class FastaValidationError(ValueError):
+    """Raised after collecting all detectable FASTA input defects."""
+
+    def __init__(self, issues: tuple[FastaIssue, ...]) -> None:
+        if not issues:
+            raise ValueError("FastaValidationError requires at least one issue")
+        self.issues = issues
+        detail = "; ".join(issue.describe() for issue in issues)
+        super().__init__(f"FASTA validation failed: {detail}")
+
+
+class StoreError(RuntimeError):
+    """Base class for evidence Store failures."""
+
+
+class StoreConfigurationError(StoreError):
+    """Raised when a Store location is missing or unsupported."""
+
+
+class StoreIntegrityError(StoreError):
+    """Raised when persisted content does not match its immutable identity."""
+
+
+class EvidenceConflictError(StoreIntegrityError):
+    """Raised when one evidence key is associated with different payloads."""
