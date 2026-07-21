@@ -5,7 +5,7 @@
 groups = ["default", "dev"]
 strategy = []
 lock_version = "4.5.0"
-content_hash = "sha256:1e306a0aebda2ca7c97bda30d69e98f2fd43c9d432c791f268c1765972fbaf5c"
+content_hash = "sha256:1c48876a7eb62dcd54e780c89ac10b33410b676349c36a8d80c0ad133d21a8bb"
 
 [[metadata.targets]]
 requires_python = ">=3.12"
@@ -224,15 +224,6 @@ summary = ""
 files = [
     {file = "certifi-2026.6.17-py3-none-any.whl", hash = "sha256:2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db"},
     {file = "certifi-2026.6.17.tar.gz", hash = "sha256:024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432"},
-]
-
-[[package]]
-name = "cliguards"
-version = "0.1.0"
-summary = ""
-files = [
-    {file = "cliguards-0.1.0-py3-none-any.whl", hash = "sha256:ea1341b5e839405f49aaebfd452f2c9b780350fc739fad0414e4c193febfcc96"},
-    {file = "cliguards-0.1.0.tar.gz", hash = "sha256:69b4e207f47149905e1a83ee6cc1ffd4ff051be24a853a2ffecd9fb0c203991d"},
 ]
 
 [[package]]
