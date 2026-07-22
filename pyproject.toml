@@ -79,7 +79,7 @@ target-version = "py312"
 line-length = 88
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "benchmarks"]
 exclude = [".venv"]
 extraPaths = ["src"]
 pythonVersion = "3.12"
