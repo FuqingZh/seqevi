@@ -16,11 +16,15 @@ external tool runner, exact cache-miss orchestration, and atomic Data Package
 materialization.
 
 The `interpro-pfam` and eggNOG-mapper 2.x `eggnog` adapters are implemented with
-native-output validation and fixture parity coverage. Acceptance against the
-official external runtimes and databases is still required before their
-scientific parity gates are closed. The Phase 5 shared Store service, HTTP
-client, streamed POSIX artifacts, and PostgreSQL persistence are implemented and
-covered by local/shared plus provisioned PostgreSQL integration tests.
+native-output validation and fixture parity coverage. The eggNOG adapter also
+passes direct parity against eggNOG-mapper 2.1.13 and eggNOG DB 5.0.2;
+InterProScan official-runtime parity remains pending. The Phase 5 shared Store
+service, HTTP client, streamed POSIX artifacts, and PostgreSQL persistence are
+implemented and covered by local/shared plus provisioned PostgreSQL integration
+tests. Phase 6 resource locks avoid repeated hashing of large immutable database
+files and provide an explicit full-content verification command. Annotation now
+uses atomic FASTA staging, file-backed artifacts, bounded Store batches, lazy
+Parquet materialization, and an operational thread setting.
 
 ## Why SeqEvi
 
@@ -47,7 +51,8 @@ seqevi annotate \
   --store /data/seqevi-store \
   --output results/eggnog \
   --executable /opt/eggnog-mapper/emapper.py \
-  --database /data/eggnog-5.0.2
+  --database /data/eggnog-5.0.2 \
+  --threads 8
 ```
 
 ```bash
@@ -66,6 +71,15 @@ Shared deployments expose the same Store contract:
 seqevi serve \
   --database-url postgresql+psycopg://seqevi@postgres/seqevi \
   --artifacts-dir /data/seqevi-artifacts
+```
+
+Initialize or audit a database resource lock independently of annotation:
+
+```bash
+seqevi resource verify \
+  --adapter eggnog \
+  --executable /opt/eggnog-mapper/emapper.py \
+  --database /data/eggnog-5.0.2
 ```
 
 ## V1 Scope
@@ -91,6 +105,8 @@ Start with [the documentation index](docs/README.md).
 - [Storage and deployment architecture](docs/architecture/20260720-v1.0-storage-deployment-architecture.md)
 - [MVP implementation plan](docs/implementation-plan/20260720-v1.0-mvp-implementation-plan.md)
 - [Validation strategy](docs/testing/20260720-v1.0-validation-strategy.md)
+- [Annotate runtime and bounded-memory plan](docs/implementation-plan/20260722-v1.0-annotate-bounded-memory-plan.md)
+- [Bounded-memory and operational performance](docs/benchmarks/20260722-v1.0-bounded-memory-performance.md)
 
 ## External Tools
 
