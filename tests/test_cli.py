@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
+from rich.text import Text
 from typer.testing import CliRunner
 
 import seqevi.cli
@@ -12,6 +13,10 @@ from seqevi.cli import app
 from .support import FixtureAdapter, write_fixture_database, write_fixture_tool
 
 runner = CliRunner()
+
+
+def _compact_help(text: str) -> str:
+    return "".join(Text.from_ansi(text).plain.split())
 
 
 def test_cli_reports_version() -> None:
@@ -31,17 +36,23 @@ def test_cli_without_command_describes_current_surface() -> None:
 
 
 def test_annotate_help_uses_concrete_external_input_names() -> None:
-    result = runner.invoke(app, ["annotate", "--help"])
+    result = runner.invoke(
+        app,
+        ["annotate", "--help"],
+        env={"COLUMNS": "240"},
+        terminal_width=240,
+    )
+    help_text = _compact_help(result.stdout)
 
     assert result.exit_code == 0
-    assert "--fasta" in result.stdout
-    assert "--executable" in result.stdout
-    assert "--database" in result.stdout
-    assert "--output" in result.stdout
-    assert "--threads" in result.stdout
-    assert "--runtime" not in result.stdout
-    assert "--resource" not in result.stdout
-    assert "_resolve_executable" not in result.stdout
+    assert "--fasta" in help_text
+    assert "--executable" in help_text
+    assert "--database" in help_text
+    assert "--output" in help_text
+    assert "--threads" in help_text
+    assert "--runtime" not in help_text
+    assert "--resource" not in help_text
+    assert "_resolve_executable" not in help_text
 
 
 def test_serve_help_exposes_only_deployment_inputs() -> None:
@@ -51,15 +62,15 @@ def test_serve_help_exposes_only_deployment_inputs() -> None:
         env={"COLUMNS": "200"},
         terminal_width=200,
     )
-    compact = "".join(result.stdout.split())
+    help_text = _compact_help(result.stdout)
 
     assert result.exit_code == 0
-    assert "--database-url" in compact
-    assert "--artifacts-dir" in compact
-    assert "--maximum-batch-size" in compact
-    assert "--maximum-artifact-bytes" in compact
-    assert "--adapter" not in result.stdout
-    assert "--fasta" not in result.stdout
+    assert "--database-url" in help_text
+    assert "--artifacts-dir" in help_text
+    assert "--maximum-batch-size" in help_text
+    assert "--maximum-artifact-bytes" in help_text
+    assert "--adapter" not in help_text
+    assert "--fasta" not in help_text
 
 
 def test_annotate_cli_runs_injected_adapter(
