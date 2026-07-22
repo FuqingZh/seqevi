@@ -5,21 +5,24 @@ from __future__ import annotations
 import csv
 import gzip
 import hashlib
-import io
 import json
 import math
 import re
+import shutil
 import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
 from seqevi.errors import AdapterError
-from seqevi.evidence import ArtifactPayload, EvidenceStatus, sha256_digest
+from seqevi.evidence import ArtifactFile, EvidenceStatus, sha256_digest
+from seqevi.resource_lock import ResourceComponent, resolve_resource_lock
 from seqevi.runner import ToolCommand, ToolRunner, ToolTimeoutError
+from seqevi.runtime_identity import RuntimeComponent, calculate_runtime_digest
 from seqevi.sequence import SequenceIdentity
 
 from .base import AdapterBatchResult, AdapterContract, AdapterSequenceResult
@@ -48,6 +51,7 @@ _PFAM_ACCESSION_PATTERN = re.compile(r"PF\d{5}\Z")
 _INTERPRO_ACCESSION_PATTERN = re.compile(r"IPR\d{6}\Z")
 _TSV_COLUMN_COUNT = 13
 _PROBE_TIMEOUT_SECONDS = 120.0
+_NORMALIZED_ROW_BATCH_SIZE = 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +94,7 @@ class InterProPfamAdapter:
         executable: Path,
         database: Path,
         parameters: InterProPfamParameters | None = None,
+        verify_resource: bool = False,
     ) -> None:
         self.executable = executable.resolve()
         self.database = database.resolve()
@@ -113,9 +118,11 @@ class InterProPfamAdapter:
             version=self.interproscan_version,
         )
         resource_id = _calculate_resource_id(
+            database=self.database,
             interproscan_version=self.interproscan_version,
             pfam_version=pfam_version,
             model_path=model_path,
+            verify=verify_resource,
         )
         self._contract = AdapterContract.from_parameters(
             name="interpro-pfam",
@@ -141,6 +148,7 @@ class InterProPfamAdapter:
         work_dir: Path,
         runner: ToolRunner,
         timeout_seconds: float | None,
+        threads: int,
     ) -> AdapterBatchResult:
         """Run one deterministic cache-miss batch and validate every result."""
 
@@ -169,6 +177,8 @@ class InterProPfamAdapter:
                     "--formats",
                     self.parameters.output_format,
                     "--disable-precalc",
+                    "--cpu",
+                    str(threads),
                     "--outfile",
                     str(raw_path),
                     "--tempdir",
@@ -189,19 +199,23 @@ class InterProPfamAdapter:
         if not raw_path.is_file():
             raise AdapterError("InterProScan did not create its TSV output")
 
-        raw = raw_path.read_bytes()
-        frame = _parse_tsv(raw, identities=identities)
-        normalized = _write_normalized_artifact(frame)
-        hit_ids = set(frame.get_column("SequenceID"))
+        normalized, payload_digest_by_id = _parse_tsv(
+            raw_path,
+            identities=identities,
+            normalized_path=work_dir / "interpro-pfam.normalized.parquet",
+        )
         sequence_results = tuple(
-            _sequence_result(identity, frame=frame, hit_ids=hit_ids)
+            _sequence_result(
+                identity,
+                payload_digest=payload_digest_by_id.get(identity.sequence_id),
+            )
             for identity in sorted(identities, key=lambda item: item.sequence_id)
         )
         return AdapterBatchResult(
             sequences=sequence_results,
-            raw_artifact=ArtifactPayload(
-                gzip.compress(raw, mtime=0),
-                "application/gzip",
+            raw_artifact=_gzip_artifact(
+                raw_path,
+                work_dir / "interpro-pfam.tsv.gz",
             ),
             normalized_artifact=normalized,
         )
@@ -340,28 +354,22 @@ def _calculate_runtime_digest(
     if not hmmer_files:
         raise AdapterError(f"InterProScan HMMER directory is empty: {hmmer_dir}")
 
-    components = [
-        ("interproscan.sh", _file_sha256(executable)),
-        ("interproscan-5.jar", _file_sha256(jar_path)),
-    ]
-    components.extend(
-        (
-            f"hmmer/{path.relative_to(hmmer_dir).as_posix()}",
-            _file_sha256(path),
-        )
-        for path in hmmer_files
+    components = (
+        RuntimeComponent("launcher", executable),
+        RuntimeComponent("interproscan-5.jar", jar_path),
+        *(
+            RuntimeComponent(
+                f"hmmer/{path.relative_to(hmmer_dir).as_posix()}",
+                path,
+            )
+            for path in hmmer_files
+        ),
     )
-    identity = {
-        "components": components,
-        "interproscan_version": version,
-    }
-    encoded = json.dumps(
-        identity,
-        ensure_ascii=True,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return sha256_digest(encoded)
+    return calculate_runtime_digest(
+        runtime_name="interproscan-pfam",
+        versions={"interproscan": version},
+        components=components,
+    )
 
 
 def _resolve_install_path(
@@ -387,18 +395,27 @@ def _resolve_install_path(
 
 
 def _calculate_resource_id(
-    *, interproscan_version: str, pfam_version: str, model_path: Path
+    *,
+    database: Path,
+    interproscan_version: str,
+    pfam_version: str,
+    model_path: Path,
+    verify: bool = False,
 ) -> str:
     interpro_release = interproscan_version.split("-", maxsplit=1)[1]
+    component_name = "pfam-model"
+    relative_path = model_path.relative_to(database).as_posix()
+    locked = resolve_resource_lock(
+        database=database,
+        resource_name="interpro",
+        resource_version=interpro_release,
+        components=(ResourceComponent(component_name, relative_path),),
+        verify=verify,
+    )
     return (
         f"interpro/{interpro_release}/pfam/{pfam_version}/"
-        f"sha256:{_file_sha256(model_path)}"
+        f"sha256:{locked.hash_for(component_name)}"
     )
-
-
-def _file_sha256(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _write_runtime_properties(*, source: Path, target: Path, database: Path) -> None:
@@ -421,46 +438,120 @@ def _write_runtime_properties(*, source: Path, target: Path, database: Path) -> 
     target.write_text("\n".join(output) + "\n", encoding="utf-8")
 
 
-def _parse_tsv(raw: bytes, *, identities: tuple[SequenceIdentity, ...]) -> pl.DataFrame:
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise AdapterError(f"InterProScan TSV is not valid UTF-8: {error}") from error
-
+def _parse_tsv(
+    path: Path,
+    *,
+    identities: tuple[SequenceIdentity, ...],
+    normalized_path: Path,
+) -> tuple[ArtifactFile | None, dict[str, str]]:
     expected = {identity.sequence_id: identity for identity in identities}
     rows: list[dict[str, object]] = []
     seen_rows: set[tuple[object, ...]] = set()
-    reader = csv.reader(io.StringIO(text), delimiter="\t")
-    for line_number, fields in enumerate(reader, start=1):
-        if not fields or fields == [""]:
+    with tempfile.TemporaryDirectory(
+        prefix=".interpro-pfam-normalized-", dir=normalized_path.parent
+    ) as raw_parts_dir:
+        parts_dir = Path(raw_parts_dir)
+        part_paths: list[Path] = []
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.reader(handle, delimiter="\t")
+                for line_number, fields in enumerate(reader, start=1):
+                    if not fields or fields == [""]:
+                        raise AdapterError(
+                            "InterProScan TSV contains a blank row at line "
+                            f"{line_number}"
+                        )
+                    if len(fields) != _TSV_COLUMN_COUNT:
+                        raise AdapterError(
+                            f"InterProScan TSV line {line_number} has "
+                            f"{len(fields)} columns; expected {_TSV_COLUMN_COUNT}"
+                        )
+                    row = _parse_tsv_row(
+                        fields, line_number=line_number, expected=expected
+                    )
+                    row_key = tuple(
+                        row[column] for column in INTERPRO_PFAM_EVIDENCE_SCHEMA
+                    )
+                    if row_key in seen_rows:
+                        raise AdapterError(
+                            "InterProScan TSV contains a duplicate match at line "
+                            f"{line_number}"
+                        )
+                    seen_rows.add(row_key)
+                    rows.append(row)
+                    if len(rows) >= _NORMALIZED_ROW_BATCH_SIZE:
+                        part_paths.append(_write_normalized_part(rows, parts_dir))
+                        rows.clear()
+        except UnicodeDecodeError as error:
             raise AdapterError(
-                f"InterProScan TSV contains a blank row at line {line_number}"
-            )
-        if len(fields) != _TSV_COLUMN_COUNT:
-            raise AdapterError(
-                f"InterProScan TSV line {line_number} has {len(fields)} columns; "
-                f"expected {_TSV_COLUMN_COUNT}"
-            )
-        row = _parse_tsv_row(fields, line_number=line_number, expected=expected)
-        row_key = tuple(row[column] for column in INTERPRO_PFAM_EVIDENCE_SCHEMA)
-        if row_key in seen_rows:
-            raise AdapterError(
-                f"InterProScan TSV contains a duplicate match at line {line_number}"
-            )
-        seen_rows.add(row_key)
-        rows.append(row)
+                f"InterProScan TSV is not valid UTF-8: {error}"
+            ) from error
 
-    frame = pl.DataFrame(rows, schema=INTERPRO_PFAM_EVIDENCE_SCHEMA)
-    if frame.is_empty():
-        return frame
-    return frame.sort(
-        "SequenceID",
-        "Start",
-        "Stop",
-        "SignatureAccession",
-        "Score",
-        nulls_last=True,
+        if rows:
+            part_paths.append(_write_normalized_part(rows, parts_dir))
+        if not part_paths:
+            return None, {}
+        normalized = pl.concat([pl.scan_parquet(part) for part in part_paths]).sort(
+            "SequenceID",
+            "Start",
+            "Stop",
+            "SignatureAccession",
+            "Score",
+            nulls_last=True,
+        )
+        payload_digest_by_id = _payload_digests(normalized)
+        normalized.sink_parquet(
+            normalized_path, compression="zstd", maintain_order=True
+        )
+    return (
+        ArtifactFile.from_path(normalized_path, "application/vnd.apache.parquet"),
+        payload_digest_by_id,
     )
+
+
+def _write_normalized_part(rows: list[dict[str, object]], directory: Path) -> Path:
+    path = directory / f"part-{len(tuple(directory.iterdir())):06d}.parquet"
+    pl.DataFrame(rows, schema=INTERPRO_PFAM_EVIDENCE_SCHEMA).write_parquet(path)
+    return path
+
+
+def _payload_digests(frame: pl.LazyFrame) -> dict[str, str]:
+    digests: dict[str, str] = {}
+    current_sequence_id: str | None = None
+    current_hasher: Any | None = None
+    row_index = 0
+    for batch in frame.collect_batches(
+        chunk_size=_NORMALIZED_ROW_BATCH_SIZE,
+        engine="streaming",
+    ):
+        for row in batch.iter_rows(named=True):
+            sequence_id = str(row["SequenceID"])
+            if sequence_id != current_sequence_id:
+                if current_sequence_id is not None and current_hasher is not None:
+                    current_hasher.update(b"]")
+                    digests[current_sequence_id] = current_hasher.hexdigest()
+                current_sequence_id = sequence_id
+                current_hasher = hashlib.sha256()
+                current_hasher.update(b"[")
+                row_index = 0
+            if current_hasher is None:
+                raise AssertionError("payload digest state was not initialized")
+            if row_index:
+                current_hasher.update(b",")
+            current_hasher.update(
+                json.dumps(
+                    row,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            row_index += 1
+    if current_sequence_id is not None and current_hasher is not None:
+        current_hasher.update(b"]")
+        digests[current_sequence_id] = current_hasher.hexdigest()
+    return digests
 
 
 def _parse_tsv_row(
@@ -578,21 +669,22 @@ def _optional_text(value: str) -> str | None:
     return None if value == "-" else value
 
 
-def _write_normalized_artifact(frame: pl.DataFrame) -> ArtifactPayload | None:
-    if frame.is_empty():
-        return None
-    buffer = io.BytesIO()
-    frame.write_parquet(buffer, compression="zstd")
-    return ArtifactPayload(buffer.getvalue(), "application/vnd.apache.parquet")
+def _gzip_artifact(source: Path, target: Path) -> ArtifactFile:
+    with (
+        source.open("rb") as source_handle,
+        target.open("wb") as target_handle,
+        gzip.GzipFile(fileobj=target_handle, mode="wb", mtime=0) as compressed,
+    ):
+        shutil.copyfileobj(source_handle, compressed)
+    return ArtifactFile.from_path(target, "application/gzip")
 
 
 def _sequence_result(
     identity: SequenceIdentity,
     *,
-    frame: pl.DataFrame,
-    hit_ids: set[str],
+    payload_digest: str | None,
 ) -> AdapterSequenceResult:
-    if identity.sequence_id not in hit_ids:
+    if payload_digest is None:
         payload = json.dumps(
             {"SequenceID": identity.sequence_id, "Status": "no_hit"},
             ensure_ascii=True,
@@ -605,16 +697,8 @@ def _sequence_result(
             payload_digest=sha256_digest(payload),
         )
 
-    rows = frame.filter(pl.col("SequenceID") == identity.sequence_id).to_dicts()
-    payload = json.dumps(
-        rows,
-        ensure_ascii=True,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
     return AdapterSequenceResult(
         sequence_id=identity.sequence_id,
         status=EvidenceStatus.HIT,
-        payload_digest=sha256_digest(payload),
+        payload_digest=payload_digest,
     )

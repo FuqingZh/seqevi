@@ -12,16 +12,19 @@ from seqevi.errors import (
     StoreIntegrityError,
 )
 from seqevi.evidence import (
-    ArtifactPayload,
+    ArtifactFile,
     CommitOutcome,
     EvidenceCommit,
     EvidenceKey,
     EvidenceQuery,
     EvidenceStatus,
+    StoredArtifact,
     sha256_digest,
 )
 from seqevi.sequence import SequenceIdentity, identify_protein_sequence
 from seqevi.store import LocalStore, resolve_store_path
+
+from .support import write_artifact_file
 
 
 def make_key(
@@ -41,19 +44,27 @@ def make_key(
 def make_hit_commit(
     sequence: str,
     *,
+    artifact_dir: Path,
     result: bytes | None = None,
     resource_id: str = "fixture-db/1",
 ) -> EvidenceCommit:
     identity = identify_protein_sequence(sequence)
     result_bytes = result or f"result:{identity.sequence_id}".encode()
+    digest = sha256_digest(result_bytes)
     return EvidenceCommit(
         identity=identity,
         key=make_key(identity, resource_id=resource_id),
         status=EvidenceStatus.HIT,
         payload_digest=sha256_digest(result_bytes),
-        normalized_artifact=ArtifactPayload(result_bytes, "application/x-parquet"),
-        raw_artifact=ArtifactPayload(
-            b"raw:" + result_bytes, "text/tab-separated-values"
+        normalized_artifact=write_artifact_file(
+            artifact_dir / f"{digest}.parquet",
+            result_bytes,
+            "application/x-parquet",
+        ),
+        raw_artifact=write_artifact_file(
+            artifact_dir / f"{digest}.raw.tsv",
+            b"raw:" + result_bytes,
+            "text/tab-separated-values",
         ),
     )
 
@@ -86,7 +97,7 @@ def test_local_store_initializes_migrated_wal_database(tmp_path: Path) -> None:
 
 
 def test_commit_lookup_and_fetch_hit_evidence(tmp_path: Path) -> None:
-    commit = make_hit_commit("MPEPTIDE")
+    commit = make_hit_commit("MPEPTIDE", artifact_dir=tmp_path / "sources")
 
     with LocalStore.open(tmp_path / "store") as store:
         assert store.commit_many((commit,)) == (CommitOutcome.CREATED,)
@@ -100,9 +111,42 @@ def test_commit_lookup_and_fetch_hit_evidence(tmp_path: Path) -> None:
     assert fetched is not None
     assert commit.normalized_artifact is not None
     assert commit.raw_artifact is not None
-    assert fetched.normalized_artifact == commit.normalized_artifact.data
-    assert fetched.raw_artifact == commit.raw_artifact.data
+    assert fetched.normalized_artifact is not None
+    assert fetched.raw_artifact is not None
+    assert fetched.normalized_artifact.path.read_bytes() == (
+        commit.normalized_artifact.path.read_bytes()
+    )
+    assert fetched.raw_artifact.path.read_bytes() == (
+        commit.raw_artifact.path.read_bytes()
+    )
     assert persisted_sequence == commit.identity
+
+
+def test_fetch_many_reads_each_shared_artifact_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = make_hit_commit(
+        "MPEPTIDE", artifact_dir=tmp_path / "sources", result=b"shared-result"
+    )
+    second = make_hit_commit(
+        "MSEQUENCE", artifact_dir=tmp_path / "sources", result=b"shared-result"
+    )
+
+    with LocalStore.open(tmp_path / "store") as store:
+        store.commit_many((first, second))
+        original_reference = store.artifact_store.reference
+        read_digests: list[str] = []
+
+        def tracked_reference(artifact: StoredArtifact) -> ArtifactFile:
+            read_digests.append(artifact.digest)
+            return original_reference(artifact)
+
+        monkeypatch.setattr(store.artifact_store, "reference", tracked_reference)
+        fetched = store.fetch_many((first.key, second.key))
+
+    assert set(fetched) == {first.key, second.key}
+    assert len(read_digests) == 2
+    assert len(set(read_digests)) == 2
 
 
 def test_no_hit_is_a_fetchable_terminal_result(tmp_path: Path) -> None:
@@ -112,7 +156,9 @@ def test_no_hit_is_a_fetchable_terminal_result(tmp_path: Path) -> None:
         key=make_key(identity),
         status=EvidenceStatus.NO_HIT,
         payload_digest=sha256_digest(b"no-hit"),
-        raw_artifact=ArtifactPayload(b"completed with no rows", "text/plain"),
+        raw_artifact=write_artifact_file(
+            tmp_path / "no-hit.txt", b"completed with no rows", "text/plain"
+        ),
     )
 
     with LocalStore.open(tmp_path / "store") as store:
@@ -122,11 +168,16 @@ def test_no_hit_is_a_fetchable_terminal_result(tmp_path: Path) -> None:
     assert fetched is not None
     assert fetched.record.status is EvidenceStatus.NO_HIT
     assert fetched.normalized_artifact is None
-    assert fetched.raw_artifact == b"completed with no rows"
+    assert fetched.raw_artifact is not None
+    assert fetched.raw_artifact.path.read_bytes() == b"completed with no rows"
 
 
 def test_exact_resource_change_is_a_cache_miss(tmp_path: Path) -> None:
-    old = make_hit_commit("MPEPTIDE", resource_id="fixture-db/1")
+    old = make_hit_commit(
+        "MPEPTIDE",
+        artifact_dir=tmp_path / "sources",
+        resource_id="fixture-db/1",
+    )
     new_key = make_key(old.identity, resource_id="fixture-db/2")
 
     with LocalStore.open(tmp_path / "store") as store:
@@ -142,9 +193,13 @@ def test_exact_resource_change_is_a_cache_miss(tmp_path: Path) -> None:
 
 
 def test_conflicting_batch_rolls_back_all_database_rows(tmp_path: Path) -> None:
-    existing = make_hit_commit("MEXISTING", result=b"first")
-    new = make_hit_commit("MNEW", result=b"new")
-    conflict = make_hit_commit("MEXISTING", result=b"different")
+    existing = make_hit_commit(
+        "MEXISTING", artifact_dir=tmp_path / "sources", result=b"first"
+    )
+    new = make_hit_commit("MNEW", artifact_dir=tmp_path / "sources", result=b"new")
+    conflict = make_hit_commit(
+        "MEXISTING", artifact_dir=tmp_path / "sources", result=b"different"
+    )
 
     with LocalStore.open(tmp_path / "store") as store:
         store.commit_many((existing,))
@@ -155,8 +210,36 @@ def test_conflicting_batch_rolls_back_all_database_rows(tmp_path: Path) -> None:
         assert store.get_sequence(new.identity.sequence_id) is None
 
 
+def test_same_scientific_payload_accepts_different_parquet_encoding(
+    tmp_path: Path,
+) -> None:
+    first = make_hit_commit(
+        "MPEPTIDE", artifact_dir=tmp_path / "first", result=b"encoding-one"
+    )
+    second = make_hit_commit(
+        "MPEPTIDE", artifact_dir=tmp_path / "second", result=b"encoding-two"
+    )
+    second = EvidenceCommit(
+        identity=second.identity,
+        key=second.key,
+        status=second.status,
+        payload_digest=first.payload_digest,
+        normalized_artifact=second.normalized_artifact,
+        raw_artifact=second.raw_artifact,
+    )
+
+    with LocalStore.open(tmp_path / "store") as store:
+        assert store.commit_many((first,)) == (CommitOutcome.CREATED,)
+        assert store.commit_many((second,)) == (CommitOutcome.EXISTING,)
+        fetched = store.fetch(first.key)
+
+    assert fetched is not None
+    assert fetched.normalized_artifact is not None
+    assert fetched.normalized_artifact.path.read_bytes() == b"encoding-one"
+
+
 def test_fetch_detects_corrupt_registered_artifact(tmp_path: Path) -> None:
-    commit = make_hit_commit("MPEPTIDE")
+    commit = make_hit_commit("MPEPTIDE", artifact_dir=tmp_path / "sources")
 
     with LocalStore.open(tmp_path / "store") as store:
         store.commit_many((commit,))
@@ -173,12 +256,12 @@ def test_fetch_detects_corrupt_registered_artifact(tmp_path: Path) -> None:
         )
         artifact_path.write_bytes(b"corrupt")
 
-        with pytest.raises(StoreIntegrityError, match="digest mismatch"):
+        with pytest.raises(StoreIntegrityError, match="artifact is corrupt"):
             store.fetch(commit.key)
 
 
 def test_lookup_verifies_full_persisted_sequence_content(tmp_path: Path) -> None:
-    commit = make_hit_commit("MPEPTIDE")
+    commit = make_hit_commit("MPEPTIDE", artifact_dir=tmp_path / "sources")
 
     with LocalStore.open(tmp_path / "store") as store:
         store.commit_many((commit,))
@@ -197,7 +280,7 @@ def test_lookup_verifies_full_persisted_sequence_content(tmp_path: Path) -> None
 
 def test_concurrent_identical_commits_are_idempotent(tmp_path: Path) -> None:
     root = tmp_path / "store"
-    commit = make_hit_commit("MCONCURRENT")
+    commit = make_hit_commit("MCONCURRENT", artifact_dir=tmp_path / "sources")
 
     def commit_once() -> CommitOutcome:
         with LocalStore.open(root) as store:

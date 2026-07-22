@@ -7,6 +7,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 from typer.testing import CliRunner
 
 from seqevi.adapters import (
@@ -17,7 +18,7 @@ from seqevi.adapters import (
 )
 from seqevi.annotate import run_annotation
 from seqevi.cli import app
-from seqevi.errors import AdapterError, AnnotationError
+from seqevi.errors import AdapterError, AnnotationError, ResourceLockError
 from seqevi.evidence import EvidenceQuery
 from seqevi.sequence import read_fasta, unique_identities
 from seqevi.store import LocalStore
@@ -76,6 +77,7 @@ parser.add_argument("--input", required=True)
 parser.add_argument("--applications", required=True)
 parser.add_argument("--formats", required=True)
 parser.add_argument("--disable-precalc", action="store_true")
+parser.add_argument("--cpu", required=True)
 parser.add_argument("--outfile", required=True)
 parser.add_argument("--tempdir", required=True)
 args = parser.parse_args()
@@ -93,6 +95,9 @@ if data_dir is None:
     raise SystemExit(11)
 
 mode = (data_dir / "mode.txt").read_text().strip()
+expected_threads = data_dir / "expected-threads.txt"
+if expected_threads.is_file() and args.cpu != expected_threads.read_text().strip():
+    raise SystemExit(12)
 run_date = (data_dir / "run-date.txt").read_text().strip()
 if mode == "fail":
     print("fixture InterProScan failure", file=sys.stderr)
@@ -174,9 +179,25 @@ def test_interpro_pfam_contract_probes_exact_runtime_and_resource(
     }
 
     (database / "pfam" / "38.1" / "pfam_a.hmm").write_bytes(b"fixture-pfam-model-v2")
-    resource_changed = InterProPfamAdapter(
+    cached = InterProPfamAdapter(
         executable=executable,
         database=database,
+    )
+    assert cached.contract.resource_id == first.contract.resource_id
+    with pytest.raises(ResourceLockError, match=r"SHA-256.*pfam_a\.hmm"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            verify_resource=True,
+        )
+
+    changed_executable, changed_database = _write_runtime(tmp_path / "changed")
+    (changed_database / "pfam" / "38.1" / "pfam_a.hmm").write_bytes(
+        b"fixture-pfam-model-v2"
+    )
+    resource_changed = InterProPfamAdapter(
+        executable=changed_executable,
+        database=changed_database,
     )
     assert resource_changed.contract.resource_id != first.contract.resource_id
     assert (
@@ -184,10 +205,10 @@ def test_interpro_pfam_contract_probes_exact_runtime_and_resource(
         == first.contract.tool_runtime_digest
     )
 
-    (executable.parent / "interproscan-5.jar").write_bytes(b"fixture-jar-v2")
+    (changed_executable.parent / "interproscan-5.jar").write_bytes(b"fixture-jar-v2")
     runtime_changed = InterProPfamAdapter(
-        executable=executable,
-        database=database,
+        executable=changed_executable,
+        database=changed_database,
     )
     assert (
         runtime_changed.contract.tool_runtime_digest
@@ -235,6 +256,39 @@ def test_interpro_pfam_annotation_preserves_matches_and_accounts_for_no_hits(
     )
     assert descriptor["seqevi"]["adapter"] == "interpro-pfam"
     assert descriptor["seqevi"]["resourceId"] == adapter.contract.resource_id
+
+
+def test_interpro_threads_change_execution_but_not_scientific_payload(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    adapter = InterProPfamAdapter(executable=executable, database=database)
+    fasta = _write_input(tmp_path / "proteins.fasta")
+    (database / "expected-threads.txt").write_text("1", encoding="utf-8")
+    with LocalStore.open(tmp_path / "one-store") as store:
+        one = run_annotation(
+            fasta_path=fasta,
+            output_dir=tmp_path / "one",
+            adapter=adapter,
+            store=store,
+            threads=1,
+        )
+    (database / "expected-threads.txt").write_text("4", encoding="utf-8")
+    with LocalStore.open(tmp_path / "four-store") as store:
+        four = run_annotation(
+            fasta_path=fasta,
+            output_dir=tmp_path / "four",
+            adapter=adapter,
+            store=store,
+            threads=4,
+        )
+
+    assert_frame_equal(
+        pl.read_parquet(one.output_dir / "evidence.parquet"),
+        pl.read_parquet(four.output_dir / "evidence.parquet"),
+    )
+    assert one.metrics.configured_threads == 1
+    assert four.metrics.configured_threads == 4
 
 
 def test_interpro_pfam_cache_hit_does_not_rerun_tool(tmp_path: Path) -> None:
@@ -291,9 +345,10 @@ def test_interpro_pfam_run_date_is_excluded_from_scientific_payload(
             store=store,
         )
 
-    assert (tmp_path / "first" / "evidence.parquet").read_bytes() == (
-        tmp_path / "second" / "evidence.parquet"
-    ).read_bytes()
+    assert_frame_equal(
+        pl.read_parquet(tmp_path / "first" / "evidence.parquet"),
+        pl.read_parquet(tmp_path / "second" / "evidence.parquet"),
+    )
 
 
 @pytest.mark.parametrize(

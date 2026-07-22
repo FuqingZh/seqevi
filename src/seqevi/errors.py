@@ -53,6 +53,10 @@ class AdapterError(AnnotationError):
     """Raised when an adapter cannot produce valid terminal evidence."""
 
 
+class ResourceLockError(AdapterError):
+    """Raised when a database resource lock is invalid or conflicts with files."""
+
+
 class AdapterUnavailableError(AdapterError):
     """Raised when a declared adapter is not implemented in this release."""
 

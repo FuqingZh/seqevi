@@ -28,6 +28,7 @@ class AdapterConfiguration:
     name: AdapterName
     executable: Path
     database: Path
+    verify_resource: bool = False
 
 
 def create_adapter(configuration: AdapterConfiguration) -> AnnotationAdapter:
@@ -37,11 +38,13 @@ def create_adapter(configuration: AdapterConfiguration) -> AnnotationAdapter:
         return InterProPfamAdapter(
             executable=configuration.executable,
             database=configuration.database,
+            verify_resource=configuration.verify_resource,
         )
     if configuration.name is AdapterName.EGGNOG:
         return EggnogAdapter(
             executable=configuration.executable,
             database=configuration.database,
+            verify_resource=configuration.verify_resource,
         )
     _raise_unavailable(configuration.name, 4)
 

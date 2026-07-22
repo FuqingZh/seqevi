@@ -6,7 +6,7 @@ from io import StringIO
 from pathlib import Path
 
 from seqevi.evidence import (
-    ArtifactPayload,
+    ArtifactFile,
     EvidenceCommit,
     EvidenceKey,
     EvidenceQuery,
@@ -46,7 +46,11 @@ def evidence_key(record: InputSequence) -> EvidenceKey:
     )
 
 
-def fake_annotate(store: LocalStore, records: tuple[InputSequence, ...]) -> int:
+def fake_annotate(
+    store: LocalStore,
+    records: tuple[InputSequence, ...],
+    artifact_dir: Path,
+) -> int:
     identities = unique_identities(records)
     keys = {
         identity.sequence_id: EvidenceKey.from_parameters(
@@ -71,10 +75,14 @@ def fake_annotate(store: LocalStore, records: tuple[InputSequence, ...]) -> int:
         {"SequenceID": identity.sequence_id, "Annotation": identity.sequence[:3]}
         for identity in sorted(missing, key=lambda item: item.sequence_id)
     ]
-    artifact = ArtifactPayload(
-        (
-            "\n".join(json.dumps(row, sort_keys=True) for row in batch_rows) + "\n"
-        ).encode(),
+    artifact_data = (
+        "\n".join(json.dumps(row, sort_keys=True) for row in batch_rows) + "\n"
+    ).encode()
+    artifact_dir.mkdir(exist_ok=True)
+    artifact_path = artifact_dir / f"{sha256_digest(artifact_data)}.ndjson"
+    artifact_path.write_bytes(artifact_data)
+    artifact = ArtifactFile.from_path(
+        artifact_path,
         "application/x-ndjson",
     )
     commits = [
@@ -102,9 +110,9 @@ def test_a_b_c_fastas_reuse_only_exact_sequence_content(tmp_path: Path) -> None:
     )
 
     with LocalStore.open(tmp_path / "store") as store:
-        assert fake_annotate(store, fasta_a) == 2000
-        assert fake_annotate(store, fasta_b) == 0
-        assert fake_annotate(store, fasta_c) == 500
+        assert fake_annotate(store, fasta_a, tmp_path / "sources") == 2000
+        assert fake_annotate(store, fasta_b, tmp_path / "sources") == 0
+        assert fake_annotate(store, fasta_c, tmp_path / "sources") == 500
 
         c_queries = [
             EvidenceQuery(record.identity, evidence_key(record)) for record in fasta_c

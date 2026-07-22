@@ -16,6 +16,7 @@ from .adapters import (
 )
 from .annotate import run_annotation
 from .errors import AnnotationError, FastaValidationError, StoreError
+from .resource_lock import resource_lock_path
 from .store import open_evidence_store
 
 app = typer.Typer(
@@ -24,6 +25,12 @@ app = typer.Typer(
     invoke_without_command=True,
     no_args_is_help=False,
 )
+resource_app = typer.Typer(
+    name="resource",
+    help="Initialize and verify immutable database resource locks.",
+    no_args_is_help=True,
+)
+app.add_typer(resource_app, name="resource")
 
 
 def _version_callback(value: bool) -> None:
@@ -127,6 +134,14 @@ def annotate_command(
             help="Optional external tool timeout in seconds.",
         ),
     ] = None,
+    threads: Annotated[
+        int,
+        typer.Option(
+            "--threads",
+            min=1,
+            help="Worker threads passed to the external annotation tool.",
+        ),
+    ] = 1,
 ) -> None:
     """Reuse exact evidence and annotate only cache-miss sequences."""
 
@@ -145,6 +160,7 @@ def annotate_command(
                 adapter=configured_adapter,
                 store=evidence_store,
                 timeout_seconds=timeout_seconds,
+                threads=threads,
             )
     except (AnnotationError, FastaValidationError, StoreError) as error:
         typer.echo(f"Error: {error}", err=True)
@@ -154,6 +170,57 @@ def annotate_command(
         f"Annotated {summary.unique_sequences} unique sequences "
         f"({summary.cache_hits} cached, {summary.computed} computed); "
         f"output: {summary.output_dir}"
+    )
+
+
+@resource_app.command("verify")
+def verify_resource_command(
+    adapter: Annotated[
+        AdapterName,
+        typer.Option("--adapter", help="Official annotation adapter to verify."),
+    ],
+    executable: Annotated[
+        Path,
+        typer.Option(
+            "--executable",
+            parser=_resolve_executable,
+            metavar="EXECUTABLE",
+            help="Adapter tool executable or command name.",
+        ),
+    ],
+    database: Annotated[
+        Path,
+        typer.Option(
+            "--database",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            resolve_path=True,
+            help="Native upstream annotation database directory.",
+        ),
+    ],
+) -> None:
+    """Fully hash a database and verify its SeqEvi resource lock."""
+
+    try:
+        configured_adapter = create_adapter(
+            AdapterConfiguration(
+                name=adapter,
+                executable=executable,
+                database=database,
+                verify_resource=True,
+            )
+        )
+    except AnnotationError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+    lock_path = resource_lock_path(database)
+    lock_status = str(lock_path) if lock_path.is_file() else "not persisted (read-only)"
+    typer.echo(
+        f"Verified resource {configured_adapter.contract.resource_id}; "
+        f"lock: {lock_status}"
     )
 
 

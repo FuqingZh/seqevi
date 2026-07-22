@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from seqevi.evidence import (
-    ArtifactPayload,
+    ArtifactFile,
     CommitOutcome,
     EvidenceCommit,
     EvidenceKey,
@@ -135,6 +135,14 @@ class FetchResponse(TransportModel):
     record: EvidenceRecordModel | None
 
 
+class FetchManyRequest(TransportModel):
+    keys: list[EvidenceKeyModel]
+
+
+class FetchManyResponse(TransportModel):
+    records: list[EvidenceRecordModel]
+
+
 class CommitModel(TransportModel):
     identity: SequenceModel
     key: EvidenceKeyModel
@@ -146,14 +154,14 @@ class CommitModel(TransportModel):
     @classmethod
     def from_domain(cls, value: EvidenceCommit) -> CommitModel:
         def reference(
-            payload: ArtifactPayload | None,
+            payload: ArtifactFile | None,
         ) -> ArtifactReferenceModel | None:
             if payload is None:
                 return None
             return ArtifactReferenceModel(
                 digest=payload.digest,
                 media_type=payload.media_type,
-                byte_size=len(payload.data),
+                byte_size=payload.byte_size,
             )
 
         return cls(

@@ -10,7 +10,11 @@ from collections.abc import AsyncIterable, Iterator
 from pathlib import Path
 
 from seqevi.errors import StoreIntegrityError
-from seqevi.evidence import ArtifactPayload, StoredArtifact
+from seqevi.evidence import (
+    ArtifactFile,
+    ArtifactLifetime,
+    StoredArtifact,
+)
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -22,31 +26,41 @@ class PosixArtifactStore:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def put(self, payload: ArtifactPayload) -> StoredArtifact:
-        digest = payload.digest
+    def put(self, artifact: ArtifactFile) -> StoredArtifact:
+        """Stream one caller-owned file into the content-addressed Store."""
+
+        digest = artifact.digest
         target = self._path_for_digest(digest)
         target.parent.mkdir(parents=True, exist_ok=True)
 
         if target.exists():
             self._verify_existing(target, digest)
+            if target.stat().st_size != artifact.byte_size:
+                raise StoreIntegrityError(f"artifact byte size mismatch: {digest}")
         else:
-            self._link_new_artifact(target, payload.data)
+            self._link_new_artifact(target, artifact)
 
         return StoredArtifact(
             digest=digest,
-            media_type=payload.media_type,
-            byte_size=len(payload.data),
+            media_type=artifact.media_type,
+            byte_size=artifact.byte_size,
             relative_path=target.relative_to(self.root).as_posix(),
         )
 
-    def read(self, digest: str) -> bytes:
-        target = self._path_for_digest(digest)
-        if target.is_symlink() or not target.is_file():
-            raise StoreIntegrityError(f"artifact is missing: {digest}")
-        data = target.read_bytes()
-        if hashlib.sha256(data).hexdigest() != digest:
-            raise StoreIntegrityError(f"artifact digest mismatch: {digest}")
-        return data
+    def reference(self, artifact: StoredArtifact) -> ArtifactFile:
+        """Return an integrity-checked Store-owned file reference."""
+
+        target = self._path_for_digest(artifact.digest)
+        self._verify_existing(target, artifact.digest)
+        if target.stat().st_size != artifact.byte_size:
+            raise StoreIntegrityError(f"artifact byte size mismatch: {artifact.digest}")
+        return ArtifactFile(
+            path=target,
+            media_type=artifact.media_type,
+            byte_size=artifact.byte_size,
+            digest=artifact.digest,
+            lifetime=ArtifactLifetime.STORE,
+        )
 
     def describe_existing(
         self, *, digest: str, media_type: str, byte_size: int
@@ -168,21 +182,37 @@ class PosixArtifactStore:
         if hasher.hexdigest() != digest:
             raise StoreIntegrityError(f"existing artifact is corrupt: {digest}")
 
-    def _link_new_artifact(self, target: Path, data: bytes) -> None:
+    def _link_new_artifact(self, target: Path, artifact: ArtifactFile) -> None:
         descriptor, temporary_name = tempfile.mkstemp(
             prefix=".seqevi-artifact-", dir=target.parent
         )
         temporary = Path(temporary_name)
+        hasher = hashlib.sha256()
+        byte_size = 0
         try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
+            with (
+                artifact.path.open("rb") as source,
+                os.fdopen(descriptor, "wb") as target_handle,
+            ):
+                while chunk := source.read(1024 * 1024):
+                    byte_size += len(chunk)
+                    hasher.update(chunk)
+                    target_handle.write(chunk)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
+            if byte_size != artifact.byte_size:
+                raise StoreIntegrityError(
+                    f"artifact byte size changed during Store copy: {artifact.digest}"
+                )
+            if hasher.hexdigest() != artifact.digest:
+                raise StoreIntegrityError(
+                    f"artifact digest changed during Store copy: {artifact.digest}"
+                )
             try:
                 os.link(temporary, target)
                 self._fsync_directory(target.parent)
             except FileExistsError:
-                self._verify_existing(target, hashlib.sha256(data).hexdigest())
+                self._verify_existing(target, artifact.digest)
         finally:
             temporary.unlink(missing_ok=True)
 

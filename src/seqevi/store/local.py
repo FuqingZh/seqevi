@@ -18,7 +18,7 @@ from seqevi.errors import (
     StoreIntegrityError,
 )
 from seqevi.evidence import (
-    ArtifactPayload,
+    ArtifactFile,
     CommitOutcome,
     EvidenceCommit,
     EvidenceKey,
@@ -215,7 +215,7 @@ class LocalStore:
         commits = tuple(proposed_commits)
         seen_keys: set[EvidenceKey] = set()
         identities: dict[str, SequenceIdentity] = {}
-        payloads: dict[str, ArtifactPayload] = {}
+        payloads: dict[str, ArtifactFile] = {}
 
         for commit in commits:
             if commit.key in seen_keys:
@@ -234,7 +234,7 @@ class LocalStore:
                 if payload is None:
                     continue
                 existing_payload = payloads.setdefault(payload.digest, payload)
-                if existing_payload != payload:
+                if _artifact_identity(existing_payload) != _artifact_identity(payload):
                     raise StoreIntegrityError(
                         f"artifact digest has conflicting payload metadata: {payload.digest}"
                     )
@@ -257,20 +257,46 @@ class LocalStore:
     def fetch(self, key: EvidenceKey) -> FetchedEvidence | None:
         """Fetch one exact evidence record and verify referenced artifact bytes."""
 
-        record = self._lookup_keys((key,)).get(key)
-        if record is None:
-            return None
-        return FetchedEvidence(
-            record=record,
-            normalized_artifact=self._read_registered_artifact(
-                record.normalized_artifact_digest
-            ),
-            raw_artifact=self._read_registered_artifact(record.raw_artifact_digest),
-        )
+        return self.fetch_many((key,)).get(key)
 
-    def _read_registered_artifact(self, digest: str | None) -> bytes | None:
-        if digest is None:
-            return None
+    def fetch_many(
+        self, keys: Iterable[EvidenceKey]
+    ) -> dict[EvidenceKey, FetchedEvidence]:
+        """Fetch records while reading each referenced artifact only once."""
+
+        requested = tuple(dict.fromkeys(keys))
+        records = self._lookup_keys(requested)
+        digests = {
+            digest
+            for record in records.values()
+            for digest in (
+                record.normalized_artifact_digest,
+                record.raw_artifact_digest,
+            )
+            if digest is not None
+        }
+        artifact_by_digest = {
+            digest: self._reference_registered_artifact(digest)
+            for digest in sorted(digests)
+        }
+        return {
+            key: FetchedEvidence(
+                record=record,
+                normalized_artifact=(
+                    artifact_by_digest[record.normalized_artifact_digest]
+                    if record.normalized_artifact_digest is not None
+                    else None
+                ),
+                raw_artifact=(
+                    artifact_by_digest[record.raw_artifact_digest]
+                    if record.raw_artifact_digest is not None
+                    else None
+                ),
+            )
+            for key, record in records.items()
+        }
+
+    def _reference_registered_artifact(self, digest: str) -> ArtifactFile:
         with self.engine.connect() as connection:
             row = (
                 connection.execute(
@@ -281,10 +307,14 @@ class LocalStore:
             )
         if row is None:
             raise StoreIntegrityError(f"artifact metadata is missing: {digest}")
-        data = self.artifact_store.read(digest)
-        if len(data) != row["byte_size"]:
-            raise StoreIntegrityError(f"artifact byte size mismatch: {digest}")
-        return data
+        return self.artifact_store.reference(
+            StoredArtifact(
+                digest=row["digest"],
+                media_type=row["media_type"],
+                byte_size=row["byte_size"],
+                relative_path=row["relative_path"],
+            )
+        )
 
     @staticmethod
     def _verify_persisted_sequence(
@@ -443,3 +473,7 @@ def _evidence_key_clause(key: EvidenceKey) -> Any:
         evidence.c.resource_id == key.resource_id,
         evidence.c.semantic_parameters_hash == key.semantic_parameters_hash,
     )
+
+
+def _artifact_identity(artifact: ArtifactFile) -> tuple[str, str, int]:
+    return artifact.digest, artifact.media_type, artifact.byte_size

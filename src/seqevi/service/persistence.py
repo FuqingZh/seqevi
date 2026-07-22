@@ -42,6 +42,10 @@ class ServicePersistence(Protocol):
 
     def fetch_record(self, key: EvidenceKey) -> EvidenceRecord | None: ...
 
+    def fetch_many(
+        self, keys: Iterable[EvidenceKey]
+    ) -> dict[EvidenceKey, EvidenceRecord]: ...
+
     def artifact_metadata(self, digest: str) -> StoredArtifact | None: ...
 
     def close(self) -> None: ...
@@ -130,13 +134,38 @@ class PostgresEvidencePersistence:
         return tuple(outcomes)
 
     def fetch_record(self, key: EvidenceKey) -> EvidenceRecord | None:
+        return self.fetch_many((key,)).get(key)
+
+    def fetch_many(
+        self, keys: Iterable[EvidenceKey]
+    ) -> dict[EvidenceKey, EvidenceRecord]:
+        requested = tuple(dict.fromkeys(keys))
+        groups: dict[tuple[str, str, str, str], list[EvidenceKey]] = defaultdict(list)
+        for key in requested:
+            groups[key.contract_identity].append(key)
+
+        found: dict[EvidenceKey, EvidenceRecord] = {}
         with self.engine.connect() as connection:
-            row = (
-                connection.execute(select(evidence).where(_key_clause(key)))
-                .mappings()
-                .one_or_none()
-            )
-        return None if row is None else _record_from_row(row)
+            for contract, group in groups.items():
+                requested_keys = set(group)
+                for offset in range(0, len(group), _LOOKUP_CHUNK_SIZE):
+                    chunk = group[offset : offset + _LOOKUP_CHUNK_SIZE]
+                    statement = select(evidence).where(
+                        and_(
+                            evidence.c.sequence_id.in_(
+                                [key.sequence_id for key in chunk]
+                            ),
+                            evidence.c.adapter_contract_version == contract[0],
+                            evidence.c.tool_runtime_digest == contract[1],
+                            evidence.c.resource_id == contract[2],
+                            evidence.c.semantic_parameters_hash == contract[3],
+                        )
+                    )
+                    for row in connection.execute(statement).mappings():
+                        record = _record_from_row(row)
+                        if record.key in requested_keys:
+                            found[record.key] = record
+        return found
 
     def artifact_metadata(self, digest: str) -> StoredArtifact | None:
         with self.engine.connect() as connection:
@@ -261,15 +290,11 @@ def _insert_evidence(connection: Connection, commit: CommitModel) -> CommitOutco
         row["semantic_parameters_json"],
         row["status"],
         row["payload_digest"],
-        row["normalized_artifact_digest"],
-        row["raw_artifact_digest"],
     )
     proposed = (
         key.semantic_parameters_json,
         commit.status.value,
         commit.payload_digest,
-        normalized_digest,
-        raw_digest,
     )
     if persisted != proposed:
         raise EvidenceConflictError(

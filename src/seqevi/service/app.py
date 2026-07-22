@@ -19,6 +19,8 @@ from seqevi.store.transport import (
     CommitResponse,
     CommitModel,
     EvidenceRecordModel,
+    FetchManyRequest,
+    FetchManyResponse,
     FetchRequest,
     FetchResponse,
     HealthResponse,
@@ -78,6 +80,19 @@ def create_service_app(
         record = database.fetch_record(request.key.to_domain())
         return FetchResponse(
             record=None if record is None else EvidenceRecordModel.from_domain(record)
+        )
+
+    @app.post("/v1/evidence/fetch-many", response_model=FetchManyResponse)
+    def fetch_many(request: FetchManyRequest) -> FetchManyResponse:
+        _check_batch_size(len(request.keys), settings.maximum_batch_size)
+        keys = [key.to_domain() for key in request.keys]
+        records = database.fetch_many(keys)
+        return FetchManyResponse(
+            records=[
+                EvidenceRecordModel.from_domain(records[key])
+                for key in keys
+                if key in records
+            ]
         )
 
     @app.put(

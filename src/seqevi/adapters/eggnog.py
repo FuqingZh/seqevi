@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import csv
 import gzip
-import hashlib
-import io
 import json
 import math
+import os
 import re
+import shutil
 import tempfile
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -17,8 +17,10 @@ from pathlib import Path
 import polars as pl
 
 from seqevi.errors import AdapterError
-from seqevi.evidence import ArtifactPayload, EvidenceStatus, sha256_digest
+from seqevi.evidence import ArtifactFile, EvidenceStatus, sha256_digest
+from seqevi.resource_lock import ResourceComponent, resolve_resource_lock
 from seqevi.runner import ToolCommand, ToolRunner, ToolTimeoutError
+from seqevi.runtime_identity import RuntimeComponent, calculate_runtime_digest
 from seqevi.sequence import SequenceIdentity
 
 from .base import AdapterBatchResult, AdapterContract, AdapterSequenceResult
@@ -60,12 +62,15 @@ EGGNOG_EVIDENCE_SCHEMA: Mapping[str, pl.DataType] = {
 _VERSION_PATTERN = re.compile(r"\bemapper-(2\.\d+\.\d+)\b")
 _EXPECTED_DB_PATTERN = re.compile(r"Expected eggNOG DB version:\s*([^\s/]+)")
 _INSTALLED_DB_PATTERN = re.compile(r"Installed eggNOG DB version:\s*([^\s/]+)")
+_DIAMOND_VERSION_PATTERN = re.compile(r"\bdiamond version\s+([^\s/]+)")
 _PROBE_TIMEOUT_SECONDS = 120.0
 _REQUIRED_DATABASE_FILES = (
     "eggnog.db",
     "eggnog.taxa.db",
     "eggnog_proteins.dmnd",
 )
+_OPTIONAL_DATABASE_FILES = ("eggnog.taxa.db.traverse.pkl",)
+_NORMALIZED_ROW_BATCH_SIZE = 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +113,7 @@ class EggnogAdapter:
         executable: Path,
         database: Path,
         parameters: EggnogParameters | None = None,
+        verify_resource: bool = False,
     ) -> None:
         self.executable = executable.resolve()
         self.database = database.resolve()
@@ -117,10 +123,28 @@ class EggnogAdapter:
         if not self.database.is_dir():
             raise AdapterError(f"eggNOG database is not a directory: {database}")
 
-        version_output = _probe_version(self.executable)
-        tool_version, database_version = _parse_version_output(version_output)
-        runtime_digest = _runtime_digest(self.executable, version_output)
-        resource_id = _resource_id(self.database, database_version)
+        version_output = _probe_version(self.executable, self.database)
+        tool_version, database_version, reported_diamond_version = (
+            _parse_version_output(version_output)
+        )
+        diamond = _resolve_diamond(self.executable)
+        diamond_version = _probe_diamond_version(diamond)
+        if diamond_version != reported_diamond_version:
+            raise AdapterError(
+                "eggNOG-mapper and the selected DIAMOND executable report "
+                "different versions"
+            )
+        runtime_digest = _runtime_digest(
+            self.executable,
+            tool_version=tool_version,
+            diamond=diamond,
+            diamond_version=diamond_version,
+        )
+        resource_id = _resource_id(
+            self.database,
+            database_version,
+            verify=verify_resource,
+        )
         self._contract = AdapterContract.from_parameters(
             name="eggnog",
             version=ADAPTER_CONTRACT_VERSION,
@@ -129,6 +153,7 @@ class EggnogAdapter:
             semantic_parameters=self.parameters.as_semantic_parameters(),
         )
         self.tool_version = tool_version
+        self.diamond_version = diamond_version
         self.database_version = database_version
 
     @property
@@ -147,6 +172,7 @@ class EggnogAdapter:
         work_dir: Path,
         runner: ToolRunner,
         timeout_seconds: float | None,
+        threads: int,
     ) -> AdapterBatchResult:
         """Run one deterministic cache-miss batch and validate every row."""
 
@@ -159,7 +185,7 @@ class EggnogAdapter:
             ToolCommand(
                 arguments=(
                     str(self.executable),
-                    "--input",
+                    "-i",
                     str(input_fasta),
                     "--itype",
                     parameters.input_type,
@@ -170,9 +196,9 @@ class EggnogAdapter:
                     "--data_dir",
                     str(self.database),
                     "--cpu",
-                    "1",
+                    str(threads),
                     "--override",
-                    "--mode",
+                    "-m",
                     parameters.search_mode,
                     "--seed_ortholog_evalue",
                     str(parameters.seed_ortholog_evalue),
@@ -188,6 +214,7 @@ class EggnogAdapter:
                 working_dir=work_dir,
                 stdout_path=work_dir / "eggnog.stdout.log",
                 stderr_path=work_dir / "eggnog.stderr.log",
+                environment=_runtime_environment(self.executable),
             ),
             timeout_seconds=timeout_seconds,
         )
@@ -199,24 +226,29 @@ class EggnogAdapter:
         if not raw_path.is_file():
             raise AdapterError("eggNOG-mapper did not create its annotations output")
 
-        raw = raw_path.read_bytes()
-        frame = _parse_annotations(raw, identities=identities)
-        normalized = _normalized_artifact(frame)
-        hit_ids = set(frame.get_column("SequenceID"))
+        normalized, payload_digest_by_id = _parse_annotations(
+            raw_path,
+            identities=identities,
+            normalized_path=work_dir / "eggnog.normalized.parquet",
+        )
         sequence_results = tuple(
-            _sequence_result(identity, frame=frame, hit_ids=hit_ids)
+            _sequence_result(
+                identity,
+                payload_digest=payload_digest_by_id.get(identity.sequence_id),
+            )
             for identity in sorted(identities, key=lambda item: item.sequence_id)
         )
         return AdapterBatchResult(
             sequences=sequence_results,
-            raw_artifact=ArtifactPayload(
-                gzip.compress(raw, mtime=0), "application/gzip"
+            raw_artifact=_gzip_artifact(
+                raw_path,
+                work_dir / "eggnog.annotations.tsv.gz",
             ),
             normalized_artifact=normalized,
         )
 
 
-def _probe_version(executable: Path) -> str:
+def _probe_version(executable: Path, database: Path) -> str:
     with tempfile.TemporaryDirectory(prefix="seqevi-eggnog-probe-") as raw_dir:
         root = Path(raw_dir)
         stdout_path = root / "stdout.log"
@@ -224,10 +256,16 @@ def _probe_version(executable: Path) -> str:
         try:
             result = ToolRunner().run(
                 ToolCommand(
-                    arguments=(str(executable), "--version"),
+                    arguments=(
+                        str(executable),
+                        "--version",
+                        "--data_dir",
+                        str(database),
+                    ),
                     working_dir=executable.parent,
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
+                    environment=_runtime_environment(executable),
                 ),
                 timeout_seconds=_PROBE_TIMEOUT_SECONDS,
             )
@@ -248,10 +286,23 @@ def _probe_version(executable: Path) -> str:
         return output
 
 
-def _parse_version_output(output: str) -> tuple[str, str]:
+def _runtime_environment(executable: Path) -> dict[str, str]:
+    runtime_bin = str(executable.parent)
+    inherited_path = os.environ.get("PATH")
+    return {
+        "PATH": (
+            runtime_bin
+            if not inherited_path
+            else os.pathsep.join((runtime_bin, inherited_path))
+        )
+    }
+
+
+def _parse_version_output(output: str) -> tuple[str, str, str]:
     tool_versions = sorted(set(_VERSION_PATTERN.findall(output)))
     expected = sorted(set(_EXPECTED_DB_PATTERN.findall(output)))
     installed = sorted(set(_INSTALLED_DB_PATTERN.findall(output)))
+    diamond_versions = sorted(set(_DIAMOND_VERSION_PATTERN.findall(output)))
     if len(tool_versions) != 1:
         raise AdapterError(
             "eggnog/1 requires exactly one eggNOG-mapper 2.x release in --version"
@@ -260,92 +311,219 @@ def _parse_version_output(output: str) -> tuple[str, str]:
         raise AdapterError(
             "eggNOG-mapper must report one matching expected and installed DB version"
         )
-    return tool_versions[0], installed[0]
+    if len(diamond_versions) != 1:
+        raise AdapterError("eggnog/1 requires exactly one DIAMOND release in --version")
+    return tool_versions[0], installed[0], diamond_versions[0]
 
 
-def _runtime_digest(executable: Path, version_output: str) -> str:
-    identity = {
-        "executable_sha256": _file_sha256(executable),
-        "version_output": version_output,
-    }
-    return sha256_digest(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+def _runtime_digest(
+    executable: Path,
+    *,
+    tool_version: str,
+    diamond: Path,
+    diamond_version: str,
+) -> str:
+    package_root = _resolve_eggnog_package(executable)
+    package_components = tuple(
+        RuntimeComponent(
+            name=f"eggnogmapper/{path.relative_to(package_root).as_posix()}",
+            path=path,
+        )
+        for path in sorted(package_root.rglob("*"))
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and path.suffix not in {".pyc", ".pyo"}
+    )
+    return calculate_runtime_digest(
+        runtime_name="eggnog-mapper",
+        versions={"diamond": diamond_version, "eggnog-mapper": tool_version},
+        components=(
+            RuntimeComponent("launcher", executable),
+            RuntimeComponent("diamond", diamond),
+            *package_components,
+        ),
     )
 
 
-def _resource_id(database: Path, version: str) -> str:
-    components = []
-    for name in _REQUIRED_DATABASE_FILES:
-        path = database / name
-        if not path.is_file():
-            raise AdapterError(f"eggNOG database file does not exist: {path}")
-        components.append((name, _file_sha256(path)))
+def _resolve_eggnog_package(executable: Path) -> Path:
+    runtime_root = executable.parent.parent
+    candidates = []
+    for python_dir in sorted((runtime_root / "lib").glob("python*")):
+        for package_dir_name in ("site-packages", "dist-packages"):
+            candidate = python_dir / package_dir_name / "eggnogmapper"
+            if candidate.is_dir():
+                candidates.append(candidate.resolve())
+    unique = sorted(set(candidates))
+    if len(unique) != 1:
+        raise AdapterError(
+            "eggNOG-mapper runtime must contain exactly one installed "
+            "eggnogmapper package directory"
+        )
+    return unique[0]
+
+
+def _resolve_diamond(executable: Path) -> Path:
+    resolved = shutil.which("diamond", path=_runtime_environment(executable)["PATH"])
+    if resolved is None:
+        raise AdapterError("eggNOG-mapper runtime has no DIAMOND executable")
+    return Path(resolved).resolve()
+
+
+def _probe_diamond_version(executable: Path) -> str:
+    with tempfile.TemporaryDirectory(prefix="seqevi-diamond-probe-") as raw_dir:
+        root = Path(raw_dir)
+        stdout_path = root / "stdout.log"
+        stderr_path = root / "stderr.log"
+        try:
+            result = ToolRunner().run(
+                ToolCommand(
+                    arguments=(str(executable), "version"),
+                    working_dir=executable.parent,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                ),
+                timeout_seconds=_PROBE_TIMEOUT_SECONDS,
+            )
+        except (OSError, ToolTimeoutError) as error:
+            raise AdapterError(f"DIAMOND version probe failed: {error}") from error
+        output = "\n".join(
+            (
+                stdout_path.read_text(encoding="utf-8", errors="replace"),
+                stderr_path.read_text(encoding="utf-8", errors="replace"),
+            )
+        ).strip()
+        if result.return_code != 0:
+            raise AdapterError(
+                f"DIAMOND version probe exited with {result.return_code}: {output}"
+            )
+        versions = sorted(set(_DIAMOND_VERSION_PATTERN.findall(output)))
+        if len(versions) != 1:
+            raise AdapterError("DIAMOND executable did not report exactly one version")
+        return versions[0]
+
+
+def _resource_id(database: Path, version: str, *, verify: bool = False) -> str:
+    declarations = tuple(
+        ResourceComponent(name=name, relative_path=name)
+        for name in _REQUIRED_DATABASE_FILES
+    ) + tuple(
+        ResourceComponent(name=name, relative_path=name)
+        for name in _OPTIONAL_DATABASE_FILES
+        if (database / name).is_file()
+    )
+    locked = resolve_resource_lock(
+        database=database,
+        resource_name="eggnog",
+        resource_version=version,
+        components=declarations,
+        verify=verify,
+    )
+    components = [(name, locked.hash_for(name)) for name in _REQUIRED_DATABASE_FILES]
     digest = sha256_digest(
         json.dumps(components, separators=(",", ":")).encode("utf-8")
     )
     return f"eggnog/{version}/sha256:{digest}"
 
 
-def _file_sha256(path: Path) -> str:
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
-
-
 def _parse_annotations(
-    raw: bytes, *, identities: tuple[SequenceIdentity, ...]
-) -> pl.DataFrame:
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise AdapterError(
-            f"eggNOG annotations are not valid UTF-8: {error}"
-        ) from error
-
+    path: Path,
+    *,
+    identities: tuple[SequenceIdentity, ...],
+    normalized_path: Path,
+) -> tuple[ArtifactFile | None, dict[str, str]]:
     expected = {identity.sequence_id: identity for identity in identities}
     header: tuple[str, ...] | None = None
     rows: list[dict[str, object]] = []
     seen_queries: set[str] = set()
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        if not line:
+    payload_digest_by_id: dict[str, str] = {}
+    with tempfile.TemporaryDirectory(
+        prefix=".eggnog-normalized-", dir=normalized_path.parent
+    ) as raw_parts_dir:
+        parts_dir = Path(raw_parts_dir)
+        part_paths: list[Path] = []
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    line = raw_line.removesuffix("\n").removesuffix("\r")
+                    if not line:
+                        raise AdapterError(
+                            f"eggNOG annotations contain a blank line at {line_number}"
+                        )
+                    if line.startswith("##"):
+                        continue
+                    if line.startswith("#"):
+                        candidate = tuple(line.removeprefix("#").split("\t"))
+                        if candidate[0] == "query":
+                            if header is not None:
+                                raise AdapterError(
+                                    "eggNOG annotations contain duplicate headers"
+                                )
+                            header = candidate
+                        continue
+                    if header is None:
+                        raise AdapterError(
+                            "eggNOG annotations data appeared before its header"
+                        )
+                    fields = next(csv.reader((line,), delimiter="\t"))
+                    if len(fields) != len(header):
+                        raise AdapterError(
+                            f"eggNOG annotations line {line_number} has "
+                            f"{len(fields)} columns; expected {len(header)}"
+                        )
+                    if header != _NATIVE_COLUMNS:
+                        raise AdapterError(
+                            "eggnog/1 requires the canonical eggNOG-mapper 2.x "
+                            "annotations schema"
+                        )
+                    row = _parse_row(
+                        header, fields, expected=expected, line_number=line_number
+                    )
+                    query = str(row["SequenceID"])
+                    if query in seen_queries:
+                        raise AdapterError(
+                            f"eggNOG annotations contain duplicate query: {query}"
+                        )
+                    seen_queries.add(query)
+                    payload_digest_by_id[query] = sha256_digest(
+                        json.dumps(
+                            row,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                    rows.append(row)
+                    if len(rows) >= _NORMALIZED_ROW_BATCH_SIZE:
+                        part_paths.append(_write_normalized_part(rows, parts_dir))
+                        rows.clear()
+        except UnicodeDecodeError as error:
             raise AdapterError(
-                f"eggNOG annotations contain a blank line at {line_number}"
-            )
-        if line.startswith("##"):
-            continue
-        if line.startswith("#"):
-            candidate = tuple(line.removeprefix("#").split("\t"))
-            if candidate[0] == "query":
-                if header is not None:
-                    raise AdapterError("eggNOG annotations contain duplicate headers")
-                header = candidate
-            continue
+                f"eggNOG annotations are not valid UTF-8: {error}"
+            ) from error
+
         if header is None:
-            raise AdapterError("eggNOG annotations data appeared before its header")
-        fields = next(csv.reader((line,), delimiter="\t"))
-        if len(fields) != len(header):
-            raise AdapterError(
-                f"eggNOG annotations line {line_number} has {len(fields)} columns; "
-                f"expected {len(header)}"
-            )
+            raise AdapterError("eggNOG annotations are missing the #query header")
         if header != _NATIVE_COLUMNS:
             raise AdapterError(
                 "eggnog/1 requires the canonical eggNOG-mapper 2.x annotations schema"
             )
-        row = _parse_row(header, fields, expected=expected, line_number=line_number)
-        query = str(row["SequenceID"])
-        if query in seen_queries:
-            raise AdapterError(f"eggNOG annotations contain duplicate query: {query}")
-        seen_queries.add(query)
-        rows.append(row)
+        if rows:
+            part_paths.append(_write_normalized_part(rows, parts_dir))
+        if not part_paths:
+            return None, payload_digest_by_id
+        pl.concat([pl.scan_parquet(part) for part in part_paths]).sort(
+            "SequenceID"
+        ).sink_parquet(normalized_path, compression="zstd", maintain_order=True)
+    return (
+        ArtifactFile.from_path(normalized_path, "application/vnd.apache.parquet"),
+        payload_digest_by_id,
+    )
 
-    if header is None:
-        raise AdapterError("eggNOG annotations are missing the #query header")
-    if header != _NATIVE_COLUMNS:
-        raise AdapterError(
-            "eggnog/1 requires the canonical eggNOG-mapper 2.x annotations schema"
-        )
-    frame = pl.DataFrame(rows, schema=EGGNOG_EVIDENCE_SCHEMA)
-    return frame.sort("SequenceID") if not frame.is_empty() else frame
+
+def _write_normalized_part(rows: list[dict[str, object]], directory: Path) -> Path:
+    path = directory / f"part-{len(tuple(directory.iterdir())):06d}.parquet"
+    pl.DataFrame(rows, schema=EGGNOG_EVIDENCE_SCHEMA).write_parquet(path)
+    return path
 
 
 def _parse_row(
@@ -381,21 +559,22 @@ def _parse_row(
     return row
 
 
-def _normalized_artifact(frame: pl.DataFrame) -> ArtifactPayload | None:
-    if frame.is_empty():
-        return None
-    buffer = io.BytesIO()
-    frame.write_parquet(buffer, compression="zstd")
-    return ArtifactPayload(buffer.getvalue(), "application/vnd.apache.parquet")
+def _gzip_artifact(source: Path, target: Path) -> ArtifactFile:
+    with (
+        source.open("rb") as source_handle,
+        target.open("wb") as target_handle,
+        gzip.GzipFile(fileobj=target_handle, mode="wb", mtime=0) as compressed,
+    ):
+        shutil.copyfileobj(source_handle, compressed)
+    return ArtifactFile.from_path(target, "application/gzip")
 
 
 def _sequence_result(
     identity: SequenceIdentity,
     *,
-    frame: pl.DataFrame,
-    hit_ids: set[str],
+    payload_digest: str | None,
 ) -> AdapterSequenceResult:
-    if identity.sequence_id not in hit_ids:
+    if payload_digest is None:
         payload = json.dumps(
             {"SequenceID": identity.sequence_id, "Status": "no_hit"},
             sort_keys=True,
@@ -406,15 +585,8 @@ def _sequence_result(
             status=EvidenceStatus.NO_HIT,
             payload_digest=sha256_digest(payload),
         )
-    row = frame.filter(pl.col("SequenceID") == identity.sequence_id).row(0, named=True)
-    payload = json.dumps(
-        row,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
     return AdapterSequenceResult(
         sequence_id=identity.sequence_id,
         status=EvidenceStatus.HIT,
-        payload_digest=sha256_digest(payload),
+        payload_digest=payload_digest,
     )

@@ -7,12 +7,14 @@ from pathlib import Path
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 from typer.testing import CliRunner
 
 from seqevi.adapters import EGGNOG_EVIDENCE_SCHEMA, EggnogAdapter, EggnogParameters
 from seqevi.annotate import run_annotation
 from seqevi.cli import app
-from seqevi.errors import AdapterError, AnnotationError
+from seqevi.errors import AdapterError, AnnotationError, ResourceLockError
+from seqevi.resource_lock import LOCK_FILENAME
 from seqevi.store import LocalStore
 
 runner = CliRunner()
@@ -52,33 +54,53 @@ def _write_runtime(root: Path) -> tuple[Path, Path]:
     (database / "eggnog_proteins.dmnd").write_bytes(b"diamond-v1")
     (database / "mode.txt").write_text("success", encoding="utf-8")
 
-    executable = root / "emapper.py"
+    runtime = root / "runtime"
+    runtime_bin = runtime / "bin"
+    package = runtime / "lib" / "python3.10" / "site-packages" / "eggnogmapper"
+    runtime_bin.mkdir(parents=True)
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "core.py").write_text("RUNTIME = 'fixture-v1'\n", encoding="utf-8")
+
+    executable = runtime_bin / "emapper.py"
     executable.write_text(_fixture_script(), encoding="utf-8")
     executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+    (runtime_bin / "python").symlink_to(sys.executable)
+    diamond = runtime_bin / "diamond"
+    diamond.write_text("#!/bin/sh\necho 'diamond version 2.1.8'\n", encoding="utf-8")
+    diamond.chmod(diamond.stat().st_mode | stat.S_IXUSR)
     return executable, database
 
 
 def _fixture_script() -> str:
-    return f"""#!{sys.executable}
+    return f"""#!/usr/bin/env python
 import argparse
 import sys
 from pathlib import Path
 
+if Path(sys.executable).resolve() != (Path(__file__).parent / "python").resolve():
+    raise SystemExit(8)
+
 if "--version" in sys.argv:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--data_dir", required=True)
+    args = parser.parse_args()
+    installed = "5.0.2" if (Path(args.data_dir) / "eggnog.db").is_file() else "unknown"
     print("emapper-2.1.12 / Expected eggNOG DB version: 5.0.2 / "
-          "Installed eggNOG DB version: 5.0.2 / "
+          f"Installed eggNOG DB version: {{installed}} / "
           "Diamond version found: diamond version 2.1.8")
     raise SystemExit(0)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--input", required=True)
+parser.add_argument("-i", dest="input", required=True)
 parser.add_argument("--itype", required=True)
 parser.add_argument("--output", required=True)
 parser.add_argument("--output_dir", required=True)
 parser.add_argument("--data_dir", required=True)
 parser.add_argument("--cpu", required=True)
 parser.add_argument("--override", action="store_true")
-parser.add_argument("--mode", required=True)
+parser.add_argument("-m", dest="mode", required=True)
 parser.add_argument("--seed_ortholog_evalue", required=True)
 parser.add_argument("--tax_scope", required=True)
 parser.add_argument("--target_orthologs", required=True)
@@ -91,6 +113,9 @@ if (args.itype, args.mode, args.tax_scope, args.target_orthologs,
     raise SystemExit(9)
 
 mode = (Path(args.data_dir) / "mode.txt").read_text().strip()
+expected_threads = Path(args.data_dir) / "expected-threads.txt"
+if expected_threads.is_file() and args.cpu != expected_threads.read_text().strip():
+    raise SystemExit(10)
 if mode == "fail":
     print("fixture eggNOG failure", file=sys.stderr)
     raise SystemExit(7)
@@ -136,7 +161,21 @@ def test_eggnog_contract_hashes_runtime_resource_and_semantics(tmp_path: Path) -
     assert first.contract.semantic_parameters["pfam_realign"] == "none"
 
     (database / "eggnog.db").write_bytes(b"annotations-v2")
-    changed = EggnogAdapter(executable=executable, database=database)
+    cached = EggnogAdapter(executable=executable, database=database)
+    assert cached.contract.resource_id == first.contract.resource_id
+    with pytest.raises(ResourceLockError, match=r"SHA-256.*eggnog\.db"):
+        EggnogAdapter(
+            executable=executable,
+            database=database,
+            verify_resource=True,
+        )
+
+    changed_executable, changed_database = _write_runtime(tmp_path / "changed")
+    (changed_database / "eggnog.db").write_bytes(b"annotations-v2")
+    changed = EggnogAdapter(
+        executable=changed_executable,
+        database=changed_database,
+    )
     assert changed.contract.resource_id != first.contract.resource_id
     assert changed.contract.tool_runtime_digest == first.contract.tool_runtime_digest
 
@@ -144,6 +183,39 @@ def test_eggnog_contract_hashes_runtime_resource_and_semantics(tmp_path: Path) -
 def test_eggnog_parameters_reject_alternate_contract() -> None:
     with pytest.raises(ValueError, match="one fixed protein"):
         EggnogParameters(tax_scope="Metazoa")
+
+
+def test_eggnog_runtime_digest_covers_mapper_package_and_diamond(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    first = EggnogAdapter(executable=executable, database=database)
+
+    package_file = (
+        executable.parent.parent
+        / "lib"
+        / "python3.10"
+        / "site-packages"
+        / "eggnogmapper"
+        / "core.py"
+    )
+    package_file.write_text("RUNTIME = 'fixture-v2'\n", encoding="utf-8")
+    package_changed = EggnogAdapter(executable=executable, database=database)
+    assert (
+        package_changed.contract.tool_runtime_digest
+        != first.contract.tool_runtime_digest
+    )
+
+    diamond = executable.parent / "diamond"
+    diamond.write_text(
+        diamond.read_text(encoding="utf-8") + "# rebuilt\n",
+        encoding="utf-8",
+    )
+    diamond_changed = EggnogAdapter(executable=executable, database=database)
+    assert (
+        diamond_changed.contract.tool_runtime_digest
+        != package_changed.contract.tool_runtime_digest
+    )
 
 
 def test_eggnog_annotation_preserves_native_columns_and_no_hits(
@@ -168,6 +240,39 @@ def test_eggnog_annotation_preserves_native_columns_and_no_hits(
     assert pl.read_parquet(summary.output_dir / "no-hits.parquet").height == 1
     package = json.loads((summary.output_dir / "datapackage.json").read_text())
     assert package["seqevi"]["adapter"] == "eggnog"
+
+
+def test_eggnog_threads_change_execution_but_not_scientific_payload(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    adapter = EggnogAdapter(executable=executable, database=database)
+    fasta = _write_fasta(tmp_path / "proteins.fasta")
+    (database / "expected-threads.txt").write_text("1", encoding="utf-8")
+    with LocalStore.open(tmp_path / "one-store") as store:
+        one = run_annotation(
+            fasta_path=fasta,
+            output_dir=tmp_path / "one",
+            adapter=adapter,
+            store=store,
+            threads=1,
+        )
+    (database / "expected-threads.txt").write_text("4", encoding="utf-8")
+    with LocalStore.open(tmp_path / "four-store") as store:
+        four = run_annotation(
+            fasta_path=fasta,
+            output_dir=tmp_path / "four",
+            adapter=adapter,
+            store=store,
+            threads=4,
+        )
+
+    assert_frame_equal(
+        pl.read_parquet(one.output_dir / "evidence.parquet"),
+        pl.read_parquet(four.output_dir / "evidence.parquet"),
+    )
+    assert one.metrics.configured_threads == 1
+    assert four.metrics.configured_threads == 4
 
 
 @pytest.mark.parametrize(
@@ -232,3 +337,30 @@ def test_eggnog_runs_through_public_cli(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert "2 unique sequences (0 cached, 2 computed)" in result.stdout
+
+
+def test_eggnog_resource_verify_cli_creates_and_audits_lock(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    arguments = [
+        "resource",
+        "verify",
+        "--adapter",
+        "eggnog",
+        "--executable",
+        str(executable),
+        "--database",
+        str(database),
+    ]
+
+    created = runner.invoke(app, arguments)
+
+    assert created.exit_code == 0, created.output
+    assert "Verified resource eggnog/5.0.2/sha256:" in created.stdout
+    assert (database / LOCK_FILENAME).is_file()
+
+    (database / "eggnog.db").write_bytes(b"annotations-v2")
+    corrupted = runner.invoke(app, arguments)
+    assert corrupted.exit_code == 1
+    assert "SHA-256 does not match" in corrupted.stderr

@@ -11,7 +11,7 @@ from typing import Protocol
 import polars as pl
 
 from seqevi.evidence import (
-    ArtifactPayload,
+    ArtifactFile,
     EvidenceKey,
     EvidenceStatus,
     canonical_semantic_parameters,
@@ -94,8 +94,8 @@ class AdapterBatchResult:
     """Validated batch artifacts and per-sequence terminal states."""
 
     sequences: tuple[AdapterSequenceResult, ...]
-    raw_artifact: ArtifactPayload
-    normalized_artifact: ArtifactPayload | None = None
+    raw_artifact: ArtifactFile
+    normalized_artifact: ArtifactFile | None = None
 
     def __post_init__(self) -> None:
         if not self.sequences:
@@ -127,4 +127,5 @@ class AnnotationAdapter(Protocol):
         work_dir: Path,
         runner: ToolRunner,
         timeout_seconds: float | None,
+        threads: int,
     ) -> AdapterBatchResult: ...

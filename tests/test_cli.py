@@ -27,6 +27,7 @@ def test_cli_without_command_describes_current_surface() -> None:
     assert result.exit_code == 0
     assert "Content-addressed protein sequence annotation evidence" in result.stdout
     assert "annotate" in result.stdout
+    assert "resource" in result.stdout
 
 
 def test_annotate_help_uses_concrete_external_input_names() -> None:
@@ -37,6 +38,7 @@ def test_annotate_help_uses_concrete_external_input_names() -> None:
     assert "--executable" in result.stdout
     assert "--database" in result.stdout
     assert "--output" in result.stdout
+    assert "--threads" in result.stdout
     assert "--runtime" not in result.stdout
     assert "--resource" not in result.stdout
     assert "_resolve_executable" not in result.stdout

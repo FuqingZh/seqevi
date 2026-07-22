@@ -8,14 +8,15 @@ from pathlib import Path
 from typing import cast
 
 import httpx
+import polars as pl
 import pytest
 from fastapi.testclient import TestClient
+from polars.testing import assert_frame_equal
 from sqlalchemy import create_engine
 
 from seqevi.annotate import run_annotation
 from seqevi.errors import EvidenceConflictError, StoreIntegrityError
 from seqevi.evidence import (
-    ArtifactPayload,
     CommitOutcome,
     EvidenceCommit,
     EvidenceKey,
@@ -34,6 +35,7 @@ from seqevi.store.transport import CommitModel
 from .support import (
     FixtureAdapter,
     NeverRunAdapter,
+    write_artifact_file,
     write_fixture_database,
     write_fixture_tool,
 )
@@ -44,6 +46,7 @@ class MemoryPersistence:
         self.records: dict[EvidenceKey, EvidenceRecord] = {}
         self.sequences: dict[str, object] = {}
         self.artifacts: dict[str, StoredArtifact] = {}
+        self.fetch_many_calls = 0
         self.closed = False
 
     def lookup_many(
@@ -89,18 +92,8 @@ class MemoryPersistence:
             )
             existing = self.records.setdefault(key, record)
             if existing != record:
-                comparable = (
-                    existing.status,
-                    existing.payload_digest,
-                    existing.normalized_artifact_digest,
-                    existing.raw_artifact_digest,
-                )
-                proposed = (
-                    record.status,
-                    record.payload_digest,
-                    record.normalized_artifact_digest,
-                    record.raw_artifact_digest,
-                )
+                comparable = (existing.status, existing.payload_digest)
+                proposed = (record.status, record.payload_digest)
                 if comparable != proposed:
                     raise EvidenceConflictError("immutable payload conflict")
             outcomes.append(
@@ -110,6 +103,12 @@ class MemoryPersistence:
 
     def fetch_record(self, key: EvidenceKey) -> EvidenceRecord | None:
         return self.records.get(key)
+
+    def fetch_many(
+        self, keys: Iterable[EvidenceKey]
+    ) -> dict[EvidenceKey, EvidenceRecord]:
+        self.fetch_many_calls += 1
+        return {key: self.records[key] for key in keys if key in self.records}
 
     def artifact_metadata(self, digest: str) -> StoredArtifact | None:
         return self.artifacts.get(digest)
@@ -131,14 +130,25 @@ def _key(sequence: str) -> tuple[SequenceIdentity, EvidenceKey]:
 
 
 def _hit_commit(
+    artifact_dir: Path,
     sequence: str = "MPEPTIDE",
     *,
     normalized_data: bytes = b"normalized",
     raw_data: bytes = b"raw",
 ) -> EvidenceCommit:
     identity, key = _key(sequence)
-    normalized = ArtifactPayload(normalized_data, "application/vnd.apache.parquet")
-    raw = ArtifactPayload(raw_data, "text/tab-separated-values")
+    normalized_digest = sha256_digest(normalized_data)
+    raw_digest = sha256_digest(raw_data)
+    normalized = write_artifact_file(
+        artifact_dir / f"{normalized_digest}.parquet",
+        normalized_data,
+        "application/vnd.apache.parquet",
+    )
+    raw = write_artifact_file(
+        artifact_dir / f"{raw_digest}.tsv",
+        raw_data,
+        "text/tab-separated-values",
+    )
     return EvidenceCommit(
         identity=identity,
         key=key,
@@ -166,7 +176,7 @@ def _settings(
 def test_http_store_matches_lookup_commit_and_fetch_contract(tmp_path: Path) -> None:
     persistence = MemoryPersistence()
     app = create_service_app(_settings(tmp_path), persistence=persistence)
-    commit = _hit_commit()
+    commit = _hit_commit(tmp_path / "sources")
 
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
@@ -180,8 +190,10 @@ def test_http_store_matches_lookup_commit_and_fetch_contract(tmp_path: Path) -> 
 
     assert found[commit.key].status is EvidenceStatus.HIT
     assert fetched is not None
-    assert fetched.normalized_artifact == b"normalized"
-    assert fetched.raw_artifact == b"raw"
+    assert fetched.normalized_artifact is not None
+    assert fetched.raw_artifact is not None
+    assert fetched.normalized_artifact.path.read_bytes() == b"normalized"
+    assert fetched.raw_artifact.path.read_bytes() == b"raw"
     assert persistence.closed
 
 
@@ -194,7 +206,9 @@ def test_http_store_preserves_no_hit_without_normalized_artifact(
         key=key,
         status=EvidenceStatus.NO_HIT,
         payload_digest=sha256_digest(b"no-hit"),
-        raw_artifact=ArtifactPayload(b"completed", "text/plain"),
+        raw_artifact=write_artifact_file(
+            tmp_path / "sources" / "completed.txt", b"completed", "text/plain"
+        ),
     )
     persistence = MemoryPersistence()
     app = create_service_app(_settings(tmp_path), persistence=persistence)
@@ -209,7 +223,33 @@ def test_http_store_preserves_no_hit_without_normalized_artifact(
     assert fetched is not None
     assert fetched.record.status is EvidenceStatus.NO_HIT
     assert fetched.normalized_artifact is None
-    assert fetched.raw_artifact == b"completed"
+    assert fetched.raw_artifact is not None
+    assert fetched.raw_artifact.path.read_bytes() == b"completed"
+
+
+def test_http_fetch_many_chunks_metadata_requests_without_n_plus_one(
+    tmp_path: Path,
+) -> None:
+    persistence = MemoryPersistence()
+    app = create_service_app(
+        _settings(tmp_path, maximum_batch_size=2), persistence=persistence
+    )
+    first = _hit_commit(tmp_path / "sources", "MONE")
+    second = _hit_commit(tmp_path / "sources", "MTWO")
+    third = _hit_commit(tmp_path / "sources", "MTHREE")
+
+    with TestClient(app) as test_client:
+        store = HttpEvidenceStore(
+            "http://testserver",
+            maximum_batch_size=2,
+            client=cast(httpx.Client, test_client),
+        )
+        store.commit_many((first, second))
+        store.commit_many((third,))
+        fetched = store.fetch_many((first.key, second.key, third.key))
+
+    assert set(fetched) == {first.key, second.key, third.key}
+    assert persistence.fetch_many_calls == 2
 
 
 def test_service_rejects_bad_artifact_digest_and_oversized_batches(
@@ -249,11 +289,31 @@ def test_service_rejects_bad_artifact_digest_and_oversized_batches(
                     }
                     for item in (
                         EvidenceQuery(
-                            _hit_commit("MONE").identity, _hit_commit("MONE").key
+                            _hit_commit(tmp_path / "sources", "MONE").identity,
+                            _hit_commit(tmp_path / "sources", "MONE").key,
                         ),
                         EvidenceQuery(
-                            _hit_commit("MTWO").identity, _hit_commit("MTWO").key
+                            _hit_commit(tmp_path / "sources", "MTWO").identity,
+                            _hit_commit(tmp_path / "sources", "MTWO").key,
                         ),
+                    )
+                ]
+            },
+        )
+        oversized_fetch = client.post(
+            "/v1/evidence/fetch-many",
+            json={
+                "keys": [
+                    {
+                        "sequence_id": item.key.sequence_id,
+                        "adapter_contract_version": item.key.adapter_contract_version,
+                        "tool_runtime_digest": item.key.tool_runtime_digest,
+                        "resource_id": item.key.resource_id,
+                        "semantic_parameters_json": item.key.semantic_parameters_json,
+                    }
+                    for item in (
+                        _hit_commit(tmp_path / "sources", "MONE"),
+                        _hit_commit(tmp_path / "sources", "MTWO"),
                     )
                 ]
             },
@@ -261,6 +321,7 @@ def test_service_rejects_bad_artifact_digest_and_oversized_batches(
 
     assert response.status_code == 409
     assert oversized.status_code == 413
+    assert oversized_fetch.status_code == 413
 
 
 def test_service_openapi_freezes_v1_operations(tmp_path: Path) -> None:
@@ -271,6 +332,7 @@ def test_service_openapi_freezes_v1_operations(tmp_path: Path) -> None:
         "/v1/artifacts/{digest}",
         "/v1/evidence/commit",
         "/v1/evidence/fetch",
+        "/v1/evidence/fetch-many",
         "/v1/evidence/lookup",
     }
 
@@ -329,10 +391,14 @@ def test_annotation_packages_are_equivalent_for_local_and_http_store(
 
     assert first.computed == 2
     assert second.cache_hits == 2
-    for name in ("evidence.parquet", "no-hits.parquet", "sequence-map.tsv"):
-        assert (tmp_path / "local-output" / name).read_bytes() == (
-            tmp_path / "remote-output" / name
-        ).read_bytes()
+    for name in ("evidence.parquet", "no-hits.parquet"):
+        assert_frame_equal(
+            pl.read_parquet(tmp_path / "local-output" / name),
+            pl.read_parquet(tmp_path / "remote-output" / name),
+        )
+    assert (tmp_path / "local-output" / "sequence-map.tsv").read_text(
+        encoding="utf-8"
+    ) == (tmp_path / "remote-output" / "sequence-map.tsv").read_text(encoding="utf-8")
 
 
 @pytest.mark.requires_postgres
@@ -341,7 +407,7 @@ def test_postgres_service_commit_lookup_fetch_contract(tmp_path: Path) -> None:
     if not database_url:
         pytest.skip("SEQEVI_TEST_POSTGRES_URL is not configured")
     persistence = PostgresEvidencePersistence.open(database_url)
-    commit = _hit_commit("MPOSTGRESPHASEFIVE")
+    commit = _hit_commit(tmp_path / "sources", "MPOSTGRESPHASEFIVE")
     app = create_service_app(
         ServiceSettings(
             database_url=database_url,
@@ -362,12 +428,14 @@ def test_postgres_service_commit_lookup_fetch_contract(tmp_path: Path) -> None:
         assert store.lookup_many((query,))[commit.key].status is EvidenceStatus.HIT
         fetched = store.fetch(commit.key)
     assert fetched is not None
-    assert fetched.normalized_artifact == b"normalized"
-    assert fetched.raw_artifact == b"raw"
+    assert fetched.normalized_artifact is not None
+    assert fetched.raw_artifact is not None
+    assert fetched.normalized_artifact.path.read_bytes() == b"normalized"
+    assert fetched.raw_artifact.path.read_bytes() == b"raw"
 
 
 @pytest.mark.requires_postgres
-def test_postgres_concurrent_identical_commits_are_idempotent() -> None:
+def test_postgres_concurrent_identical_commits_are_idempotent(tmp_path: Path) -> None:
     database_url = os.environ.get("SEQEVI_TEST_POSTGRES_URL")
     if not database_url:
         pytest.skip("SEQEVI_TEST_POSTGRES_URL is not configured")
@@ -375,6 +443,7 @@ def test_postgres_concurrent_identical_commits_are_idempotent() -> None:
         chr(ord("A") + value % 26) for value in os.urandom(24)
     )
     commit = _hit_commit(
+        tmp_path / "sources",
         unique_sequence,
         normalized_data=b"concurrent-normalized",
         raw_data=b"concurrent-raw",

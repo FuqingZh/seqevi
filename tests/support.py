@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import gzip
-import io
 import json
+import shutil
 import stat
 import sys
 from collections.abc import Mapping
@@ -16,7 +16,7 @@ from seqevi.adapters import (
     AdapterSequenceResult,
 )
 from seqevi.errors import AdapterError
-from seqevi.evidence import ArtifactPayload, EvidenceStatus, sha256_digest
+from seqevi.evidence import ArtifactFile, EvidenceStatus, sha256_digest
 from seqevi.runner import ToolCommand, ToolRunner
 from seqevi.sequence import SequenceIdentity
 
@@ -57,7 +57,10 @@ class FixtureAdapter:
         work_dir: Path,
         runner: ToolRunner,
         timeout_seconds: float | None,
+        threads: int,
     ) -> AdapterBatchResult:
+        if threads < 1:
+            raise AdapterError("fixture threads must be positive")
         raw_path = work_dir / "fixture-output.tsv"
         result = runner.run(
             ToolCommand(
@@ -85,8 +88,7 @@ class FixtureAdapter:
             raise AdapterError("fixture executable did not create its primary output")
 
         try:
-            raw = raw_path.read_bytes()
-            frame = pl.read_csv(io.BytesIO(raw), separator="\t")
+            frame = pl.read_csv(raw_path, separator="\t")
         except Exception as error:
             raise AdapterError(f"fixture output is malformed: {error}") from error
 
@@ -105,12 +107,13 @@ class FixtureAdapter:
         df_hits = frame.filter(pl.col("Status") == "hit").select(
             "SequenceID", "Annotation"
         )
-        normalized: ArtifactPayload | None = None
+        normalized: ArtifactFile | None = None
         if df_hits.height:
-            buffer = io.BytesIO()
-            df_hits.write_parquet(buffer, compression="zstd")
-            normalized = ArtifactPayload(
-                buffer.getvalue(), "application/vnd.apache.parquet"
+            normalized_path = work_dir / "fixture.normalized.parquet"
+            df_hits.write_parquet(normalized_path, compression="zstd")
+            normalized = ArtifactFile.from_path(
+                normalized_path,
+                "application/vnd.apache.parquet",
             )
 
         sequence_results = []
@@ -136,11 +139,16 @@ class FixtureAdapter:
                 )
             )
 
+        compressed_path = work_dir / "fixture-output.tsv.gz"
+        with (
+            raw_path.open("rb") as source_handle,
+            compressed_path.open("wb") as target_handle,
+            gzip.GzipFile(fileobj=target_handle, mode="wb", mtime=0) as compressed,
+        ):
+            shutil.copyfileobj(source_handle, compressed)
         return AdapterBatchResult(
             sequences=tuple(sequence_results),
-            raw_artifact=ArtifactPayload(
-                gzip.compress(raw, mtime=0), "application/gzip"
-            ),
+            raw_artifact=ArtifactFile.from_path(compressed_path, "application/gzip"),
             normalized_artifact=normalized,
         )
 
@@ -211,3 +219,11 @@ def write_fixture_database(path: Path, *, mode: str = "success") -> Path:
     path.mkdir()
     (path / "mode.txt").write_text(mode, encoding="utf-8")
     return path
+
+
+def write_artifact_file(path: Path, data: bytes, media_type: str) -> ArtifactFile:
+    """Write a caller-owned artifact fixture without retaining payload bytes."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return ArtifactFile.from_path(path, media_type)

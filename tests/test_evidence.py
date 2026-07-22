@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from seqevi.evidence import (
-    ArtifactPayload,
     EvidenceCommit,
     EvidenceKey,
     EvidenceStatus,
@@ -13,6 +12,8 @@ from seqevi.evidence import (
     sha256_digest,
 )
 from seqevi.sequence import identify_protein_sequence
+
+from .support import write_artifact_file
 
 
 def make_key(**parameter_overrides: object) -> EvidenceKey:
@@ -77,7 +78,7 @@ def test_hit_commit_requires_normalized_artifact() -> None:
         )
 
 
-def test_no_hit_commit_rejects_normalized_artifact() -> None:
+def test_no_hit_commit_rejects_normalized_artifact(tmp_path: Path) -> None:
     identity = identify_protein_sequence("MPEPTIDE")
 
     with pytest.raises(ValueError, match="cannot contain"):
@@ -86,5 +87,7 @@ def test_no_hit_commit_rejects_normalized_artifact() -> None:
             key=make_key(),
             status=EvidenceStatus.NO_HIT,
             payload_digest=sha256_digest(b"no-hit"),
-            normalized_artifact=ArtifactPayload(b"unexpected", "text/plain"),
+            normalized_artifact=write_artifact_file(
+                tmp_path / "unexpected.txt", b"unexpected", "text/plain"
+            ),
         )
