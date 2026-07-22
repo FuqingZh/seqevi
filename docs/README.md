@@ -18,6 +18,7 @@ which external-runtime gates have passed.
 7. [eggNOG runtime validation](benchmarks/20260721-v1.0-eggnog-runtime-validation.md)
 8. [Annotate runtime and bounded-memory plan](implementation-plan/20260722-v1.0-annotate-bounded-memory-plan.md)
 9. [Bounded-memory and operational performance](benchmarks/20260722-v1.0-bounded-memory-performance.md)
+10. [eggNOG-mapper and DIAMOND tuning](benchmarks/20260722-v1.0-eggnog-diamond-tuning.md)
 
 ## Authority
 
