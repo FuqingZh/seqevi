@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-07-22
+> Last updated: 2026-07-23
 
 SeqEvi has implemented the v1 local and shared Store paths plus both initial
 adapters. The documents below define the implementation contract and record
@@ -19,6 +19,7 @@ which external-runtime gates have passed.
 8. [Annotate runtime and bounded-memory plan](implementation-plan/20260722-v1.0-annotate-bounded-memory-plan.md)
 9. [Bounded-memory and operational performance](benchmarks/20260722-v1.0-bounded-memory-performance.md)
 10. [eggNOG-mapper and DIAMOND tuning](benchmarks/20260722-v1.0-eggnog-diamond-tuning.md)
+11. [eggNOG full-proteome scaling](benchmarks/20260723-v1.0-eggnog-full-proteome-tuning.md)
 
 ## Authority
 
