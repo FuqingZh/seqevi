@@ -20,6 +20,8 @@ which external-runtime gates have passed.
 9. [Bounded-memory and operational performance](benchmarks/20260722-v1.0-bounded-memory-performance.md)
 10. [eggNOG-mapper and DIAMOND tuning](benchmarks/20260722-v1.0-eggnog-diamond-tuning.md)
 11. [eggNOG full-proteome scaling](benchmarks/20260723-v1.0-eggnog-full-proteome-tuning.md)
+12. [InterProScan official parity plan](implementation-plan/20260723-v1.0-interproscan-parity-implementation-plan.md)
+13. [InterProScan Pfam runtime validation](benchmarks/20260723-v1.0-interproscan-runtime-validation.md)
 
 ## Authority
 

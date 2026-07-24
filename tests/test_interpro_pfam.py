@@ -132,13 +132,15 @@ for sequence_id, sequence in records:
     first = [
         accession, md5, str(len(sequence)), analysis, "PF00001", "Fixture domain",
         "1", str(min(3, len(sequence))), "1.0E-5", "T", date,
-        "IPR000001", "Fixture InterPro entry",
+        "IPR000001", "Fixture InterPro entry", "-", "-",
     ]
+    if mode == "unexpected-go":
+        first[-2] = "GO:0000001"
     lines.append("\\t".join(first))
     if len(sequence) >= 5:
         second = [
             accession, md5, str(len(sequence)), analysis, "PF00002", "-",
-            "2", "5", "2.5E-4", "T", date, "-", "-",
+            "2", "5", "2.5E-4", "T", date, "-", "-", "-", "-",
         ]
         lines.append("\\t".join(second))
 
@@ -354,11 +356,12 @@ def test_interpro_pfam_run_date_is_excluded_from_scientific_payload(
 @pytest.mark.parametrize(
     ("mode", "message"),
     [
-        ("malformed", "expected 13"),
+        ("malformed", "expected 15"),
         ("unknown-id", "unknown SequenceID"),
         ("bad-md5", "MD5 does not match"),
         ("wrong-analysis", "not a Pfam match"),
         ("bad-date", "invalid run date"),
+        ("unexpected-go", "outside the interpro-pfam/1 contract"),
         ("duplicate", "duplicate match"),
     ],
 )

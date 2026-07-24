@@ -49,7 +49,7 @@ _VERSION_PATTERN = re.compile(r"\b5\.\d+-\d+\.\d+\b")
 _PFAM_VERSION_PATTERN = re.compile(r"\d+(?:\.\d+)+\Z")
 _PFAM_ACCESSION_PATTERN = re.compile(r"PF\d{5}\Z")
 _INTERPRO_ACCESSION_PATTERN = re.compile(r"IPR\d{6}\Z")
-_TSV_COLUMN_COUNT = 13
+_TSV_COLUMN_COUNT = 15
 _PROBE_TIMEOUT_SECONDS = 120.0
 _NORMALIZED_ROW_BATCH_SIZE = 1000
 
@@ -574,6 +574,8 @@ def _parse_tsv_row(
         run_date,
         interpro_accession,
         interpro_description,
+        go_annotations,
+        pathway_annotations,
     ) = fields
     identity = expected.get(accession)
     if identity is None:
@@ -623,6 +625,11 @@ def _parse_tsv_row(
         raise AdapterError(
             f"InterProScan TSV line {line_number} has invalid InterPro accession: "
             f"{normalized_interpro}"
+        )
+    if go_annotations != "-" or pathway_annotations != "-":
+        raise AdapterError(
+            f"InterProScan TSV line {line_number} contains GO or pathway annotations "
+            "outside the interpro-pfam/1 contract"
         )
 
     return {

@@ -16,15 +16,16 @@ external tool runner, exact cache-miss orchestration, and atomic Data Package
 materialization.
 
 The `interpro-pfam` and eggNOG-mapper 2.x `eggnog` adapters are implemented with
-native-output validation and fixture parity coverage. The eggNOG adapter also
-passes direct parity against eggNOG-mapper 2.1.13 and eggNOG DB 5.0.2;
-InterProScan official-runtime parity remains pending. The Phase 5 shared Store
-service, HTTP client, streamed POSIX artifacts, and PostgreSQL persistence are
-implemented and covered by local/shared plus provisioned PostgreSQL integration
-tests. Phase 6 resource locks avoid repeated hashing of large immutable database
-files and provide an explicit full-content verification command. Annotation now
-uses atomic FASTA staging, file-backed artifacts, bounded Store batches, lazy
-Parquet materialization, and an operational thread setting.
+native-output validation and fixture parity coverage. The eggNOG adapter passes
+direct parity against eggNOG-mapper 2.1.13 and eggNOG DB 5.0.2. The InterPro
+adapter passes direct parity against InterProScan 5.77-108.0 with InterPro data
+108.0 and Pfam 38.1. The Phase 5 shared Store service, HTTP client, streamed
+POSIX artifacts, and PostgreSQL persistence are implemented and covered by
+local/shared plus provisioned PostgreSQL integration tests. Phase 6 resource
+locks avoid repeated hashing of large immutable database files and provide an
+explicit full-content verification command. Annotation now uses atomic FASTA
+staging, file-backed artifacts, bounded Store batches, lazy Parquet
+materialization, and an operational thread setting.
 
 ## Why SeqEvi
 
@@ -107,6 +108,7 @@ Start with [the documentation index](docs/README.md).
 - [Validation strategy](docs/testing/20260720-v1.0-validation-strategy.md)
 - [Annotate runtime and bounded-memory plan](docs/implementation-plan/20260722-v1.0-annotate-bounded-memory-plan.md)
 - [Bounded-memory and operational performance](docs/benchmarks/20260722-v1.0-bounded-memory-performance.md)
+- [InterProScan Pfam runtime validation](docs/benchmarks/20260723-v1.0-interproscan-runtime-validation.md)
 
 ## External Tools
 
