@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
+from pathlib import Path
 from string import ascii_letters
 
 import pytest
@@ -14,9 +15,13 @@ from seqevi.sequence import (
     ga4gh_sequence_id,
     identify_protein_sequence,
     iter_fasta_lines,
+    iter_staged_identities,
+    iter_staged_records,
     parse_fasta,
+    stage_fasta,
     unique_identities,
 )
+from seqevi.evidence import sha256_digest
 
 
 def test_ga4gh_identifier_matches_official_refget_vector() -> None:
@@ -81,6 +86,54 @@ def test_parse_fasta_collects_errors_and_returns_no_partial_result() -> None:
 def test_empty_fasta_is_invalid() -> None:
     with pytest.raises(FastaValidationError, match="contains no records"):
         parse_fasta(StringIO(""))
+
+
+def test_fasta_stage_preserves_atomic_records_identity_and_raw_digest(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    raw = b">first label\nacgt\n>second alias\nAC GT*\n>third\nMPEPTIDE\n"
+    fasta.write_bytes(raw)
+
+    stage = stage_fasta(fasta, tmp_path / "stage")
+
+    records = tuple(iter_staged_records(stage))
+    identities = tuple(iter_staged_identities(stage))
+    assert stage.input_digest == sha256_digest(raw)
+    assert stage.input_records == 3
+    assert stage.unique_sequences == 2
+    assert [record.input_id for record in records] == ["first", "second", "third"]
+    assert identities == (records[0].identity, records[2].identity)
+
+
+def test_invalid_fasta_stage_is_removed_and_returns_no_partial_records(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(
+        ">valid\nACGT\n>middle\nAC-GT\n>valid\nMPEPTIDE\n>last\nAC1GT\n",
+        encoding="utf-8",
+    )
+    stage_dir = tmp_path / "stage"
+
+    with pytest.raises(FastaValidationError) as caught:
+        stage_fasta(fasta, stage_dir)
+
+    assert len(caught.value.issues) == 3
+    assert not stage_dir.exists()
+
+
+def test_non_utf8_fasta_stage_is_a_validation_error_and_is_removed(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_bytes(b">valid\nACGT\n>invalid\nMPEP\xffTIDE\n")
+    stage_dir = tmp_path / "stage"
+
+    with pytest.raises(FastaValidationError, match="not valid UTF-8"):
+        stage_fasta(fasta, stage_dir)
+
+    assert not stage_dir.exists()
 
 
 def test_sequence_identity_rejects_inconsistent_manual_values() -> None:

@@ -10,14 +10,22 @@ result package for the current FASTA.
 
 ## Status
 
-The target architecture and v1 contracts are approved. The Phase 1 core now
-implements strict protein sequence identity and the single-host SQLite/POSIX
-Store, including exact immutable evidence keys and incremental-reuse tests.
+The target architecture and v1 contracts are approved. Phases 1 and 2 implement
+strict protein sequence identity, the single-host SQLite/POSIX Store, the
+external tool runner, exact cache-miss orchestration, and atomic Data Package
+materialization.
 
-The real annotation adapters, output Data Package, and shared Store service are
-not implemented yet. The `annotate` and `serve` examples below still describe
-the intended public interface. The currently installed command supports
-`seqevi --version` while those product commands are developed.
+The `interpro-pfam` and eggNOG-mapper 2.x `eggnog` adapters are implemented with
+native-output validation and fixture parity coverage. The eggNOG adapter passes
+direct parity against eggNOG-mapper 2.1.13 and eggNOG DB 5.0.2. The InterPro
+adapter passes direct parity against InterProScan 5.77-108.0 with InterPro data
+108.0 and Pfam 38.1. The Phase 5 shared Store service, HTTP client, streamed
+POSIX artifacts, and PostgreSQL persistence are implemented and covered by
+local/shared plus provisioned PostgreSQL integration tests. Phase 6 resource
+locks avoid repeated hashing of large immutable database files and provide an
+explicit full-content verification command. Annotation now uses atomic FASTA
+staging, file-backed artifacts, bounded Store batches, lazy Parquet
+materialization, and an operational thread setting.
 
 ## Why SeqEvi
 
@@ -37,12 +45,35 @@ fall back to an older result.
 
 ## Intended CLI
 
+For repeated use, keep one machine-local TOML per adapter runtime under
+`${XDG_CONFIG_HOME:-~/.config}/seqevi/profiles/`:
+
+```bash
+seqevi profile example --adapter eggnog
+seqevi profile example --adapter interpro-pfam
+```
+
+After saving and editing a template:
+
+```bash
+seqevi annotate \
+  --profile eggnog-5.0.2 \
+  --fasta proteins.fasta \
+  --output results/eggnog
+```
+
+An exact profile file can be selected with `--config PATH`. Complete explicit
+mode remains available:
+
 ```bash
 seqevi annotate \
   --adapter eggnog \
   --fasta proteins.fasta \
   --store /data/seqevi-store \
-  --output results/eggnog
+  --output results/eggnog \
+  --executable /opt/eggnog-mapper/emapper.py \
+  --resource /data/eggnog-5.0.2 \
+  --threads 8
 ```
 
 ```bash
@@ -50,7 +81,9 @@ seqevi annotate \
   --adapter interpro-pfam \
   --fasta proteins.fasta \
   --store https://seqevi.example.org \
-  --output results/pfam
+  --output results/pfam \
+  --executable /opt/interproscan/interproscan.sh \
+  --resource /data/interproscan-5.77-108.0/data
 ```
 
 Shared deployments expose the same Store contract:
@@ -59,6 +92,15 @@ Shared deployments expose the same Store contract:
 seqevi serve \
   --database-url postgresql+psycopg://seqevi@postgres/seqevi \
   --artifacts-dir /data/seqevi-artifacts
+```
+
+Initialize or audit a database resource lock independently of annotation:
+
+```bash
+seqevi resource verify \
+  --adapter eggnog \
+  --executable /opt/eggnog-mapper/emapper.py \
+  --resource /data/eggnog-5.0.2
 ```
 
 ## V1 Scope
@@ -81,9 +123,14 @@ Start with [the documentation index](docs/README.md).
 - [Architecture overview](docs/architecture/20260720-v1.0-seqevi-architecture.md)
 - [Sequence and evidence contract](docs/architecture/20260720-v1.0-sequence-evidence-contract.md)
 - [Adapter contract](docs/architecture/20260720-v1.0-adapter-contract.md)
+- [Execution profile contract](docs/architecture/20260724-v1.0-execution-profile-contract.md)
 - [Storage and deployment architecture](docs/architecture/20260720-v1.0-storage-deployment-architecture.md)
 - [MVP implementation plan](docs/implementation-plan/20260720-v1.0-mvp-implementation-plan.md)
+- [Execution profile implementation plan](docs/implementation-plan/20260724-v1.0-execution-profile-implementation-plan.md)
 - [Validation strategy](docs/testing/20260720-v1.0-validation-strategy.md)
+- [Annotate runtime and bounded-memory plan](docs/implementation-plan/20260722-v1.0-annotate-bounded-memory-plan.md)
+- [Bounded-memory and operational performance](docs/benchmarks/20260722-v1.0-bounded-memory-performance.md)
+- [InterProScan Pfam runtime validation](docs/benchmarks/20260723-v1.0-interproscan-runtime-validation.md)
 
 ## External Tools
 

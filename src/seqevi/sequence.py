@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
+import json
+import shutil
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Any, BinaryIO, TextIO
 
 from Bio.SeqIO.FastaIO import SimpleFastaParser
 
@@ -47,6 +50,43 @@ class InputSequence:
     input_id: str
     input_header: str
     identity: SequenceIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class FastaStage:
+    """Validated temporary FASTA records and unique identities."""
+
+    root: Path
+    records_path: Path
+    identities_path: Path
+    input_digest: str
+    input_records: int
+    unique_sequences: int
+
+
+class _HashingRawReader(io.RawIOBase):
+    """Hash the exact bytes consumed by one buffered text parser."""
+
+    def __init__(self, handle: BinaryIO, hasher: Any) -> None:
+        self._handle = handle
+        self._hasher = hasher
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any, /) -> int | None:
+        data = self._handle.read(len(buffer))
+        if not data:
+            return 0
+        buffer[: len(data)] = data
+        self._hasher.update(data)
+        return len(data)
+
+    def close(self) -> None:
+        try:
+            self._handle.close()
+        finally:
+            super().close()
 
 
 def canonicalize_protein_sequence(sequence: str) -> str:
@@ -149,6 +189,128 @@ def read_fasta(path: Path) -> tuple[InputSequence, ...]:
         return parse_fasta(handle)
 
 
+def stage_fasta(path: Path, stage_dir: Path) -> FastaStage:
+    """Validate a FASTA atomically while writing bounded temporary staging.
+
+    No usable stage is returned unless every input record passes validation.
+    The raw input digest is calculated incrementally before any Store access.
+    """
+
+    if stage_dir.exists():
+        if not stage_dir.is_dir() or any(stage_dir.iterdir()):
+            raise ValueError(f"FASTA stage path is not empty: {stage_dir}")
+    else:
+        stage_dir.mkdir()
+    records_path = stage_dir / "records.ndjson"
+    identities_path = stage_dir / "identities.ndjson"
+    issues: list[FastaIssue] = []
+    seen_input_ids: set[str] = set()
+    seen_sequence_ids: set[str] = set()
+    input_records = 0
+
+    try:
+        input_hasher = hashlib.sha256()
+        with (
+            io.TextIOWrapper(
+                io.BufferedReader(_HashingRawReader(path.open("rb"), input_hasher)),
+                encoding="utf-8",
+                newline=None,
+            ) as source,
+            records_path.open("w", encoding="utf-8", newline="\n") as records_out,
+            identities_path.open("w", encoding="utf-8", newline="\n") as identities_out,
+        ):
+            for record_number, (header, sequence) in enumerate(
+                SimpleFastaParser(source), start=1
+            ):
+                input_records = record_number
+                input_id = header.split(maxsplit=1)[0] if header else ""
+                issue_id = input_id or None
+                record_is_valid = True
+                identity: SequenceIdentity | None = None
+                if not input_id:
+                    issues.append(
+                        FastaIssue(record_number, None, "FASTA header is empty")
+                    )
+                    record_is_valid = False
+                elif input_id in seen_input_ids:
+                    issues.append(
+                        FastaIssue(
+                            record_number,
+                            input_id,
+                            "InputID is duplicated",
+                        )
+                    )
+                    record_is_valid = False
+                else:
+                    seen_input_ids.add(input_id)
+
+                try:
+                    identity = identify_protein_sequence(sequence)
+                except ValueError as error:
+                    issues.append(FastaIssue(record_number, issue_id, str(error)))
+                    record_is_valid = False
+
+                if not record_is_valid or identity is None:
+                    continue
+                record = InputSequence(
+                    input_order=record_number,
+                    input_id=input_id,
+                    input_header=header,
+                    identity=identity,
+                )
+                records_out.write(_serialize_record(record) + "\n")
+                if identity.sequence_id not in seen_sequence_ids:
+                    seen_sequence_ids.add(identity.sequence_id)
+                    identities_out.write(_serialize_identity(identity) + "\n")
+
+        if input_records == 0 and not issues:
+            issues.append(FastaIssue(0, None, "FASTA contains no records"))
+        if issues:
+            raise FastaValidationError(tuple(issues))
+        return FastaStage(
+            root=stage_dir,
+            records_path=records_path,
+            identities_path=identities_path,
+            input_digest=input_hasher.hexdigest(),
+            input_records=input_records,
+            unique_sequences=len(seen_sequence_ids),
+        )
+    except UnicodeDecodeError as error:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        issue = FastaIssue(
+            max(input_records + 1, 1),
+            None,
+            f"FASTA is not valid UTF-8: {error}",
+        )
+        raise FastaValidationError((issue,)) from error
+    except Exception:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
+
+
+def iter_staged_records(stage: FastaStage) -> Iterator[InputSequence]:
+    """Yield validated input records in invocation order."""
+
+    with stage.records_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            raw = json.loads(line)
+            identity = _identity_from_mapping(raw["identity"])
+            yield InputSequence(
+                input_order=raw["input_order"],
+                input_id=raw["input_id"],
+                input_header=raw["input_header"],
+                identity=identity,
+            )
+
+
+def iter_staged_identities(stage: FastaStage) -> Iterator[SequenceIdentity]:
+    """Yield each first-seen canonical identity exactly once."""
+
+    with stage.identities_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            yield _identity_from_mapping(json.loads(line))
+
+
 def unique_identities(
     records: tuple[InputSequence, ...],
 ) -> tuple[SequenceIdentity, ...]:
@@ -166,3 +328,56 @@ def iter_fasta_lines(identities: tuple[SequenceIdentity, ...]) -> Iterator[str]:
     for identity in sorted(identities, key=lambda item: item.sequence_id):
         yield f">{identity.sequence_id}\n"
         yield f"{identity.sequence}\n"
+
+
+def _serialize_record(record: InputSequence) -> str:
+    return json.dumps(
+        {
+            "identity": _identity_mapping(record.identity),
+            "input_header": record.input_header,
+            "input_id": record.input_id,
+            "input_order": record.input_order,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _serialize_identity(identity: SequenceIdentity) -> str:
+    return json.dumps(
+        _identity_mapping(identity),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _identity_mapping(identity: SequenceIdentity) -> dict[str, object]:
+    return {
+        "length": identity.length,
+        "md5": identity.md5,
+        "sequence": identity.sequence,
+        "sequence_id": identity.sequence_id,
+    }
+
+
+def _identity_from_mapping(raw: dict[str, object]) -> SequenceIdentity:
+    sequence_id = raw.get("sequence_id")
+    md5 = raw.get("md5")
+    length = raw.get("length")
+    sequence = raw.get("sequence")
+    if (
+        not isinstance(sequence_id, str)
+        or not isinstance(md5, str)
+        or isinstance(length, bool)
+        or not isinstance(length, int)
+        or not isinstance(sequence, str)
+    ):
+        raise ValueError("invalid internal FASTA identity staging row")
+    return SequenceIdentity(
+        sequence_id=sequence_id,
+        md5=md5,
+        length=length,
+        sequence=sequence,
+    )

@@ -10,8 +10,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
+from .hashing import sha256_file
 from .sequence import SequenceIdentity
 
 _SEQUENCE_ID_PATTERN = re.compile(r"SQ\.[A-Za-z0-9_-]{32}\Z")
@@ -147,22 +149,66 @@ class EvidenceKey:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class ArtifactPayload:
-    """Exact artifact bytes and their media type before Store insertion."""
+class ArtifactLifetime(StrEnum):
+    """Owner responsible for keeping an artifact file available."""
 
-    data: bytes
+    CALLER = "caller"
+    STORE = "store"
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactFile:
+    """Integrity metadata and a stable file path for one artifact."""
+
+    path: Path
     media_type: str
+    byte_size: int
+    digest: str
+    lifetime: ArtifactLifetime
 
     def __post_init__(self) -> None:
-        if not isinstance(self.data, bytes):
-            raise TypeError("artifact data must be bytes")
+        if not self.path.is_file():
+            raise ValueError(f"artifact path is not a file: {self.path}")
         if not self.media_type:
             raise ValueError("artifact media_type must not be empty")
+        if self.byte_size < 0 or self.path.stat().st_size != self.byte_size:
+            raise ValueError("artifact byte_size does not match its file")
+        if not _SHA256_PATTERN.fullmatch(self.digest):
+            raise ValueError("artifact digest must be a lowercase SHA-256 digest")
+        if not isinstance(self.lifetime, ArtifactLifetime):
+            raise TypeError("artifact lifetime must be an ArtifactLifetime")
 
-    @property
-    def digest(self) -> str:
-        return sha256_digest(self.data)
+    @classmethod
+    def from_path(
+        cls,
+        path: Path,
+        media_type: str,
+        *,
+        lifetime: ArtifactLifetime = ArtifactLifetime.CALLER,
+    ) -> ArtifactFile:
+        """Hash a stable artifact path incrementally and capture its metadata."""
+
+        path = path.resolve()
+        before = path.stat()
+        digest = sha256_file(path)
+        after = path.stat()
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity:
+            raise ValueError(f"artifact changed while hashing: {path}")
+        return cls(path, media_type, after.st_size, digest, lifetime)
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,8 +229,8 @@ class EvidenceCommit:
     key: EvidenceKey
     status: EvidenceStatus
     payload_digest: str
-    normalized_artifact: ArtifactPayload | None = None
-    raw_artifact: ArtifactPayload | None = None
+    normalized_artifact: ArtifactFile | None = None
+    raw_artifact: ArtifactFile | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, EvidenceStatus):
@@ -228,11 +274,11 @@ class EvidenceRecord:
 
 @dataclass(frozen=True, slots=True)
 class FetchedEvidence:
-    """Evidence metadata with integrity-checked artifact bytes."""
+    """Evidence metadata with integrity-checked file-backed artifacts."""
 
     record: EvidenceRecord
-    normalized_artifact: bytes | None
-    raw_artifact: bytes | None
+    normalized_artifact: ArtifactFile | None
+    raw_artifact: ArtifactFile | None
 
 
 @dataclass(frozen=True, slots=True)

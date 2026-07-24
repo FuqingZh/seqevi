@@ -43,3 +43,27 @@ class StoreIntegrityError(StoreError):
 
 class EvidenceConflictError(StoreIntegrityError):
     """Raised when one evidence key is associated with different payloads."""
+
+
+class AnnotationError(RuntimeError):
+    """Base class for one annotation invocation failure."""
+
+
+class ProfileConfigurationError(AnnotationError):
+    """Raised when an execution profile cannot be resolved safely."""
+
+
+class AdapterError(AnnotationError):
+    """Raised when an adapter cannot produce valid terminal evidence."""
+
+
+class ResourceLockError(AdapterError):
+    """Raised when a database resource lock is invalid or conflicts with files."""
+
+
+class AdapterUnavailableError(AdapterError):
+    """Raised when a declared adapter is not implemented in this release."""
+
+
+class OutputPackageError(AnnotationError):
+    """Raised when a valid invocation package cannot be materialized."""

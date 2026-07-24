@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     CheckConstraint,
+    BigInteger,
     Column,
     DateTime,
     ForeignKey,
@@ -37,7 +38,7 @@ artifacts = Table(
     metadata,
     Column("digest", String(64), primary_key=True),
     Column("media_type", Text, nullable=False),
-    Column("byte_size", Integer, nullable=False),
+    Column("byte_size", BigInteger, nullable=False),
     Column("relative_path", Text, nullable=False, unique=True),
     Column(
         "created_at", DateTime(timezone=True), nullable=False, server_default=func.now()
