@@ -12,10 +12,10 @@ import polars as pl
 import pytest
 from fastapi.testclient import TestClient
 from polars.testing import assert_frame_equal
-from sqlalchemy import create_engine
+from sqlalchemy import BigInteger, create_engine
 
 from seqevi.annotate import run_annotation
-from seqevi.errors import EvidenceConflictError, StoreIntegrityError
+from seqevi.errors import EvidenceConflictError, StoreError, StoreIntegrityError
 from seqevi.evidence import (
     CommitOutcome,
     EvidenceCommit,
@@ -30,6 +30,7 @@ from seqevi.sequence import SequenceIdentity, identify_protein_sequence
 from seqevi.service import ServiceSettings, create_service_app
 from seqevi.service.persistence import PostgresEvidencePersistence
 from seqevi.store import HttpEvidenceStore, LocalStore
+from seqevi.store.schema import artifacts
 from seqevi.store.transport import CommitModel
 
 from .support import (
@@ -47,11 +48,13 @@ class MemoryPersistence:
         self.sequences: dict[str, object] = {}
         self.artifacts: dict[str, StoredArtifact] = {}
         self.fetch_many_calls = 0
+        self.lookup_many_calls = 0
         self.closed = False
 
     def lookup_many(
         self, queries: Iterable[EvidenceQuery]
     ) -> dict[EvidenceKey, EvidenceRecord]:
+        self.lookup_many_calls += 1
         found = {}
         for query in queries:
             persisted = self.sequences.get(query.identity.sequence_id)
@@ -252,6 +255,62 @@ def test_http_fetch_many_chunks_metadata_requests_without_n_plus_one(
     assert persistence.fetch_many_calls == 2
 
 
+def test_http_lookup_and_commit_follow_discovered_service_batch_size(
+    tmp_path: Path,
+) -> None:
+    persistence = MemoryPersistence()
+    app = create_service_app(
+        _settings(tmp_path, maximum_batch_size=2),
+        persistence=persistence,
+    )
+    commits = tuple(
+        _hit_commit(tmp_path / "sources", sequence)
+        for sequence in ("MONE", "MTWO", "MTHREE")
+    )
+
+    with TestClient(app) as test_client:
+        store = HttpEvidenceStore(
+            "http://testserver",
+            client=cast(httpx.Client, test_client),
+        )
+        assert store.maximum_batch_size == 2
+        assert store.commit_many(commits) == (CommitOutcome.CREATED,) * 3
+        found = store.lookup_many(
+            EvidenceQuery(commit.identity, commit.key) for commit in commits
+        )
+
+    assert set(found) == {commit.key for commit in commits}
+    assert persistence.lookup_many_calls == 2
+
+
+def test_http_store_uses_discovered_artifact_limit_and_formats_stream_errors(
+    tmp_path: Path,
+) -> None:
+    persistence = MemoryPersistence()
+    identity, key = _key("MMISSING")
+    persistence.records[key] = EvidenceRecord(
+        key=key,
+        status=EvidenceStatus.NO_HIT,
+        payload_digest=sha256_digest(b"missing"),
+        normalized_artifact_digest=None,
+        raw_artifact_digest="f" * 64,
+        created_at=datetime.now(UTC),
+    )
+    app = create_service_app(
+        _settings(tmp_path, maximum_artifact_bytes=1234),
+        persistence=persistence,
+    )
+
+    with TestClient(app) as test_client:
+        store = HttpEvidenceStore(
+            "http://testserver",
+            client=cast(httpx.Client, test_client),
+        )
+        assert store.maximum_artifact_bytes == 1234
+        with pytest.raises(StoreError, match="HTTP 404"):
+            store.fetch(key)
+
+
 def test_service_rejects_bad_artifact_digest_and_oversized_batches(
     tmp_path: Path,
 ) -> None:
@@ -345,12 +404,47 @@ def test_shared_store_configuration_requires_postgres_and_postgres_engine(
             database_url="sqlite:///store.sqlite3",
             artifacts_dir=tmp_path,
         )
+    normalized = ServiceSettings(
+        database_url="postgresql://seqevi@postgres/seqevi",
+        artifacts_dir=tmp_path,
+    )
+    assert normalized.database_url == "postgresql+psycopg://seqevi@postgres/seqevi"
+    assert isinstance(artifacts.c.byte_size.type, BigInteger)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     try:
         with pytest.raises(ValueError, match="requires PostgreSQL"):
             PostgresEvidencePersistence(engine)
     finally:
         engine.dispose()
+
+
+def test_service_returns_422_for_invalid_domain_values_and_missing_raw_artifact(
+    tmp_path: Path,
+) -> None:
+    commit = _hit_commit(tmp_path / "sources")
+    model = CommitModel.from_domain(commit).model_dump(mode="json")
+    invalid_identity = {
+        **model,
+        "identity": {
+            **model["identity"],
+            "md5": "0" * 32,
+        },
+    }
+    missing_raw = {**model, "raw_artifact": None}
+    app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
+
+    with TestClient(app) as client:
+        invalid_response = client.post(
+            "/v1/evidence/commit",
+            json={"commits": [invalid_identity]},
+        )
+        missing_raw_response = client.post(
+            "/v1/evidence/commit",
+            json={"commits": [missing_raw]},
+        )
+
+    assert invalid_response.status_code == 422
+    assert missing_raw_response.status_code == 422
 
 
 def test_annotation_packages_are_equivalent_for_local_and_http_store(

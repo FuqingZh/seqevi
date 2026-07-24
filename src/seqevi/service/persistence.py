@@ -104,14 +104,23 @@ class PostgresEvidencePersistence:
                             evidence.c.semantic_parameters_hash == contract[3],
                         )
                     )
-                    for row in connection.execute(statement).mappings():
+                    rows = tuple(connection.execute(statement).mappings())
+                    returned_sequence_ids = {
+                        row["sequence_id"]
+                        for row in rows
+                        if _record_from_row(row).key in requested_keys
+                    }
+                    _verify_sequences(
+                        connection,
+                        {
+                            sequence_id: identities[sequence_id]
+                            for sequence_id in returned_sequence_ids
+                        },
+                    )
+                    for row in rows:
                         record = _record_from_row(row)
                         if record.key not in requested_keys:
                             continue
-                        _verify_sequence(
-                            connection,
-                            identities[record.key.sequence_id],
-                        )
                         found[record.key] = record
         return found
 
@@ -219,6 +228,26 @@ def _verify_sequence(connection: Connection, identity: SequenceIdentity) -> None
         raise StoreIntegrityError(
             f"SequenceID collision in shared Store: {identity.sequence_id}"
         )
+
+
+def _verify_sequences(
+    connection: Connection, identities: dict[str, SequenceIdentity]
+) -> None:
+    if not identities:
+        return
+    rows = connection.execute(
+        select(sequences).where(sequences.c.sequence_id.in_(identities))
+    ).mappings()
+    observed = {}
+    for row in rows:
+        observed[row["sequence_id"]] = (row["md5"], row["length"], row["sequence"])
+    for sequence_id, identity in identities.items():
+        persisted = observed.get(sequence_id)
+        requested = (identity.md5, identity.length, identity.sequence)
+        if persisted != requested:
+            raise StoreIntegrityError(
+                f"SequenceID collision in shared Store: {sequence_id}"
+            )
 
 
 def _insert_artifact(connection: Connection, artifact: StoredArtifact) -> None:

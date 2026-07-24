@@ -38,7 +38,7 @@ def upgrade() -> None:
         "artifact",
         sa.Column("digest", sa.String(length=64), nullable=False),
         sa.Column("media_type", sa.Text(), nullable=False),
-        sa.Column("byte_size", sa.Integer(), nullable=False),
+        sa.Column("byte_size", sa.BigInteger(), nullable=False),
         sa.Column("relative_path", sa.Text(), nullable=False),
         sa.Column(
             "created_at",

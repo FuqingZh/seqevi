@@ -57,7 +57,10 @@ def create_service_app(
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
-        return HealthResponse()
+        return HealthResponse(
+            maximum_batch_size=settings.maximum_batch_size,
+            maximum_artifact_bytes=settings.maximum_artifact_bytes,
+        )
 
     @app.post("/v1/evidence/lookup", response_model=LookupResponse)
     def lookup(request: LookupRequest) -> LookupResponse:
@@ -175,9 +178,7 @@ def create_service_app(
         except EvidenceConflictError as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         except (StoreIntegrityError, ValueError) as error:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)
-            ) from error
+            raise HTTPException(422, str(error)) from error
         return CommitResponse(outcomes=list(outcomes))
 
     return app
@@ -198,6 +199,8 @@ def _validate_commit_model(commit: CommitModel) -> None:
         raise ValueError("hit evidence requires a normalized artifact")
     if commit.status.value == "no_hit" and commit.normalized_artifact is not None:
         raise ValueError("no-hit evidence cannot contain a normalized artifact")
+    if commit.raw_artifact is None:
+        raise ValueError("shared evidence requires a raw artifact")
 
 
 def _key_sort_value(key: EvidenceKey) -> tuple[str, str, str, str, str]:

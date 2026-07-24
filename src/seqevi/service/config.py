@@ -23,7 +23,13 @@ class ServiceSettings(BaseSettings):
     )
 
     def model_post_init(self, _context: object) -> None:
-        if not self.database_url.startswith(("postgresql://", "postgresql+psycopg://")):
+        if self.database_url.startswith("postgresql://"):
+            object.__setattr__(
+                self,
+                "database_url",
+                self.database_url.replace("postgresql://", "postgresql+psycopg://", 1),
+            )
+        elif not self.database_url.startswith("postgresql+psycopg://"):
             raise ValueError("shared Store database_url must use PostgreSQL")
         object.__setattr__(
             self,

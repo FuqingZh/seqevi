@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from seqevi.evidence import (
     ArtifactFile,
@@ -34,6 +34,11 @@ class SequenceModel(TransportModel):
     length: Annotated[int, Field(gt=0)]
     sequence: str
 
+    @model_validator(mode="after")
+    def validate_domain_identity(self) -> SequenceModel:
+        SequenceIdentity(**self.model_dump())
+        return self
+
     @classmethod
     def from_domain(cls, value: SequenceIdentity) -> SequenceModel:
         return cls(
@@ -54,6 +59,11 @@ class EvidenceKeyModel(TransportModel):
     resource_id: str
     semantic_parameters_json: str
 
+    @model_validator(mode="after")
+    def validate_domain_key(self) -> EvidenceKeyModel:
+        EvidenceKey(**self.model_dump())
+        return self
+
     @classmethod
     def from_domain(cls, value: EvidenceKey) -> EvidenceKeyModel:
         return cls(
@@ -71,6 +81,11 @@ class EvidenceKeyModel(TransportModel):
 class EvidenceQueryModel(TransportModel):
     identity: SequenceModel
     key: EvidenceKeyModel
+
+    @model_validator(mode="after")
+    def validate_domain_query(self) -> EvidenceQueryModel:
+        EvidenceQuery(self.identity.to_domain(), self.key.to_domain())
+        return self
 
     @classmethod
     def from_domain(cls, value: EvidenceQuery) -> EvidenceQueryModel:
@@ -151,6 +166,21 @@ class CommitModel(TransportModel):
     normalized_artifact: ArtifactReferenceModel | None
     raw_artifact: ArtifactReferenceModel | None
 
+    @model_validator(mode="after")
+    def validate_shared_commit(self) -> CommitModel:
+        if self.key.sequence_id != self.identity.sequence_id:
+            raise ValueError("evidence key and sequence identity do not match")
+        if self.status is EvidenceStatus.HIT and self.normalized_artifact is None:
+            raise ValueError("hit evidence requires a normalized artifact")
+        if (
+            self.status is EvidenceStatus.NO_HIT
+            and self.normalized_artifact is not None
+        ):
+            raise ValueError("no-hit evidence cannot contain a normalized artifact")
+        if self.raw_artifact is None:
+            raise ValueError("shared evidence requires a raw artifact")
+        return self
+
     @classmethod
     def from_domain(cls, value: EvidenceCommit) -> CommitModel:
         def reference(
@@ -190,3 +220,5 @@ class ArtifactUploadResponse(TransportModel):
 class HealthResponse(TransportModel):
     status: Literal["ok"] = "ok"
     api_version: Literal["v1"] = "v1"
+    maximum_batch_size: Annotated[int, Field(ge=1)]
+    maximum_artifact_bytes: Annotated[int, Field(ge=1)]

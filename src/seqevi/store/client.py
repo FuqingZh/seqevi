@@ -33,6 +33,7 @@ from .transport import (
     EvidenceQueryModel,
     FetchManyRequest,
     FetchManyResponse,
+    HealthResponse,
     LookupRequest,
     LookupResponse,
 )
@@ -48,14 +49,10 @@ class HttpEvidenceStore:
         base_url: str,
         *,
         timeout_seconds: float = 120.0,
-        maximum_artifact_bytes: int = 512 * 1024 * 1024,
-        maximum_batch_size: int = 1000,
+        maximum_artifact_bytes: int | None = None,
+        maximum_batch_size: int | None = None,
         client: httpx.Client | None = None,
     ) -> None:
-        if maximum_batch_size < 1:
-            raise ValueError("maximum_batch_size must be positive")
-        self.maximum_artifact_bytes = maximum_artifact_bytes
-        self.maximum_batch_size = maximum_batch_size
         self._uploaded_artifact_digests: set[str] = set()
         self._download_directory = tempfile.TemporaryDirectory(
             prefix="seqevi-http-artifacts-"
@@ -67,6 +64,20 @@ class HttpEvidenceStore:
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout_seconds),
         )
+        if maximum_artifact_bytes is None or maximum_batch_size is None:
+            health = HealthResponse.model_validate(
+                self._request("GET", "/health").json()
+            )
+            if maximum_artifact_bytes is None:
+                maximum_artifact_bytes = health.maximum_artifact_bytes
+            if maximum_batch_size is None:
+                maximum_batch_size = health.maximum_batch_size
+        if maximum_artifact_bytes < 1:
+            raise ValueError("maximum_artifact_bytes must be positive")
+        if maximum_batch_size < 1:
+            raise ValueError("maximum_batch_size must be positive")
+        self.maximum_artifact_bytes = maximum_artifact_bytes
+        self.maximum_batch_size = maximum_batch_size
 
     def close(self) -> None:
         try:
@@ -85,24 +96,32 @@ class HttpEvidenceStore:
         self, requested_queries: Iterable[EvidenceQuery]
     ) -> dict[EvidenceKey, EvidenceRecord]:
         requested = tuple(dict.fromkeys(requested_queries))
-        request = LookupRequest(
-            queries=[EvidenceQueryModel.from_domain(query) for query in requested]
-        )
-        response = self._request(
-            "POST", "/v1/evidence/lookup", json=request.model_dump(mode="json")
-        )
-        payload = LookupResponse.model_validate(response.json())
-        records = [record.to_domain() for record in payload.records]
         expected = {query.key for query in requested}
-        observed = {record.key for record in records}
-        if len(observed) != len(records) or not observed.issubset(expected):
-            raise StoreIntegrityError("shared Store returned unexpected lookup records")
-        return {record.key: record for record in records}
+        records: dict[EvidenceKey, EvidenceRecord] = {}
+        for offset in range(0, len(requested), self.maximum_batch_size):
+            chunk = requested[offset : offset + self.maximum_batch_size]
+            request = LookupRequest(
+                queries=[EvidenceQueryModel.from_domain(query) for query in chunk]
+            )
+            response = self._request(
+                "POST", "/v1/evidence/lookup", json=request.model_dump(mode="json")
+            )
+            payload = LookupResponse.model_validate(response.json())
+            for model in payload.records:
+                record = model.to_domain()
+                if record.key not in expected or record.key in records:
+                    raise StoreIntegrityError(
+                        "shared Store returned unexpected lookup records"
+                    )
+                records[record.key] = record
+        return records
 
     def commit_many(
         self, proposed_commits: Iterable[EvidenceCommit]
     ) -> tuple[CommitOutcome, ...]:
         commits = tuple(proposed_commits)
+        if len({commit.key for commit in commits}) != len(commits):
+            raise ValueError("commit batch contains a duplicate evidence key")
         payloads: dict[str, ArtifactFile] = {}
         for commit in commits:
             for payload in (commit.normalized_artifact, commit.raw_artifact):
@@ -117,18 +136,24 @@ class HttpEvidenceStore:
             if payload.digest not in self._uploaded_artifact_digests:
                 self._upload(payload)
                 self._uploaded_artifact_digests.add(payload.digest)
-        request = CommitRequest(
-            commits=[CommitModel.from_domain(item) for item in commits]
-        )
-        response = self._request(
-            "POST", "/v1/evidence/commit", json=request.model_dump(mode="json")
-        )
-        outcomes = tuple(CommitResponse.model_validate(response.json()).outcomes)
-        if len(outcomes) != len(commits):
-            raise StoreIntegrityError(
-                "shared Store returned incomplete commit outcomes"
+        outcomes: list[CommitOutcome] = []
+        for offset in range(0, len(commits), self.maximum_batch_size):
+            chunk = commits[offset : offset + self.maximum_batch_size]
+            request = CommitRequest(
+                commits=[CommitModel.from_domain(item) for item in chunk]
             )
-        return outcomes
+            response = self._request(
+                "POST", "/v1/evidence/commit", json=request.model_dump(mode="json")
+            )
+            chunk_outcomes = tuple(
+                CommitResponse.model_validate(response.json()).outcomes
+            )
+            if len(chunk_outcomes) != len(chunk):
+                raise StoreIntegrityError(
+                    "shared Store returned incomplete commit outcomes"
+                )
+            outcomes.extend(chunk_outcomes)
+        return tuple(outcomes)
 
     def fetch(self, key: EvidenceKey) -> FetchedEvidence | None:
         return self.fetch_many((key,)).get(key)
@@ -222,7 +247,7 @@ class HttpEvidenceStore:
                     self.client.stream("GET", f"/v1/artifacts/{digest}") as response,
                     temporary.open("wb") as handle,
                 ):
-                    _raise_for_store_status(response)
+                    _raise_for_store_status(response, include_body=False)
                     for chunk in response.iter_bytes(_TRANSFER_CHUNK_SIZE):
                         byte_size += len(chunk)
                         if byte_size > self.maximum_artifact_bytes:
@@ -271,10 +296,12 @@ def _file_chunks(path: Path) -> Iterator[bytes]:
             yield chunk
 
 
-def _raise_for_store_status(response: httpx.Response) -> None:
+def _raise_for_store_status(
+    response: httpx.Response, *, include_body: bool = True
+) -> None:
     if response.is_success:
         return
-    detail = response.text
+    detail = response.text if include_body else response.reason_phrase
     if response.status_code == 409:
         raise EvidenceConflictError(detail)
     raise StoreError(f"shared Store returned HTTP {response.status_code}: {detail}")
