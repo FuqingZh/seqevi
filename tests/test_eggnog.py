@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import stat
 import sys
@@ -15,6 +16,7 @@ from seqevi.annotate import run_annotation
 from seqevi.cli import app
 from seqevi.errors import AdapterError, AnnotationError, ResourceLockError
 from seqevi.resource_lock import LOCK_FILENAME
+from seqevi.sequence import read_fasta, unique_identities
 from seqevi.store import LocalStore
 
 runner = CliRunner()
@@ -61,6 +63,18 @@ def _write_runtime(root: Path) -> tuple[Path, Path]:
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "core.py").write_text("RUNTIME = 'fixture-v1'\n", encoding="utf-8")
+    distribution = (
+        runtime
+        / "lib"
+        / "python3.10"
+        / "site-packages"
+        / "eggnog_mapper-2.1.12.dist-info"
+    )
+    distribution.mkdir()
+    (distribution / "RECORD").write_text(
+        "eggnogmapper/core.py,,\n",
+        encoding="utf-8",
+    )
 
     executable = runtime_bin / "emapper.py"
     executable.write_text(_fixture_script(), encoding="utf-8")
@@ -217,19 +231,51 @@ def test_eggnog_runtime_digest_covers_mapper_package_and_diamond(
         != package_changed.contract.tool_runtime_digest
     )
 
+    record = (
+        executable.parent.parent
+        / "lib"
+        / "python3.10"
+        / "site-packages"
+        / "eggnog_mapper-2.1.12.dist-info"
+        / "RECORD"
+    )
+    record.write_text("eggnogmapper/core.py,sha256=changed,\n", encoding="utf-8")
+    dependency_changed = EggnogAdapter(executable=executable, database=database)
+    assert (
+        dependency_changed.contract.tool_runtime_digest
+        != diamond_changed.contract.tool_runtime_digest
+    )
+
+
+def test_eggnog_resource_identity_includes_optional_taxonomy_component(
+    tmp_path: Path,
+) -> None:
+    first_executable, first_database = _write_runtime(tmp_path / "first")
+    (first_database / "eggnog.taxa.db.traverse.pkl").write_bytes(b"traverse-v1")
+    first = EggnogAdapter(executable=first_executable, database=first_database)
+
+    second_executable, second_database = _write_runtime(tmp_path / "second")
+    (second_database / "eggnog.taxa.db.traverse.pkl").write_bytes(b"traverse-v2")
+    second = EggnogAdapter(executable=second_executable, database=second_database)
+
+    assert second.contract.resource_id != first.contract.resource_id
+
 
 def test_eggnog_annotation_preserves_native_columns_and_no_hits(
     tmp_path: Path,
 ) -> None:
     executable, database = _write_runtime(tmp_path)
     adapter = EggnogAdapter(executable=executable, database=database)
+    fasta = _write_fasta(tmp_path / "proteins.fasta")
     with LocalStore.open(tmp_path / "store") as store:
         summary = run_annotation(
-            fasta_path=_write_fasta(tmp_path / "proteins.fasta"),
+            fasta_path=fasta,
             output_dir=tmp_path / "output",
             adapter=adapter,
             store=store,
         )
+        hit_identity = unique_identities(read_fasta(fasta))[0]
+        fetched = store.fetch(adapter.contract.evidence_key(hit_identity))
 
     assert (summary.hits, summary.no_hits) == (1, 1)
     frame = pl.read_parquet(summary.output_dir / "evidence.parquet")
@@ -240,6 +286,12 @@ def test_eggnog_annotation_preserves_native_columns_and_no_hits(
     assert pl.read_parquet(summary.output_dir / "no-hits.parquet").height == 1
     package = json.loads((summary.output_dir / "datapackage.json").read_text())
     assert package["seqevi"]["adapter"] == "eggnog"
+    assert fetched is not None
+    assert fetched.raw_artifact is not None
+    with gzip.open(fetched.raw_artifact.path, "rt", encoding="utf-8") as handle:
+        retained_raw = handle.read()
+    assert "## fixture" not in retained_raw
+    assert retained_raw.startswith("#query\t")
 
 
 def test_eggnog_threads_change_execution_but_not_scientific_payload(

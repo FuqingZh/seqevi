@@ -4,17 +4,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import shutil
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Any, BinaryIO, TextIO
 
 from Bio.SeqIO.FastaIO import SimpleFastaParser
 
 from .errors import FastaIssue, FastaValidationError
-from .hashing import sha256_file
 
 _ASCII_WHITESPACE = str.maketrans("", "", " \t\n\r\v\f")
 
@@ -62,6 +62,31 @@ class FastaStage:
     input_digest: str
     input_records: int
     unique_sequences: int
+
+
+class _HashingRawReader(io.RawIOBase):
+    """Hash the exact bytes consumed by one buffered text parser."""
+
+    def __init__(self, handle: BinaryIO, hasher: Any) -> None:
+        self._handle = handle
+        self._hasher = hasher
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any, /) -> int | None:
+        data = self._handle.read(len(buffer))
+        if not data:
+            return 0
+        buffer[: len(data)] = data
+        self._hasher.update(data)
+        return len(data)
+
+    def close(self) -> None:
+        try:
+            self._handle.close()
+        finally:
+            super().close()
 
 
 def canonicalize_protein_sequence(sequence: str) -> str:
@@ -184,9 +209,13 @@ def stage_fasta(path: Path, stage_dir: Path) -> FastaStage:
     input_records = 0
 
     try:
-        input_digest = sha256_file(path)
+        input_hasher = hashlib.sha256()
         with (
-            path.open("r", encoding="utf-8", newline=None) as source,
+            io.TextIOWrapper(
+                io.BufferedReader(_HashingRawReader(path.open("rb"), input_hasher)),
+                encoding="utf-8",
+                newline=None,
+            ) as source,
             records_path.open("w", encoding="utf-8", newline="\n") as records_out,
             identities_path.open("w", encoding="utf-8", newline="\n") as identities_out,
         ):
@@ -242,7 +271,7 @@ def stage_fasta(path: Path, stage_dir: Path) -> FastaStage:
             root=stage_dir,
             records_path=records_path,
             identities_path=identities_path,
-            input_digest=input_digest,
+            input_digest=input_hasher.hexdigest(),
             input_records=input_records,
             unique_sequences=len(seen_sequence_ids),
         )

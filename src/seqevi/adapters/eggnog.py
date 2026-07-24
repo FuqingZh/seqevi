@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import tempfile
 from collections.abc import Mapping
@@ -148,6 +149,7 @@ class EggnogAdapter:
             tool_version=tool_version,
             diamond=diamond,
             diamond_version=diamond_version,
+            environment=self.environment,
         )
         resource_id = _resource_id(
             self.database,
@@ -252,7 +254,7 @@ class EggnogAdapter:
         )
         return AdapterBatchResult(
             sequences=sequence_results,
-            raw_artifact=_gzip_artifact(
+            raw_artifact=_gzip_annotations_artifact(
                 raw_path,
                 work_dir / "eggnog.annotations.tsv.gz",
             ),
@@ -346,6 +348,7 @@ def _runtime_digest(
     tool_version: str,
     diamond: Path,
     diamond_version: str,
+    environment: Mapping[str, str],
 ) -> str:
     package_root = _resolve_eggnog_package(executable)
     package_components = tuple(
@@ -358,15 +361,53 @@ def _runtime_digest(
         and "__pycache__" not in path.parts
         and path.suffix not in {".pyc", ".pyo"}
     )
+    interpreter = _resolve_python_interpreter(executable, environment=environment)
+    distribution_records = tuple(
+        RuntimeComponent(
+            name=f"python-distributions/{path.parent.name}/RECORD",
+            path=path,
+        )
+        for path in sorted(package_root.parent.glob("*.dist-info/RECORD"))
+    )
     return calculate_runtime_digest(
         runtime_name="eggnog-mapper",
         versions={"diamond": diamond_version, "eggnog-mapper": tool_version},
         components=(
             RuntimeComponent("launcher", executable),
+            RuntimeComponent("python", interpreter),
             RuntimeComponent("diamond", diamond),
+            *distribution_records,
             *package_components,
         ),
     )
+
+
+def _resolve_python_interpreter(
+    executable: Path, *, environment: Mapping[str, str]
+) -> Path:
+    with executable.open("rb") as handle:
+        first_line = handle.readline(4096).decode("utf-8", errors="strict")
+    if not first_line.startswith("#!"):
+        raise AdapterError("eggNOG-mapper launcher has no Python shebang")
+    command = shlex.split(first_line[2:].strip())
+    if not command:
+        raise AdapterError("eggNOG-mapper launcher has an empty shebang")
+    if Path(command[0]).name == "env":
+        candidates = [item for item in command[1:] if not item.startswith("-")]
+        if len(candidates) != 1:
+            raise AdapterError("unsupported eggNOG-mapper env shebang")
+        resolved = shutil.which(
+            candidates[0],
+            path=_runtime_environment(executable, overlay=environment)["PATH"],
+        )
+    else:
+        resolved = shutil.which(
+            command[0],
+            path=_runtime_environment(executable, overlay=environment)["PATH"],
+        )
+    if resolved is None:
+        raise AdapterError("eggNOG-mapper Python interpreter cannot be resolved")
+    return Path(resolved).resolve()
 
 
 def _resolve_eggnog_package(executable: Path) -> Path:
@@ -454,7 +495,9 @@ def _resource_id(database: Path, version: str, *, verify: bool = False) -> str:
         components=declarations,
         verify=verify,
     )
-    components = [(name, locked.hash_for(name)) for name in _REQUIRED_DATABASE_FILES]
+    components = [
+        (component.name, locked.hash_for(component.name)) for component in declarations
+    ]
     digest = sha256_digest(
         json.dumps(components, separators=(",", ":")).encode("utf-8")
     )
@@ -595,13 +638,16 @@ def _parse_row(
     return row
 
 
-def _gzip_artifact(source: Path, target: Path) -> ArtifactFile:
+def _gzip_annotations_artifact(source: Path, target: Path) -> ArtifactFile:
     with (
         source.open("rb") as source_handle,
         target.open("wb") as target_handle,
         gzip.GzipFile(fileobj=target_handle, mode="wb", mtime=0) as compressed,
     ):
-        shutil.copyfileobj(source_handle, compressed)
+        for line in source_handle:
+            if line.startswith(b"#") and not line.startswith(b"#query\t"):
+                continue
+            compressed.write(line)
     return ArtifactFile.from_path(target, "application/gzip")
 
 

@@ -41,6 +41,7 @@ def _write_runtime(
     (install_dir / "interproscan-5.jar").write_bytes(b"fixture-jar-v1")
     (hmmer_dir / "hmmscan").write_bytes(b"fixture-hmmscan-v1")
     (model_dir / "pfam_a.hmm").write_bytes(b"fixture-pfam-model-v1")
+    (model_dir / "pfam_a.dat").write_bytes(b"fixture-pfam-metadata-v1")
     (database / "mode.txt").write_text("success", encoding="utf-8")
     (database / "run-date.txt").write_text("21-07-2026", encoding="utf-8")
     (install_dir / "interproscan.properties").write_text(
@@ -223,6 +224,62 @@ def test_interpro_pfam_contract_probes_exact_runtime_and_resource(
         != resource_changed.contract.tool_runtime_digest
     )
     assert runtime_changed.contract.resource_id == resource_changed.contract.resource_id
+
+    (changed_executable.parent / "interproscan.properties").write_text(
+        (changed_executable.parent / "interproscan.properties").read_text(
+            encoding="utf-8"
+        )
+        + "exclude.sites.from.output=false\n",
+        encoding="utf-8",
+    )
+    properties_changed = InterProPfamAdapter(
+        executable=changed_executable,
+        database=changed_database,
+    )
+    assert (
+        properties_changed.contract.tool_runtime_digest
+        != runtime_changed.contract.tool_runtime_digest
+    )
+
+    (changed_database / "pfam" / "38.1" / "pfam_a.dat").write_bytes(
+        b"fixture-pfam-metadata-v2"
+    )
+    metadata_changed_executable, metadata_changed_database = _write_runtime(
+        tmp_path / "metadata-changed"
+    )
+    (metadata_changed_database / "pfam" / "38.1" / "pfam_a.dat").write_bytes(
+        b"fixture-pfam-metadata-v2"
+    )
+    metadata_changed = InterProPfamAdapter(
+        executable=metadata_changed_executable,
+        database=metadata_changed_database,
+    )
+    assert metadata_changed.contract.resource_id != first.contract.resource_id
+
+
+def test_interpro_pfam_runtime_digest_includes_selected_java(tmp_path: Path) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java_dir = tmp_path / "jdk" / "bin"
+    java_dir.mkdir(parents=True)
+    java = java_dir / "java"
+    java.write_bytes(b"fixture-java-v1")
+    java.chmod(java.stat().st_mode | stat.S_IXUSR)
+    environment = {"PATH": str(java_dir)}
+
+    first = InterProPfamAdapter(
+        executable=executable,
+        database=database,
+        environment=environment,
+    )
+    java.write_bytes(b"fixture-java-v2")
+    java.chmod(java.stat().st_mode | stat.S_IXUSR)
+    second = InterProPfamAdapter(
+        executable=executable,
+        database=database,
+        environment=environment,
+    )
+
+    assert second.contract.tool_runtime_digest != first.contract.tool_runtime_digest
 
 
 def test_interpro_pfam_applies_environment_to_probe_and_execution(

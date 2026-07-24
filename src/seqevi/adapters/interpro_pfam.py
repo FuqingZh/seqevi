@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -121,6 +122,7 @@ class InterProPfamAdapter:
             jar_path=self.jar_path,
             properties=self.properties,
             version=self.interproscan_version,
+            environment=self.environment,
         )
         resource_id = _calculate_resource_id(
             database=self.database,
@@ -350,6 +352,7 @@ def _calculate_runtime_digest(
     jar_path: Path,
     properties: Mapping[str, str],
     version: str,
+    environment: Mapping[str, str],
 ) -> str:
     bin_dir = _resolve_install_path(
         install_dir,
@@ -367,8 +370,27 @@ def _calculate_runtime_digest(
     if not hmmer_files:
         raise AdapterError(f"InterProScan HMMER directory is empty: {hmmer_dir}")
 
+    java = shutil.which(
+        "java",
+        path=environment.get("PATH", os.environ.get("PATH")),
+    )
+    if java is None:
+        raise AdapterError("InterProScan runtime has no Java executable")
+    normalized_properties = {
+        **properties,
+        "data.directory": "${data.directory}",
+    }
+    properties_digest = sha256_digest(
+        json.dumps(
+            normalized_properties,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
     components = (
         RuntimeComponent("launcher", executable),
+        RuntimeComponent("java", Path(java).resolve()),
         RuntimeComponent("interproscan-5.jar", jar_path),
         *(
             RuntimeComponent(
@@ -380,7 +402,10 @@ def _calculate_runtime_digest(
     )
     return calculate_runtime_digest(
         runtime_name="interproscan-pfam",
-        versions={"interproscan": version},
+        versions={
+            "interproscan": version,
+            "properties": f"sha256:{properties_digest}",
+        },
         components=components,
     )
 
@@ -416,19 +441,36 @@ def _calculate_resource_id(
     verify: bool = False,
 ) -> str:
     interpro_release = interproscan_version.split("-", maxsplit=1)[1]
-    component_name = "pfam-model"
-    relative_path = model_path.relative_to(database).as_posix()
+    metadata_path = model_path.with_name("pfam_a.dat")
+    if not metadata_path.is_file():
+        raise AdapterError(f"Pfam metadata file does not exist: {metadata_path}")
+    declarations = (
+        ResourceComponent(
+            "pfam-model",
+            model_path.relative_to(database).as_posix(),
+        ),
+        ResourceComponent(
+            "pfam-metadata",
+            metadata_path.relative_to(database).as_posix(),
+        ),
+    )
     locked = resolve_resource_lock(
         database=database,
         resource_name="interpro",
         resource_version=interpro_release,
-        components=(ResourceComponent(component_name, relative_path),),
+        components=declarations,
         verify=verify,
     )
-    return (
-        f"interpro/{interpro_release}/pfam/{pfam_version}/"
-        f"sha256:{locked.hash_for(component_name)}"
+    digest = sha256_digest(
+        json.dumps(
+            [
+                (component.name, locked.hash_for(component.name))
+                for component in declarations
+            ],
+            separators=(",", ":"),
+        ).encode("utf-8")
     )
+    return f"interpro/{interpro_release}/pfam/{pfam_version}/sha256:{digest}"
 
 
 def _write_runtime_properties(*, source: Path, target: Path, database: Path) -> None:
@@ -459,7 +501,6 @@ def _parse_tsv(
 ) -> tuple[ArtifactFile | None, dict[str, str]]:
     expected = {identity.sequence_id: identity for identity in identities}
     rows: list[dict[str, object]] = []
-    seen_rows: set[tuple[object, ...]] = set()
     with tempfile.TemporaryDirectory(
         prefix=".interpro-pfam-normalized-", dir=normalized_path.parent
     ) as raw_parts_dir:
@@ -482,15 +523,6 @@ def _parse_tsv(
                     row = _parse_tsv_row(
                         fields, line_number=line_number, expected=expected
                     )
-                    row_key = tuple(
-                        row[column] for column in INTERPRO_PFAM_EVIDENCE_SCHEMA
-                    )
-                    if row_key in seen_rows:
-                        raise AdapterError(
-                            "InterProScan TSV contains a duplicate match at line "
-                            f"{line_number}"
-                        )
-                    seen_rows.add(row_key)
                     rows.append(row)
                     if len(rows) >= _NORMALIZED_ROW_BATCH_SIZE:
                         part_paths.append(_write_normalized_part(rows, parts_dir))
@@ -505,11 +537,7 @@ def _parse_tsv(
         if not part_paths:
             return None, {}
         normalized = pl.concat([pl.scan_parquet(part) for part in part_paths]).sort(
-            "SequenceID",
-            "Start",
-            "Stop",
-            "SignatureAccession",
-            "Score",
+            *INTERPRO_PFAM_EVIDENCE_SCHEMA,
             nulls_last=True,
         )
         payload_digest_by_id = _payload_digests(normalized)
@@ -532,12 +560,17 @@ def _payload_digests(frame: pl.LazyFrame) -> dict[str, str]:
     digests: dict[str, str] = {}
     current_sequence_id: str | None = None
     current_hasher: Any | None = None
+    previous_row: tuple[object, ...] | None = None
     row_index = 0
     for batch in frame.collect_batches(
         chunk_size=_NORMALIZED_ROW_BATCH_SIZE,
         engine="streaming",
     ):
         for row in batch.iter_rows(named=True):
+            row_key = tuple(row[column] for column in INTERPRO_PFAM_EVIDENCE_SCHEMA)
+            if row_key == previous_row:
+                raise AdapterError("InterProScan TSV contains a duplicate match")
+            previous_row = row_key
             sequence_id = str(row["SequenceID"])
             if sequence_id != current_sequence_id:
                 if current_sequence_id is not None and current_hasher is not None:
