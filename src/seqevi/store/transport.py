@@ -31,7 +31,7 @@ class TransportModel(BaseModel):
 class SequenceModel(TransportModel):
     sequence_id: SequenceId
     md5: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
-    length: Annotated[int, Field(gt=0)]
+    length: Annotated[int, Field(gt=0, strict=True)]
     sequence: str
 
     @model_validator(mode="after")
@@ -101,7 +101,7 @@ class EvidenceQueryModel(TransportModel):
 class ArtifactReferenceModel(TransportModel):
     digest: Sha256
     media_type: str
-    byte_size: Annotated[int, Field(ge=0)]
+    byte_size: Annotated[int, Field(ge=0, strict=True)]
 
 
 class EvidenceRecordModel(TransportModel):
@@ -220,5 +220,5 @@ class ArtifactUploadResponse(TransportModel):
 class HealthResponse(TransportModel):
     status: Literal["ok"] = "ok"
     api_version: Literal["v1"] = "v1"
-    maximum_batch_size: Annotated[int, Field(ge=1)]
-    maximum_artifact_bytes: Annotated[int, Field(ge=1)]
+    maximum_batch_size: Annotated[int, Field(ge=1, strict=True)]
+    maximum_artifact_bytes: Annotated[int, Field(ge=1, strict=True)]

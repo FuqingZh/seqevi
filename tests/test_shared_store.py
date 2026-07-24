@@ -10,6 +10,8 @@ from typing import cast
 import httpx
 import polars as pl
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
 from polars.testing import assert_frame_equal
 from sqlalchemy import BigInteger, create_engine
@@ -30,6 +32,7 @@ from seqevi.sequence import SequenceIdentity, identify_protein_sequence
 from seqevi.service import ServiceSettings, create_service_app
 from seqevi.service.persistence import PostgresEvidencePersistence
 from seqevi.store import HttpEvidenceStore, LocalStore
+from seqevi.store import migration as store_migration
 from seqevi.store.schema import artifacts
 from seqevi.store.transport import CommitModel
 
@@ -431,6 +434,21 @@ def test_service_returns_422_for_invalid_domain_values_and_missing_raw_artifact(
         },
     }
     missing_raw = {**model, "raw_artifact": None}
+    coerced_length = {
+        **model,
+        "identity": {
+            **model["identity"],
+            "length": str(model["identity"]["length"]),
+        },
+    }
+    assert model["raw_artifact"] is not None
+    coerced_byte_size = {
+        **model,
+        "raw_artifact": {
+            **model["raw_artifact"],
+            "byte_size": str(model["raw_artifact"]["byte_size"]),
+        },
+    }
     app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
 
     with TestClient(app) as client:
@@ -442,9 +460,19 @@ def test_service_returns_422_for_invalid_domain_values_and_missing_raw_artifact(
             "/v1/evidence/commit",
             json={"commits": [missing_raw]},
         )
+        coerced_length_response = client.post(
+            "/v1/evidence/commit",
+            json={"commits": [coerced_length]},
+        )
+        coerced_byte_size_response = client.post(
+            "/v1/evidence/commit",
+            json={"commits": [coerced_byte_size]},
+        )
 
     assert invalid_response.status_code == 422
     assert missing_raw_response.status_code == 422
+    assert coerced_length_response.status_code == 422
+    assert coerced_byte_size_response.status_code == 422
 
 
 def test_annotation_packages_are_equivalent_for_local_and_http_store(
@@ -493,6 +521,50 @@ def test_annotation_packages_are_equivalent_for_local_and_http_store(
     assert (tmp_path / "local-output" / "sequence-map.tsv").read_text(
         encoding="utf-8"
     ) == (tmp_path / "remote-output" / "sequence-map.tsv").read_text(encoding="utf-8")
+
+
+@pytest.mark.requires_postgres
+def test_postgres_migrates_artifact_byte_size_from_integer_to_bigint() -> None:
+    database_url = os.environ.get("SEQEVI_TEST_POSTGRES_URL")
+    if not database_url:
+        pytest.skip("SEQEVI_TEST_POSTGRES_URL is not configured")
+    schema = f"seqevi_migration_{os.urandom(8).hex()}"
+    admin_engine = create_engine(database_url)
+    with admin_engine.begin() as connection:
+        connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
+    scoped_engine = create_engine(
+        database_url,
+        connect_args={"options": f"-csearch_path={schema}"},
+    )
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    try:
+        with scoped_engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0001_initial_store")
+            connection.commit()
+            initial_type = connection.exec_driver_sql(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'artifact' AND column_name = 'byte_size'"
+            ).scalar_one()
+            command.upgrade(config, "head")
+            connection.commit()
+            upgraded_type = connection.exec_driver_sql(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'artifact' AND column_name = 'byte_size'"
+            ).scalar_one()
+        assert initial_type == "integer"
+        assert upgraded_type == "bigint"
+    finally:
+        scoped_engine.dispose()
+        with admin_engine.begin() as connection:
+            connection.exec_driver_sql(f'DROP SCHEMA "{schema}" CASCADE')
+        admin_engine.dispose()
 
 
 @pytest.mark.requires_postgres
