@@ -330,7 +330,7 @@ def test_eggnog_runs_through_public_cli(tmp_path: Path) -> None:
             str(tmp_path / "output"),
             "--executable",
             str(executable),
-            "--database",
+            "--resource",
             str(database),
         ],
     )
@@ -350,7 +350,7 @@ def test_eggnog_resource_verify_cli_creates_and_audits_lock(
         "eggnog",
         "--executable",
         str(executable),
-        "--database",
+        "--resource",
         str(database),
     ]
 

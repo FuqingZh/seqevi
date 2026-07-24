@@ -45,6 +45,26 @@ fall back to an older result.
 
 ## Intended CLI
 
+For repeated use, keep one machine-local TOML per adapter runtime under
+`${XDG_CONFIG_HOME:-~/.config}/seqevi/profiles/`:
+
+```bash
+seqevi profile example --adapter eggnog
+seqevi profile example --adapter interpro-pfam
+```
+
+After saving and editing a template:
+
+```bash
+seqevi annotate \
+  --profile eggnog-5.0.2 \
+  --fasta proteins.fasta \
+  --output results/eggnog
+```
+
+An exact profile file can be selected with `--config PATH`. Complete explicit
+mode remains available:
+
 ```bash
 seqevi annotate \
   --adapter eggnog \
@@ -52,7 +72,7 @@ seqevi annotate \
   --store /data/seqevi-store \
   --output results/eggnog \
   --executable /opt/eggnog-mapper/emapper.py \
-  --database /data/eggnog-5.0.2 \
+  --resource /data/eggnog-5.0.2 \
   --threads 8
 ```
 
@@ -63,7 +83,7 @@ seqevi annotate \
   --store https://seqevi.example.org \
   --output results/pfam \
   --executable /opt/interproscan/interproscan.sh \
-  --database /data/interproscan-5.77-108.0/data
+  --resource /data/interproscan-5.77-108.0/data
 ```
 
 Shared deployments expose the same Store contract:
@@ -80,7 +100,7 @@ Initialize or audit a database resource lock independently of annotation:
 seqevi resource verify \
   --adapter eggnog \
   --executable /opt/eggnog-mapper/emapper.py \
-  --database /data/eggnog-5.0.2
+  --resource /data/eggnog-5.0.2
 ```
 
 ## V1 Scope
@@ -103,8 +123,10 @@ Start with [the documentation index](docs/README.md).
 - [Architecture overview](docs/architecture/20260720-v1.0-seqevi-architecture.md)
 - [Sequence and evidence contract](docs/architecture/20260720-v1.0-sequence-evidence-contract.md)
 - [Adapter contract](docs/architecture/20260720-v1.0-adapter-contract.md)
+- [Execution profile contract](docs/architecture/20260724-v1.0-execution-profile-contract.md)
 - [Storage and deployment architecture](docs/architecture/20260720-v1.0-storage-deployment-architecture.md)
 - [MVP implementation plan](docs/implementation-plan/20260720-v1.0-mvp-implementation-plan.md)
+- [Execution profile implementation plan](docs/implementation-plan/20260724-v1.0-execution-profile-implementation-plan.md)
 - [Validation strategy](docs/testing/20260720-v1.0-validation-strategy.md)
 - [Annotate runtime and bounded-memory plan](docs/implementation-plan/20260722-v1.0-annotate-bounded-memory-plan.md)
 - [Bounded-memory and operational performance](docs/benchmarks/20260722-v1.0-bounded-memory-performance.md)

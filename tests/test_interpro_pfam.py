@@ -68,6 +68,12 @@ import os
 import sys
 from pathlib import Path
 
+expected_environment = Path(__file__).parent / "expected-environment.txt"
+if expected_environment.is_file():
+    expected = expected_environment.read_text().strip()
+    if os.environ.get("SEQEVI_TEST_RUNTIME_ENV") != expected:
+        raise SystemExit(13)
+
 if "--version" in sys.argv:
     print("InterProScan version {version}")
     raise SystemExit(0)
@@ -217,6 +223,32 @@ def test_interpro_pfam_contract_probes_exact_runtime_and_resource(
         != resource_changed.contract.tool_runtime_digest
     )
     assert runtime_changed.contract.resource_id == resource_changed.contract.resource_id
+
+
+def test_interpro_pfam_applies_environment_to_probe_and_execution(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    (executable.parent / "expected-environment.txt").write_text(
+        "profile-runtime",
+        encoding="utf-8",
+    )
+    adapter = InterProPfamAdapter(
+        executable=executable,
+        database=database,
+        environment={"SEQEVI_TEST_RUNTIME_ENV": "profile-runtime"},
+    )
+
+    with LocalStore.open(tmp_path / "store") as store:
+        summary = run_annotation(
+            fasta_path=_write_input(tmp_path / "proteins.fasta"),
+            output_dir=tmp_path / "output",
+            adapter=adapter,
+            store=store,
+            threads=1,
+        )
+
+    assert summary.computed == 2
 
 
 def test_interpro_pfam_parameters_reject_alternate_scientific_contract() -> None:
@@ -420,7 +452,7 @@ def test_interpro_pfam_runs_through_public_cli(tmp_path: Path) -> None:
             str(tmp_path / "output"),
             "--executable",
             str(executable),
-            "--database",
+            "--resource",
             str(database),
         ],
     )

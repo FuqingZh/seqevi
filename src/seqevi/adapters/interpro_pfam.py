@@ -95,17 +95,22 @@ class InterProPfamAdapter:
         database: Path,
         parameters: InterProPfamParameters | None = None,
         verify_resource: bool = False,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self.executable = executable.resolve()
         self.database = database.resolve()
         self.parameters = parameters or InterProPfamParameters()
+        self.environment = dict(environment or {})
         self.install_dir = self.executable.parent
         self.properties_path = self.install_dir / "interproscan.properties"
         self.jar_path = self.install_dir / "interproscan-5.jar"
 
         self._validate_installation_paths()
         self.properties = _read_properties(self.properties_path)
-        self.interproscan_version = _probe_interproscan_version(self.executable)
+        self.interproscan_version = _probe_interproscan_version(
+            self.executable,
+            environment=self.environment,
+        )
         pfam_version, model_path = _resolve_pfam_model(
             database=self.database,
             properties=self.properties,
@@ -187,7 +192,10 @@ class InterProPfamAdapter:
                 working_dir=work_dir,
                 stdout_path=work_dir / "interproscan.stdout.log",
                 stderr_path=work_dir / "interproscan.stderr.log",
-                environment={"INTERPROSCAN_CONF": str(properties_path)},
+                environment={
+                    **self.environment,
+                    "INTERPROSCAN_CONF": str(properties_path),
+                },
             ),
             timeout_seconds=timeout_seconds,
         )
@@ -240,7 +248,11 @@ class InterProPfamAdapter:
             )
 
 
-def _probe_interproscan_version(executable: Path) -> str:
+def _probe_interproscan_version(
+    executable: Path,
+    *,
+    environment: Mapping[str, str],
+) -> str:
     with tempfile.TemporaryDirectory(prefix="seqevi-interpro-probe-") as raw_dir:
         probe_dir = Path(raw_dir)
         stdout_path = probe_dir / "stdout.log"
@@ -252,6 +264,7 @@ def _probe_interproscan_version(executable: Path) -> str:
                     working_dir=executable.parent,
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
+                    environment=environment,
                 ),
                 timeout_seconds=_PROBE_TIMEOUT_SECONDS,
             )

@@ -114,21 +114,30 @@ class EggnogAdapter:
         database: Path,
         parameters: EggnogParameters | None = None,
         verify_resource: bool = False,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         self.executable = executable.resolve()
         self.database = database.resolve()
         self.parameters = parameters or EggnogParameters()
+        self.environment = dict(environment or {})
         if not self.executable.is_file():
             raise AdapterError(f"eggNOG-mapper executable is not a file: {executable}")
         if not self.database.is_dir():
             raise AdapterError(f"eggNOG database is not a directory: {database}")
 
-        version_output = _probe_version(self.executable, self.database)
+        version_output = _probe_version(
+            self.executable,
+            self.database,
+            environment=self.environment,
+        )
         tool_version, database_version, reported_diamond_version = (
             _parse_version_output(version_output)
         )
-        diamond = _resolve_diamond(self.executable)
-        diamond_version = _probe_diamond_version(diamond)
+        diamond = _resolve_diamond(self.executable, environment=self.environment)
+        diamond_version = _probe_diamond_version(
+            diamond,
+            environment=self.environment,
+        )
         if diamond_version != reported_diamond_version:
             raise AdapterError(
                 "eggNOG-mapper and the selected DIAMOND executable report "
@@ -214,7 +223,10 @@ class EggnogAdapter:
                 working_dir=work_dir,
                 stdout_path=work_dir / "eggnog.stdout.log",
                 stderr_path=work_dir / "eggnog.stderr.log",
-                environment=_runtime_environment(self.executable),
+                environment=_runtime_environment(
+                    self.executable,
+                    overlay=self.environment,
+                ),
             ),
             timeout_seconds=timeout_seconds,
         )
@@ -248,7 +260,12 @@ class EggnogAdapter:
         )
 
 
-def _probe_version(executable: Path, database: Path) -> str:
+def _probe_version(
+    executable: Path,
+    database: Path,
+    *,
+    environment: Mapping[str, str],
+) -> str:
     with tempfile.TemporaryDirectory(prefix="seqevi-eggnog-probe-") as raw_dir:
         root = Path(raw_dir)
         stdout_path = root / "stdout.log"
@@ -265,7 +282,10 @@ def _probe_version(executable: Path, database: Path) -> str:
                     working_dir=executable.parent,
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
-                    environment=_runtime_environment(executable),
+                    environment=_runtime_environment(
+                        executable,
+                        overlay=environment,
+                    ),
                 ),
                 timeout_seconds=_PROBE_TIMEOUT_SECONDS,
             )
@@ -286,16 +306,20 @@ def _probe_version(executable: Path, database: Path) -> str:
         return output
 
 
-def _runtime_environment(executable: Path) -> dict[str, str]:
+def _runtime_environment(
+    executable: Path,
+    *,
+    overlay: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     runtime_bin = str(executable.parent)
-    inherited_path = os.environ.get("PATH")
-    return {
-        "PATH": (
-            runtime_bin
-            if not inherited_path
-            else os.pathsep.join((runtime_bin, inherited_path))
-        )
-    }
+    environment = dict(overlay or {})
+    inherited_path = environment.get("PATH", os.environ.get("PATH"))
+    environment["PATH"] = (
+        runtime_bin
+        if not inherited_path
+        else os.pathsep.join((runtime_bin, inherited_path))
+    )
+    return environment
 
 
 def _parse_version_output(output: str) -> tuple[str, str, str]:
@@ -362,14 +386,25 @@ def _resolve_eggnog_package(executable: Path) -> Path:
     return unique[0]
 
 
-def _resolve_diamond(executable: Path) -> Path:
-    resolved = shutil.which("diamond", path=_runtime_environment(executable)["PATH"])
+def _resolve_diamond(
+    executable: Path,
+    *,
+    environment: Mapping[str, str],
+) -> Path:
+    resolved = shutil.which(
+        "diamond",
+        path=_runtime_environment(executable, overlay=environment)["PATH"],
+    )
     if resolved is None:
         raise AdapterError("eggNOG-mapper runtime has no DIAMOND executable")
     return Path(resolved).resolve()
 
 
-def _probe_diamond_version(executable: Path) -> str:
+def _probe_diamond_version(
+    executable: Path,
+    *,
+    environment: Mapping[str, str],
+) -> str:
     with tempfile.TemporaryDirectory(prefix="seqevi-diamond-probe-") as raw_dir:
         root = Path(raw_dir)
         stdout_path = root / "stdout.log"
@@ -381,6 +416,7 @@ def _probe_diamond_version(executable: Path) -> str:
                     working_dir=executable.parent,
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
+                    environment=environment,
                 ),
                 timeout_seconds=_PROBE_TIMEOUT_SECONDS,
             )

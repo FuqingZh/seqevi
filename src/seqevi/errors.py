@@ -49,6 +49,10 @@ class AnnotationError(RuntimeError):
     """Base class for one annotation invocation failure."""
 
 
+class ProfileConfigurationError(AnnotationError):
+    """Raised when an execution profile cannot be resolved safely."""
+
+
 class AdapterError(AnnotationError):
     """Raised when an adapter cannot produce valid terminal evidence."""
 

@@ -29,6 +29,7 @@ class AdapterConfiguration:
     executable: Path
     database: Path
     verify_resource: bool = False
+    environment: tuple[tuple[str, str], ...] = ()
 
 
 def create_adapter(configuration: AdapterConfiguration) -> AnnotationAdapter:
@@ -39,12 +40,14 @@ def create_adapter(configuration: AdapterConfiguration) -> AnnotationAdapter:
             executable=configuration.executable,
             database=configuration.database,
             verify_resource=configuration.verify_resource,
+            environment=dict(configuration.environment),
         )
     if configuration.name is AdapterName.EGGNOG:
         return EggnogAdapter(
             executable=configuration.executable,
             database=configuration.database,
             verify_resource=configuration.verify_resource,
+            environment=dict(configuration.environment),
         )
     _raise_unavailable(configuration.name, 4)
 
