@@ -224,3 +224,54 @@ def test_profile_example_is_complete_toml() -> None:
     assert 'adapter = "interpro-pfam"' in result.stdout
     assert 'resource = "/opt/interproscan/data"' in result.stdout
     assert 'path_prepend = ["/opt/jdk-17/bin"]' in result.stdout
+
+
+def test_profile_init_list_and_show_use_isolated_xdg_home(tmp_path: Path) -> None:
+    config_home = tmp_path / "config"
+    environment = {"XDG_CONFIG_HOME": str(config_home)}
+
+    initialized = runner.invoke(
+        app,
+        ["profile", "init", "zeta", "--adapter", "eggnog"],
+        env=environment,
+    )
+    duplicate = runner.invoke(
+        app,
+        ["profile", "init", "zeta", "--adapter", "interpro-pfam"],
+        env=environment,
+    )
+    runner.invoke(
+        app,
+        ["profile", "init", "Alpha", "--adapter", "interpro-pfam"],
+        env=environment,
+    )
+    listed = runner.invoke(app, ["profile", "list"], env=environment)
+
+    assert initialized.exit_code == 0
+    assert duplicate.exit_code == 1
+    assert "already exists" in duplicate.stderr
+    assert listed.stdout.splitlines() == ["Alpha", "zeta"]
+
+    profile_path = config_home / "seqevi" / "profiles" / "zeta.toml"
+    executable = write_fixture_tool(tmp_path / "tool")
+    resource = write_fixture_database(tmp_path / "resource")
+    profile_path.write_text(
+        "\n".join(
+            (
+                "version = 1",
+                'adapter = "eggnog"',
+                f'executable = "{executable}"',
+                f'resource = "{resource}"',
+                "",
+                "[environment]",
+                'API_TOKEN = "secret-value"',
+            )
+        ),
+        encoding="utf-8",
+    )
+    shown = runner.invoke(app, ["profile", "show", "zeta"], env=environment)
+
+    assert shown.exit_code == 0, shown.output
+    assert "adapter: eggnog" in shown.stdout
+    assert "environment_names: API_TOKEN" in shown.stdout
+    assert "secret-value" not in shown.stdout

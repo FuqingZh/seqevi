@@ -49,11 +49,26 @@ For repeated use, keep one machine-local TOML per adapter runtime under
 `${XDG_CONFIG_HOME:-~/.config}/seqevi/profiles/`:
 
 ```bash
-seqevi profile example --adapter eggnog
-seqevi profile example --adapter interpro-pfam
+seqevi profile init eggnog-5.0.2 --adapter eggnog
+seqevi profile init interpro-pfam-38.1 --adapter interpro-pfam
 ```
 
-After saving and editing a template:
+Each command creates a complete adapter-specific TOML file and refuses to
+replace an existing profile. After editing the machine-local paths, inspect and
+validate profiles without launching either annotation runtime:
+
+```bash
+seqevi profile list
+seqevi profile show eggnog-5.0.2
+seqevi profile validate \
+  --config "${XDG_CONFIG_HOME:-$HOME/.config}/seqevi/profiles/eggnog-5.0.2.toml"
+```
+
+`profile show` resolves paths and operational defaults but reports only
+environment variable names, never their values. The original complete
+templates remain available through `profile example --adapter ADAPTER`.
+
+Run repeated annotations by name:
 
 ```bash
 seqevi annotate \

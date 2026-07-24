@@ -19,9 +19,12 @@ from .annotate import run_annotation
 from .errors import AnnotationError, FastaValidationError, StoreError
 from .execution_profile import (
     ExecutionProfile,
+    initialize_named_profile,
+    list_named_profiles,
     load_execution_profile,
     load_named_profile,
     profile_example,
+    redacted_effective_configuration,
 )
 from .resource_lock import resource_lock_path
 from .store import open_evidence_store
@@ -338,6 +341,51 @@ def profile_validate_command(
         f"Valid {validated.adapter.value} profile: {validated.source}; "
         f"resource: {validated.resource}"
     )
+
+
+@profile_app.command("init")
+def profile_init_command(
+    name: Annotated[str, typer.Argument(help="Name for the new user profile.")],
+    adapter: Annotated[
+        AdapterName,
+        typer.Option("--adapter", help="Official adapter for the new profile."),
+    ],
+) -> None:
+    """Create a complete named profile without overwriting an existing file."""
+
+    try:
+        destination = initialize_named_profile(name, adapter)
+    except AnnotationError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Created {adapter.value} profile: {destination}")
+
+
+@profile_app.command("list")
+def profile_list_command() -> None:
+    """List named profiles in deterministic order."""
+
+    try:
+        names = list_named_profiles()
+    except AnnotationError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    for name in names:
+        typer.echo(name)
+
+
+@profile_app.command("show")
+def profile_show_command(
+    name: Annotated[str, typer.Argument(help="Named user profile to inspect.")],
+) -> None:
+    """Show resolved profile configuration with environment values redacted."""
+
+    try:
+        selected = load_named_profile(name)
+    except AnnotationError as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(redacted_effective_configuration(selected), nl=False)
 
 
 @resource_app.command("verify")
