@@ -123,6 +123,19 @@ def test_invalid_fasta_stage_is_removed_and_returns_no_partial_records(
     assert not stage_dir.exists()
 
 
+def test_non_utf8_fasta_stage_is_a_validation_error_and_is_removed(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_bytes(b">valid\nACGT\n>invalid\nMPEP\xffTIDE\n")
+    stage_dir = tmp_path / "stage"
+
+    with pytest.raises(FastaValidationError, match="not valid UTF-8"):
+        stage_fasta(fasta, stage_dir)
+
+    assert not stage_dir.exists()
+
+
 def test_sequence_identity_rejects_inconsistent_manual_values() -> None:
     with pytest.raises(ValueError, match="sequence_id"):
         SequenceIdentity(

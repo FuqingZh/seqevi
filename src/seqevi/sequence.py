@@ -275,6 +275,14 @@ def stage_fasta(path: Path, stage_dir: Path) -> FastaStage:
             input_records=input_records,
             unique_sequences=len(seen_sequence_ids),
         )
+    except UnicodeDecodeError as error:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        issue = FastaIssue(
+            max(input_records + 1, 1),
+            None,
+            f"FASTA is not valid UTF-8: {error}",
+        )
+        raise FastaValidationError((issue,)) from error
     except Exception:
         shutil.rmtree(stage_dir, ignore_errors=True)
         raise
