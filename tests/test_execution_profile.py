@@ -63,6 +63,8 @@ def test_profile_loads_strict_relative_paths_and_environment(tmp_path: Path) -> 
     [
         ("unknown = true", "unknown keys"),
         ("threads = 0", "at least 1"),
+        ("timeout_seconds = nan", "finite and greater than zero"),
+        ("timeout_seconds = inf", "finite and greater than zero"),
         ('environment = "JAVA_HOME=/opt/jdk"', "must be a TOML table"),
         ('path_prepend = ["missing"]', "is not a directory"),
     ],

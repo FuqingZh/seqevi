@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import re
 import shutil
 import tomllib
@@ -163,9 +164,11 @@ def load_execution_profile(path: Path) -> ExecutionProfile:
     if threads is not None and threads < 1:
         raise ProfileConfigurationError("profile threads must be at least 1")
     timeout_seconds = _optional_number(document, "timeout_seconds")
-    if timeout_seconds is not None and timeout_seconds <= 0:
+    if timeout_seconds is not None and (
+        not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+    ):
         raise ProfileConfigurationError(
-            "profile timeout_seconds must be greater than zero"
+            "profile timeout_seconds must be finite and greater than zero"
         )
 
     return ExecutionProfile(
