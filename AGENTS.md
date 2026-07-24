@@ -35,3 +35,10 @@
 - Contract changes require focused tests plus an update to the authoritative
   architecture document.
 - Shared-store changes must be tested against PostgreSQL as well as SQLite.
+
+## AO Delivery
+
+- Keep AO task branches scoped to one tracked issue, and use a ready-for-review
+  pull request with the issue key in its body for delivery.
+- Enable native auto-merge only after required checks pass and review threads
+  are resolved; do not merge a task branch directly.

@@ -7,9 +7,13 @@ import pytest
 from seqevi.errors import ProfileConfigurationError
 from seqevi.execution_profile import (
     default_profile_directory,
+    initialize_named_profile,
+    list_named_profiles,
     load_execution_profile,
     named_profile_path,
+    redacted_effective_configuration,
 )
+from seqevi.adapters import AdapterName
 
 
 def _write_executable(path: Path) -> Path:
@@ -108,3 +112,74 @@ def test_named_profiles_use_xdg_config_home_and_reject_path_traversal(
     )
     with pytest.raises(ProfileConfigurationError, match="profile name"):
         named_profile_path("../escape", environment=environment)
+
+
+def test_initialize_named_profile_is_complete_and_never_overwrites(
+    tmp_path: Path,
+) -> None:
+    environment = {"XDG_CONFIG_HOME": str(tmp_path / "config")}
+
+    created = initialize_named_profile(
+        "eggnog-5.0.2", AdapterName.EGGNOG, environment=environment
+    )
+
+    contents = created.read_text(encoding="utf-8")
+    assert 'adapter = "eggnog"' in contents
+    assert 'executable = "/opt/eggnog-mapper/bin/emapper.py"' in contents
+    assert 'resource = "/data/eggnog-5.0.2"' in contents
+    assert "store =" in contents
+    assert "threads =" in contents
+    with pytest.raises(ProfileConfigurationError, match="already exists"):
+        initialize_named_profile(
+            "eggnog-5.0.2", AdapterName.INTERPRO_PFAM, environment=environment
+        )
+    assert created.read_text(encoding="utf-8") == contents
+
+
+def test_list_named_profiles_is_sorted_and_ignores_non_profiles(
+    tmp_path: Path,
+) -> None:
+    environment = {"XDG_CONFIG_HOME": str(tmp_path / "config")}
+    directory = default_profile_directory(environment)
+    directory.mkdir(parents=True)
+    for name in ("zeta.toml", "Alpha.toml", "middle.toml", "notes.txt"):
+        (directory / name).write_text("", encoding="utf-8")
+    (directory / ".hidden.toml").write_text("", encoding="utf-8")
+    (directory / "directory.toml").mkdir()
+
+    assert list_named_profiles(environment=environment) == (
+        "Alpha",
+        "middle",
+        "zeta",
+    )
+
+
+def test_effective_configuration_redacts_environment_and_store_secrets(
+    tmp_path: Path,
+) -> None:
+    executable = _write_executable(tmp_path / "tool")
+    resource = tmp_path / "resource"
+    resource.mkdir()
+    profile_path = tmp_path / "profile.toml"
+    profile_path.write_text(
+        "\n".join(
+            (
+                "version = 1",
+                'adapter = "eggnog"',
+                f'executable = "{executable}"',
+                f'resource = "{resource}"',
+                'store = "https://user:password@example.org/store?token=secret"',
+                "",
+                "[environment]",
+                'API_TOKEN = "very-secret-value"',
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    shown = redacted_effective_configuration(load_execution_profile(profile_path))
+
+    assert "environment_names: API_TOKEN" in shown
+    assert "https://example.org/store" in shown
+    for secret in ("very-secret-value", "password", "token=secret", "user"):
+        assert secret not in shown

@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .adapters import AdapterName
 from .errors import ProfileConfigurationError
@@ -93,6 +94,77 @@ def load_named_profile(
     """Load one profile selected by its stable user-facing name."""
 
     return load_execution_profile(named_profile_path(name, environment=environment))
+
+
+def initialize_named_profile(
+    name: str,
+    adapter: AdapterName,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Create one complete named profile without replacing an existing file."""
+
+    destination = named_profile_path(name, environment=environment)
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("x", encoding="utf-8") as stream:
+            stream.write(profile_example(adapter))
+    except FileExistsError as error:
+        raise ProfileConfigurationError(
+            f"execution profile already exists: {destination}"
+        ) from error
+    except OSError as error:
+        raise ProfileConfigurationError(
+            f"cannot create execution profile {destination}: {error}"
+        ) from error
+    return destination
+
+
+def list_named_profiles(
+    *, environment: Mapping[str, str] | None = None
+) -> tuple[str, ...]:
+    """Return safe named profiles in deterministic lexical order."""
+
+    directory = default_profile_directory(environment)
+    try:
+        names = tuple(
+            entry.stem
+            for entry in directory.iterdir()
+            if entry.is_file()
+            and entry.suffix == ".toml"
+            and _PROFILE_NAME.fullmatch(entry.stem) is not None
+        )
+    except FileNotFoundError:
+        return ()
+    except OSError as error:
+        raise ProfileConfigurationError(
+            f"cannot list execution profiles in {directory}: {error}"
+        ) from error
+    return tuple(sorted(names))
+
+
+def redacted_effective_configuration(profile: ExecutionProfile) -> str:
+    """Render resolved profile inputs without subprocess environment values."""
+
+    store = _redacted_store(profile.store)
+    lines = [
+        f"source: {profile.source}",
+        f"adapter: {profile.adapter.value}",
+        f"executable: {profile.executable}",
+        f"resource: {profile.resource}",
+        f"store: {store if store is not None else '(default)'}",
+        f"threads: {profile.threads if profile.threads is not None else '(default)'}",
+        (
+            "timeout_seconds: "
+            f"{profile.timeout_seconds if profile.timeout_seconds is not None else '(none)'}"
+        ),
+    ]
+    environment_names = tuple(name for name, _value in profile.environment)
+    lines.append(
+        "environment_names: "
+        + (", ".join(environment_names) if environment_names else "(none)")
+    )
+    return "\n".join(lines) + "\n"
 
 
 def load_execution_profile(path: Path) -> ExecutionProfile:
@@ -204,6 +276,23 @@ def profile_example(adapter: AdapterName) -> str:
         "# timeout_seconds = 86400\n"
         f"{environment}"
     )
+
+
+def _redacted_store(store: str | None) -> str | None:
+    if store is None or "://" not in store:
+        return store
+    try:
+        parsed = urlsplit(store)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return f"{store.split('://', maxsplit=1)[0]}://<redacted>"
+    if hostname is None:
+        return f"{parsed.scheme}://<redacted>"
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        host = f"{host}:{port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
 
 
 def _required_string(document: Mapping[str, Any], key: str) -> str:
