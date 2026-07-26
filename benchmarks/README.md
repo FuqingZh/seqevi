@@ -18,6 +18,22 @@ PYTHONPATH=src:. pdm run python benchmarks/annotate_fixture.py \
   --output /tmp/seqevi-fixture-10000
 ```
 
+To exercise a deployed shared Store with an independent HTTP client for every
+A/B/C run:
+
+```bash
+PYTHONPATH=src:. pdm run python benchmarks/annotate_fixture.py \
+  --sequences 10000 \
+  --store http://127.0.0.1:18081 \
+  --fresh-store-per-run \
+  --output /tmp/seqevi-shared-fixture-10000
+```
+
+The target shared Store must be an isolated benchmark deployment because this
+harness intentionally commits deterministic fixture evidence. Set
+`--sequence-offset` to a previously unused non-negative value when rerunning
+against an immutable Store.
+
 Real-tool reports must separately record executable/runtime identity, database
 resource identity, thread count, hit/no-hit composition, and external-tool time.
 
