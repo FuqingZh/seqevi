@@ -77,6 +77,14 @@ seqevi annotate \
   --output results/eggnog
 ```
 
+```bash
+seqevi annotate \
+  --profile interpro-pfam-38.1 \
+  --fasta proteins.fasta \
+  --store https://seqevi.example.org \
+  --output results/pfam
+```
+
 An exact profile file can be selected with `--config PATH`. Complete explicit
 mode remains available:
 
