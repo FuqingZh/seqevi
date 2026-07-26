@@ -151,7 +151,14 @@ def main() -> None:
                     for name, indices in run_specs
                 )
 
-        if run_b.computed != 0 or run_c.computed != half:
+        if (
+            run_a.cache_hits != 0
+            or run_a.computed != count
+            or run_b.cache_hits != half
+            or run_b.computed != 0
+            or run_c.cache_hits != half
+            or run_c.computed != half
+        ):
             raise RuntimeError("A/B/C reuse counts do not match the benchmark contract")
         if not pl.read_parquet(root / "a-new" / "evidence.parquet").schema:
             raise RuntimeError("benchmark evidence schema is empty")
