@@ -95,12 +95,20 @@ def test_user_asset_install_preserves_secret_and_updates_example(
     subprocess.run(
         (str(ROOT / "deploy/systemd/install-user-assets"),),
         check=True,
-        env={**os.environ, "HOME": str(home)},
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+        },
     )
     subprocess.run(
         (str(ROOT / "deploy/systemd/install-user-assets"),),
         check=True,
-        env={**os.environ, "HOME": str(home)},
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+        },
     )
 
     assert environment_file.read_bytes() == b"existing-secret-bytes\n"
