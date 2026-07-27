@@ -87,6 +87,7 @@ def test_user_asset_install_preserves_secret_and_updates_example(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
+    xdg_config_home = tmp_path / "xdg"
     environment_file = home / ".config/seqevi/seqevi-store.env"
     environment_file.parent.mkdir(parents=True)
     environment_file.write_bytes(b"existing-secret-bytes\n")
@@ -98,7 +99,7 @@ def test_user_asset_install_preserves_secret_and_updates_example(
         env={
             **os.environ,
             "HOME": str(home),
-            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_CONFIG_HOME": str(xdg_config_home),
         },
     )
     subprocess.run(
@@ -107,7 +108,7 @@ def test_user_asset_install_preserves_secret_and_updates_example(
         env={
             **os.environ,
             "HOME": str(home),
-            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_CONFIG_HOME": str(xdg_config_home),
         },
     )
 
@@ -123,6 +124,7 @@ def test_user_asset_install_preserves_secret_and_updates_example(
         assert (home / f".local/libexec/seqevi/{helper}").read_bytes() == (
             ROOT / f"deploy/systemd/{helper}"
         ).read_bytes()
+    assert not xdg_config_home.exists()
 
 
 def test_node4_runbook_selects_one_explicit_rootful_docker_context() -> None:

@@ -3,7 +3,7 @@
 set -eu
 
 source_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}
+config_dir=$HOME/.config
 seqevi_config_dir=$config_dir/seqevi
 systemd_user_dir=$config_dir/systemd/user
 libexec_dir=$HOME/.local/libexec/seqevi
