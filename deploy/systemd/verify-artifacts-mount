@@ -29,4 +29,3 @@ if [ "$actual_fstype" != "ceph" ] || [ "$mount_fstype" != "ceph" ]; then
     echo "artifact path and configured mount must both use ceph" >&2
     exit 1
 fi
-
