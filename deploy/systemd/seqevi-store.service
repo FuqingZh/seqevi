@@ -16,6 +16,7 @@ ExecStartPre=/usr/bin/test "${SEQEVI_GID}" -gt 0
 ExecStartPre=/usr/bin/test -S /var/run/docker.sock
 ExecStartPre=/usr/bin/docker info
 ExecStartPre=%h/.local/libexec/seqevi/verify-artifacts-mount "${SEQEVI_ARTIFACTS_DIR}" "${SEQEVI_ARTIFACTS_MOUNT}"
+ExecStartPre=%h/.local/libexec/seqevi/verify-image-reference "${SEQEVI_IMAGE}"
 ExecStartPre=/usr/bin/docker image inspect "${SEQEVI_IMAGE}"
 ExecStartPre=-/usr/bin/docker rm --force seqevi-store
 ExecStart=/usr/bin/docker run --name seqevi-store --network host --read-only --init --user ${SEQEVI_UID}:${SEQEVI_GID} --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m --mount type=bind,src=${SEQEVI_ARTIFACTS_DIR},dst=/var/lib/seqevi/artifacts --env SEQEVI_DATABASE_URL --env SEQEVI_ARTIFACTS_DIR=/var/lib/seqevi/artifacts --env SEQEVI_HEALTH_URL=http://127.0.0.1:18081/health "${SEQEVI_IMAGE}" serve --host 127.0.0.1 --port 18081

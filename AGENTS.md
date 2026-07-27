@@ -40,5 +40,7 @@
 
 - Keep AO task branches scoped to one tracked issue, and use a ready-for-review
   pull request with the issue key in its body for delivery.
-- Enable native auto-merge only after required checks pass and review threads
-  are resolved; do not merge a task branch directly.
+- Merge readiness requires platform-native review completion against the exact
+  current head SHA, followed by confirmation that zero review threads remain
+  unresolved. Only then may native auto-merge be enabled; do not merge a task
+  branch directly.

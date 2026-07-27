@@ -1,0 +1,44 @@
+#!/bin/sh
+
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: verify-image-reference REPOSITORY@SHA256_DIGEST" >&2
+    exit 2
+fi
+
+image_reference=$1
+
+case "$image_reference" in
+    *[!abcdefghijklmnopqrstuvwxyz0123456789._:/@-]*)
+        echo "image reference contains unsupported, whitespace, or uppercase characters" >&2
+        exit 1
+        ;;
+esac
+
+repository=${image_reference%@sha256:*}
+digest=${image_reference#*@sha256:}
+
+if [ -z "$repository" ] || [ "$repository" = "$image_reference" ]; then
+    echo "image reference must use repository@sha256:<64 lowercase hex>" >&2
+    exit 1
+fi
+
+case "$repository" in
+    *@*)
+        echo "image repository must not contain @" >&2
+        exit 1
+        ;;
+esac
+
+if [ "${#digest}" -ne 64 ]; then
+    echo "image digest must contain exactly 64 lowercase hex characters" >&2
+    exit 1
+fi
+
+case "$digest" in
+    *[!0123456789abcdef]*)
+        echo "image digest must contain exactly 64 lowercase hex characters" >&2
+        exit 1
+        ;;
+esac

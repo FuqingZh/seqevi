@@ -1,0 +1,26 @@
+#!/bin/sh
+
+set -eu
+
+source_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+config_dir=$HOME/.config
+seqevi_config_dir=$config_dir/seqevi
+systemd_user_dir=$config_dir/systemd/user
+libexec_dir=$HOME/.local/libexec/seqevi
+environment_file=$seqevi_config_dir/seqevi-store.env
+
+install -d -m 0700 "$seqevi_config_dir" "$systemd_user_dir"
+install -d -m 0755 "$libexec_dir"
+
+install -m 0644 "$source_dir/seqevi-store.env.example" \
+    "$seqevi_config_dir/seqevi-store.env.example"
+if [ ! -e "$environment_file" ]; then
+    install -m 0600 "$source_dir/seqevi-store.env.example" "$environment_file"
+fi
+
+install -m 0644 "$source_dir/seqevi-store.service" \
+    "$systemd_user_dir/seqevi-store.service"
+install -m 0755 "$source_dir/verify-artifacts-mount" \
+    "$libexec_dir/verify-artifacts-mount"
+install -m 0755 "$source_dir/verify-image-reference" \
+    "$libexec_dir/verify-image-reference"
