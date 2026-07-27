@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-07-26
+> Last updated: 2026-07-27
 
 SeqEvi has implemented the v1 local and shared Store paths plus both initial
 adapters. The documents below define the implementation contract and record
@@ -26,6 +26,8 @@ which external-runtime gates have passed.
 15. [eggNOG full-proteome scaling](benchmarks/20260723-v1.0-eggnog-full-proteome-tuning.md)
 16. [InterProScan official parity plan](implementation-plan/20260723-v1.0-interproscan-parity-implementation-plan.md)
 17. [InterProScan Pfam runtime validation](benchmarks/20260723-v1.0-interproscan-runtime-validation.md)
+18. [SeqEvi 0.1.0 service release implementation plan](implementation-plan/20260727-v0.1.0-service-release-implementation-plan.md)
+19. [SeqEvi 0.1.0 loopback service runbook](operations/20260727-v0.1.0-loopback-service-runbook.md)
 
 ## Authority
 

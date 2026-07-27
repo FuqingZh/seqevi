@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+.pdm-python
+.pytest_cache
+.ruff_cache
+.pyright
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+benchmarks
+docs
+tests
+
