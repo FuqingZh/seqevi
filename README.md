@@ -117,6 +117,12 @@ seqevi serve \
   --artifacts-dir /data/seqevi-artifacts
 ```
 
+The supported user-systemd deployment through the host rootful Docker daemon is
+documented in the
+[service runbook](docs/operations/20260727-v0.1.0-loopback-service-runbook.md).
+The service image contains SeqEvi and its server dependencies only; annotation
+executables and databases remain external.
+
 Initialize or audit a database resource lock independently of annotation:
 
 ```bash

@@ -1,0 +1,31 @@
+#!/bin/sh
+
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    echo "usage: verify-artifacts-mount ARTIFACTS_DIR ARTIFACTS_MOUNT" >&2
+    exit 2
+fi
+
+artifacts_dir=$(/usr/bin/realpath -e -- "$1")
+artifacts_mount=$(/usr/bin/realpath -e -- "$2")
+findmnt_bin=${SEQEVI_FINDMNT_BIN:-/usr/bin/findmnt}
+
+if [ ! -d "$artifacts_dir" ]; then
+    echo "artifact path is not a directory: $artifacts_dir" >&2
+    exit 1
+fi
+
+actual_target=$("$findmnt_bin" --noheadings --raw --output TARGET --target "$artifacts_dir")
+actual_fstype=$("$findmnt_bin" --noheadings --raw --output FSTYPE --target "$artifacts_dir")
+mount_fstype=$("$findmnt_bin" --noheadings --raw --output FSTYPE --mountpoint "$artifacts_mount")
+
+if [ "$actual_target" != "$artifacts_mount" ]; then
+    echo "artifact path resolves to $actual_target, expected $artifacts_mount" >&2
+    exit 1
+fi
+
+if [ "$actual_fstype" != "ceph" ] || [ "$mount_fstype" != "ceph" ]; then
+    echo "artifact path and configured mount must both use ceph" >&2
+    exit 1
+fi
