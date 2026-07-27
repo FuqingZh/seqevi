@@ -88,6 +88,15 @@ def test_image_reference_guard_rejects_mutable_or_malformed_references(
     assert _verify_image_reference(reference).returncode == 1
 
 
+def test_image_reference_guard_reports_unsupported_characters() -> None:
+    rejected = _verify_image_reference(
+        "repo?name@sha256:"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    )
+
+    assert "unsupported, whitespace, or uppercase" in rejected.stderr
+
+
 def test_user_asset_install_preserves_secret_and_updates_example(
     tmp_path: Path,
 ) -> None:
