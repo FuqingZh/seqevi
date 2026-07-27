@@ -10,7 +10,7 @@ fi
 image_reference=$1
 
 case "$image_reference" in
-    *[!abcdefghijklmnopqrstuvwxyz0123456789._:/-@]*)
+    *[!abcdefghijklmnopqrstuvwxyz0123456789._:/@-]*)
         echo "image reference must contain no whitespace or uppercase characters" >&2
         exit 1
         ;;

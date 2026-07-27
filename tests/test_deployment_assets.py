@@ -75,6 +75,11 @@ def test_image_reference_guard_accepts_exact_repository_digest() -> None:
         "repo@sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "repo@@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "repo@sha256:g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "repo;name@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "repo<name@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "repo=name@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "repo>name@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "repo?name@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     ),
 )
 def test_image_reference_guard_rejects_mutable_or_malformed_references(
