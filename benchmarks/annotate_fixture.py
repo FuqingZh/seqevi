@@ -13,7 +13,8 @@ from pathlib import Path
 import polars as pl
 
 from seqevi.annotate import AnnotationSummary, run_annotation
-from seqevi.store import LocalStore
+from seqevi.store import open_evidence_store
+from seqevi.store.contract import EvidenceStore
 from tests.support import FixtureAdapter, write_fixture_database, write_fixture_tool
 
 _RESIDUES = "ACDEFGHIKLMNPQRSTVWY"
@@ -42,7 +43,7 @@ def _run(
     indices: list[int],
     root: Path,
     adapter: FixtureAdapter,
-    store: LocalStore,
+    store: EvidenceStore,
     threads: int,
 ) -> AnnotationSummary:
     fasta = root / f"{name}.fasta"
@@ -72,10 +73,27 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequences", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--store",
+        help="Local Store path or HTTP(S) shared Store URL; defaults under output.",
+    )
+    parser.add_argument(
+        "--fresh-store-per-run",
+        action="store_true",
+        help="Open an independent Store client for each A/B/C run.",
+    )
+    parser.add_argument(
+        "--sequence-offset",
+        type=int,
+        default=0,
+        help="First deterministic sequence index; use a new offset for immutable reruns.",
+    )
     parser.add_argument("--threads", type=int, default=1)
     args = parser.parse_args()
     if args.sequences < 2:
         parser.error("--sequences must be at least 2")
+    if args.sequence_offset < 0:
+        parser.error("--sequence-offset must not be negative")
     if args.threads < 1:
         parser.error("--threads must be positive")
 
@@ -91,33 +109,56 @@ def main() -> None:
         adapter = FixtureAdapter(executable=executable, database=database)
         count = args.sequences
         half = count // 2
-        with LocalStore.open(root / "store") as store:
-            run_a = _run(
-                name="a-new",
-                indices=list(range(count)),
-                root=root,
-                adapter=adapter,
-                store=store,
-                threads=args.threads,
-            )
-            run_b = _run(
-                name="b-reused-subset",
-                indices=list(range(half)),
-                root=root,
-                adapter=adapter,
-                store=store,
-                threads=args.threads,
-            )
-            run_c = _run(
-                name="c-half-new",
-                indices=[*range(half), *range(count, count + half)],
-                root=root,
-                adapter=adapter,
-                store=store,
-                threads=args.threads,
-            )
+        first = args.sequence_offset
+        store_value = args.store or str(root / "store")
+        run_specs = (
+            ("a-new", list(range(first, first + count))),
+            ("b-reused-subset", list(range(first, first + half))),
+            (
+                "c-half-new",
+                [
+                    *range(first, first + half),
+                    *range(first + count, first + count + half),
+                ],
+            ),
+        )
+        if args.fresh_store_per_run:
+            summaries = []
+            for name, indices in run_specs:
+                with open_evidence_store(store_value) as store:
+                    summaries.append(
+                        _run(
+                            name=name,
+                            indices=indices,
+                            root=root,
+                            adapter=adapter,
+                            store=store,
+                            threads=args.threads,
+                        )
+                    )
+            run_a, run_b, run_c = summaries
+        else:
+            with open_evidence_store(store_value) as store:
+                run_a, run_b, run_c = (
+                    _run(
+                        name=name,
+                        indices=indices,
+                        root=root,
+                        adapter=adapter,
+                        store=store,
+                        threads=args.threads,
+                    )
+                    for name, indices in run_specs
+                )
 
-        if run_b.computed != 0 or run_c.computed != half:
+        if (
+            run_a.cache_hits != 0
+            or run_a.computed != count
+            or run_b.cache_hits != half
+            or run_b.computed != 0
+            or run_c.cache_hits != half
+            or run_c.computed != half
+        ):
             raise RuntimeError("A/B/C reuse counts do not match the benchmark contract")
         if not pl.read_parquet(root / "a-new" / "evidence.parquet").schema:
             raise RuntimeError("benchmark evidence schema is empty")
@@ -125,9 +166,12 @@ def main() -> None:
         report = {
             "schema_version": 1,
             "sequences": count,
+            "sequence_offset": args.sequence_offset,
             "threads": args.threads,
             "python": platform.python_version(),
             "platform": platform.platform(),
+            "store": store_value,
+            "fresh_store_per_run": args.fresh_store_per_run,
             "wall_seconds": time.perf_counter() - started,
             "runs": {
                 "a_new": _summary(run_a),

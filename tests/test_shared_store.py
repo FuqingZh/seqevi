@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -14,7 +15,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from polars.testing import assert_frame_equal
-from sqlalchemy import BigInteger, create_engine
+from sqlalchemy import BigInteger, create_engine, make_url
 
 from seqevi.annotate import run_annotation
 from seqevi.errors import EvidenceConflictError, StoreError, StoreIntegrityError
@@ -523,76 +524,85 @@ def test_annotation_packages_are_equivalent_for_local_and_http_store(
     ) == (tmp_path / "remote-output" / "sequence-map.tsv").read_text(encoding="utf-8")
 
 
-@pytest.mark.requires_postgres
-def test_postgres_migrates_artifact_byte_size_from_integer_to_bigint() -> None:
+@contextmanager
+def _isolated_postgres_url() -> Iterator[str]:
     database_url = os.environ.get("SEQEVI_TEST_POSTGRES_URL")
     if not database_url:
         pytest.skip("SEQEVI_TEST_POSTGRES_URL is not configured")
-    schema = f"seqevi_migration_{os.urandom(8).hex()}"
+
+    schema = f"seqevi_test_{os.urandom(8).hex()}"
     admin_engine = create_engine(database_url)
     with admin_engine.begin() as connection:
         connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
-    scoped_engine = create_engine(
-        database_url,
-        connect_args={"options": f"-csearch_path={schema}"},
-    )
-    config = Config()
-    config.set_main_option(
-        "script_location",
-        str(Path(store_migration.__file__).with_name("migrations")),
+    scoped_url = (
+        make_url(database_url)
+        .update_query_dict({"options": f"-csearch_path={schema}"})
+        .render_as_string(hide_password=False)
     )
     try:
-        with scoped_engine.connect() as connection:
-            config.attributes["connection"] = connection
-            command.upgrade(config, "0001_initial_store")
-            connection.commit()
-            initial_type = connection.exec_driver_sql(
-                "SELECT data_type FROM information_schema.columns "
-                "WHERE table_schema = current_schema() "
-                "AND table_name = 'artifact' AND column_name = 'byte_size'"
-            ).scalar_one()
-            command.upgrade(config, "head")
-            connection.commit()
-            upgraded_type = connection.exec_driver_sql(
-                "SELECT data_type FROM information_schema.columns "
-                "WHERE table_schema = current_schema() "
-                "AND table_name = 'artifact' AND column_name = 'byte_size'"
-            ).scalar_one()
-        assert initial_type == "integer"
-        assert upgraded_type == "bigint"
+        yield scoped_url
     finally:
-        scoped_engine.dispose()
         with admin_engine.begin() as connection:
             connection.exec_driver_sql(f'DROP SCHEMA "{schema}" CASCADE')
         admin_engine.dispose()
 
 
 @pytest.mark.requires_postgres
+def test_postgres_migrates_artifact_byte_size_from_integer_to_bigint() -> None:
+    with _isolated_postgres_url() as database_url:
+        scoped_engine = create_engine(database_url)
+        try:
+            config = Config()
+            config.set_main_option(
+                "script_location",
+                str(Path(store_migration.__file__).with_name("migrations")),
+            )
+            with scoped_engine.connect() as connection:
+                config.attributes["connection"] = connection
+                command.upgrade(config, "0001_initial_store")
+                connection.commit()
+                initial_type = connection.exec_driver_sql(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'artifact' AND column_name = 'byte_size'"
+                ).scalar_one()
+                command.upgrade(config, "head")
+                connection.commit()
+                upgraded_type = connection.exec_driver_sql(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'artifact' AND column_name = 'byte_size'"
+                ).scalar_one()
+            assert initial_type == "integer"
+            assert upgraded_type == "bigint"
+        finally:
+            scoped_engine.dispose()
+
+
+@pytest.mark.requires_postgres
 def test_postgres_service_commit_lookup_fetch_contract(tmp_path: Path) -> None:
-    database_url = os.environ.get("SEQEVI_TEST_POSTGRES_URL")
-    if not database_url:
-        pytest.skip("SEQEVI_TEST_POSTGRES_URL is not configured")
-    persistence = PostgresEvidencePersistence.open(database_url)
-    commit = _hit_commit(tmp_path / "sources", "MPOSTGRESPHASEFIVE")
-    app = create_service_app(
-        ServiceSettings(
-            database_url=database_url,
-            artifacts_dir=tmp_path / "artifacts",
-        ),
-        persistence=persistence,
-    )
-    with TestClient(app) as test_client:
-        store = HttpEvidenceStore(
-            "http://testserver",
-            client=cast(httpx.Client, test_client),
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        commit = _hit_commit(tmp_path / "sources", "MPOSTGRESPHASEFIVE")
+        app = create_service_app(
+            ServiceSettings(
+                database_url=database_url,
+                artifacts_dir=tmp_path / "artifacts",
+            ),
+            persistence=persistence,
         )
-        assert store.commit_many((commit,)) in {
-            (CommitOutcome.CREATED,),
-            (CommitOutcome.EXISTING,),
-        }
-        query = EvidenceQuery(commit.identity, commit.key)
-        assert store.lookup_many((query,))[commit.key].status is EvidenceStatus.HIT
-        fetched = store.fetch(commit.key)
+        with TestClient(app) as test_client:
+            store = HttpEvidenceStore(
+                "http://testserver",
+                client=cast(httpx.Client, test_client),
+            )
+            assert store.commit_many((commit,)) in {
+                (CommitOutcome.CREATED,),
+                (CommitOutcome.EXISTING,),
+            }
+            query = EvidenceQuery(commit.identity, commit.key)
+            assert store.lookup_many((query,))[commit.key].status is EvidenceStatus.HIT
+            fetched = store.fetch(commit.key)
     assert fetched is not None
     assert fetched.normalized_artifact is not None
     assert fetched.raw_artifact is not None
@@ -602,38 +612,36 @@ def test_postgres_service_commit_lookup_fetch_contract(tmp_path: Path) -> None:
 
 @pytest.mark.requires_postgres
 def test_postgres_concurrent_identical_commits_are_idempotent(tmp_path: Path) -> None:
-    database_url = os.environ.get("SEQEVI_TEST_POSTGRES_URL")
-    if not database_url:
-        pytest.skip("SEQEVI_TEST_POSTGRES_URL is not configured")
-    unique_sequence = "M" + "".join(
-        chr(ord("A") + value % 26) for value in os.urandom(24)
-    )
-    commit = _hit_commit(
-        tmp_path / "sources",
-        unique_sequence,
-        normalized_data=b"concurrent-normalized",
-        raw_data=b"concurrent-raw",
-    )
-    model = CommitModel.from_domain(commit)
-    assert model.normalized_artifact is not None
-    assert model.raw_artifact is not None
-    stored = {
-        reference.digest: StoredArtifact(
-            digest=reference.digest,
-            media_type=reference.media_type,
-            byte_size=reference.byte_size,
-            relative_path=f"fixture/{reference.digest}",
+    with _isolated_postgres_url() as database_url:
+        unique_sequence = "M" + "".join(
+            chr(ord("A") + value % 26) for value in os.urandom(24)
         )
-        for reference in (model.normalized_artifact, model.raw_artifact)
-    }
+        commit = _hit_commit(
+            tmp_path / "sources",
+            unique_sequence,
+            normalized_data=b"concurrent-normalized",
+            raw_data=b"concurrent-raw",
+        )
+        model = CommitModel.from_domain(commit)
+        assert model.normalized_artifact is not None
+        assert model.raw_artifact is not None
+        stored = {
+            reference.digest: StoredArtifact(
+                digest=reference.digest,
+                media_type=reference.media_type,
+                byte_size=reference.byte_size,
+                relative_path=f"fixture/{reference.digest}",
+            )
+            for reference in (model.normalized_artifact, model.raw_artifact)
+        }
 
-    def commit_once() -> CommitOutcome:
-        persistence = PostgresEvidencePersistence.open(database_url)
-        try:
-            return persistence.commit_many((model,), stored)[0]
-        finally:
-            persistence.close()
+        def commit_once() -> CommitOutcome:
+            persistence = PostgresEvidencePersistence.open(database_url)
+            try:
+                return persistence.commit_many((model,), stored)[0]
+            finally:
+                persistence.close()
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        outcomes = list(executor.map(lambda _index: commit_once(), range(2)))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda _index: commit_once(), range(2)))
     assert sorted(outcomes) == [CommitOutcome.CREATED, CommitOutcome.EXISTING]
