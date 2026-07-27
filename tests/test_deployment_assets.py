@@ -54,12 +54,16 @@ def _verify_image_reference(reference: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_image_reference_guard_accepts_exact_repository_digest() -> None:
-    reference = (
+    references = (
         "192.168.30.202:23099/bioinfo/seqevi@sha256:"
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "registry.example/team-name/seqevi@sha256:"
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
 
-    assert _verify_image_reference(reference).returncode == 0
+    assert all(
+        _verify_image_reference(reference).returncode == 0 for reference in references
+    )
 
 
 @pytest.mark.parametrize(
