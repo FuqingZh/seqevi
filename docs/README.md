@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-07-27
+> Last updated: 2026-07-29
 
 SeqEvi has implemented the v1 local and shared Store paths plus both initial
 adapters. The documents below define the implementation contract and record
