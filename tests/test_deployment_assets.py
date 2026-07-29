@@ -47,39 +47,27 @@ def test_systemd_unit_is_loopback_only_and_mount_guarded() -> None:
 def test_httpd_ingress_exposes_only_loopback_http_store() -> None:
     config = (ROOT / "deploy/httpd/seqevi-store.conf").read_text(encoding="utf-8")
 
-    assert "Listen 192.168.30.205:18443 https" in config
-    assert "SSLEngine on" in config
-    assert "AuthType Basic" in config
-    assert "AuthUserFile /etc/seqevi/ingress.htpasswd" in config
+    assert "Listen 192.168.30.205:18082" in config
     assert "Require ip 172.17.0.0/16 192.168.30.0/24" in config
-    assert "Require valid-user" in config
     assert "ProxyPass / http://127.0.0.1:18081/ nocanon" in config
     assert "ProxyPassReverse / http://127.0.0.1:18081/" in config
+    for excluded in ("ssl", "certificate", "AuthType", "AuthUserFile", "htpasswd"):
+        assert excluded.lower() not in config.lower()
     assert "15432" not in config
     assert "artifacts" not in config.lower()
     assert "0.0.0.0" not in config
-    assert "RequestHeader unset Authorization" in config
 
 
 def test_httpd_ingress_drops_untrusted_forwarding_headers() -> None:
     config = (ROOT / "deploy/httpd/seqevi-store.conf").read_text(encoding="utf-8")
 
     for header in (
-        "Authorization",
         "Forwarded",
         "X-Forwarded-For",
         "X-Forwarded-Host",
         "X-Forwarded-Proto",
     ):
         assert f"RequestHeader unset {header}" in config
-
-
-def test_ingress_runbook_checks_certificate_hostname() -> None:
-    runbook = (
-        ROOT / "docs/operations/20260729-v0.1.0-private-cluster-ingress-runbook.md"
-    ).read_text(encoding="utf-8")
-
-    assert "-checkhost node4.cluster.local" in runbook
 
 
 def _verify_image_reference(reference: str) -> subprocess.CompletedProcess[str]:

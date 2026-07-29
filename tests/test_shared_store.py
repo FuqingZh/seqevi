@@ -18,12 +18,7 @@ from polars.testing import assert_frame_equal
 from sqlalchemy import BigInteger, create_engine, make_url
 
 from seqevi.annotate import run_annotation
-from seqevi.errors import (
-    EvidenceConflictError,
-    StoreConfigurationError,
-    StoreError,
-    StoreIntegrityError,
-)
+from seqevi.errors import EvidenceConflictError, StoreError, StoreIntegrityError
 from seqevi.evidence import (
     CommitOutcome,
     EvidenceCommit,
@@ -38,7 +33,6 @@ from seqevi.sequence import SequenceIdentity, identify_protein_sequence
 from seqevi.service import ServiceSettings, create_service_app
 from seqevi.service.persistence import PostgresEvidencePersistence
 from seqevi.store import HttpEvidenceStore, LocalStore
-from seqevi.store import factory as store_factory
 from seqevi.store import migration as store_migration
 from seqevi.store.schema import artifacts
 from seqevi.store.transport import CommitModel
@@ -208,149 +202,6 @@ def test_http_store_matches_lookup_commit_and_fetch_contract(tmp_path: Path) -> 
     assert fetched.normalized_artifact.path.read_bytes() == b"normalized"
     assert fetched.raw_artifact.path.read_bytes() == b"raw"
     assert persistence.closed
-
-
-def test_http_store_rejects_credentials_in_url() -> None:
-    with pytest.raises(ValueError, match="must not contain credentials"):
-        HttpEvidenceStore(
-            "https://worker:secret@store.example",
-            maximum_artifact_bytes=1,
-            maximum_batch_size=1,
-        )
-
-
-def test_http_store_rejects_basic_auth_over_plain_http(tmp_path: Path) -> None:
-    auth_file = tmp_path / "auth"
-    auth_file.write_text("worker\nsecret\n", encoding="utf-8")
-    auth_file.chmod(0o600)
-
-    with pytest.raises(ValueError, match="requires HTTPS"):
-        HttpEvidenceStore(
-            "http://store.example",
-            basic_auth_file=auth_file,
-            maximum_artifact_bytes=1,
-            maximum_batch_size=1,
-        )
-
-
-def test_http_store_loads_basic_auth_from_owner_only_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    auth_file = tmp_path / "auth"
-    auth_file.write_text("worker\nsecret\n", encoding="utf-8")
-    auth_file.chmod(0o600)
-    captured: dict[str, object] = {}
-
-    class FakeClient:
-        def __init__(self, **kwargs: object) -> None:
-            captured.update(kwargs)
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-    store = HttpEvidenceStore(
-        "https://store.example",
-        basic_auth_file=auth_file,
-        maximum_artifact_bytes=1,
-        maximum_batch_size=1,
-    )
-    store.close()
-
-    request = httpx.Request("GET", "https://store.example/health")
-    captured_auth = cast(httpx.BasicAuth, captured["auth"])
-    flow = captured_auth.auth_flow(request)
-    authenticated = next(flow)
-    assert authenticated.headers["Authorization"].startswith("Basic ")
-    assert "worker" not in repr(captured_auth)
-    assert "secret" not in repr(captured_auth)
-
-
-@pytest.mark.parametrize(
-    ("contents", "mode", "message"),
-    (
-        ("worker\n", 0o600, "username and password lines"),
-        ("worker\nsecret\nextra\n", 0o600, "username and password lines"),
-        ("worker\nsecret\n", 0o644, "group/other access"),
-        ("worker:name\nsecret\n", 0o600, "invalid credentials"),
-    ),
-)
-def test_http_store_rejects_unsafe_basic_auth_files(
-    tmp_path: Path,
-    contents: str,
-    mode: int,
-    message: str,
-) -> None:
-    auth_file = tmp_path / "auth"
-    auth_file.write_text(contents, encoding="utf-8")
-    auth_file.chmod(mode)
-
-    with pytest.raises(ValueError, match=message):
-        HttpEvidenceStore(
-            "https://store.example",
-            basic_auth_file=auth_file,
-            maximum_artifact_bytes=1,
-            maximum_batch_size=1,
-        )
-
-
-def test_store_factory_passes_basic_auth_file_from_environment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-
-    class FakeStore:
-        def __init__(self, base_url: str, **kwargs: object) -> None:
-            captured["base_url"] = base_url
-            captured.update(kwargs)
-
-        def __enter__(self) -> FakeStore:
-            return self
-
-        def __exit__(self, *_error: object) -> None:
-            pass
-
-    monkeypatch.setattr(store_factory, "HttpEvidenceStore", FakeStore)
-    with store_factory.open_evidence_store(
-        None,
-        environ={
-            "SEQEVI_STORE": "https://store.example",
-            "SEQEVI_HTTP_BASIC_AUTH_FILE": "/run/secrets/seqevi-auth",
-        },
-    ) as store:
-        assert isinstance(store, FakeStore)
-
-    assert captured == {
-        "base_url": "https://store.example",
-        "basic_auth_file": "/run/secrets/seqevi-auth",
-    }
-
-
-@pytest.mark.parametrize(
-    ("store_url", "message"),
-    (
-        ("https://worker:secret@store.example", "must not contain credentials"),
-        ("http://store.example", "requires HTTPS"),
-    ),
-)
-def test_store_factory_translates_auth_validation_to_configuration_error(
-    tmp_path: Path,
-    store_url: str,
-    message: str,
-) -> None:
-    auth_file = tmp_path / "auth"
-    auth_file.write_text("worker\nsecret\n", encoding="utf-8")
-    auth_file.chmod(0o600)
-
-    with pytest.raises(StoreConfigurationError, match=message):
-        with store_factory.open_evidence_store(
-            None,
-            environ={
-                "SEQEVI_STORE": store_url,
-                "SEQEVI_HTTP_BASIC_AUTH_FILE": str(auth_file),
-            },
-        ):
-            pass
 
 
 def test_http_store_preserves_no_hit_without_normalized_artifact(
