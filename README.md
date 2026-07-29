@@ -153,7 +153,7 @@ Start with [the documentation index](docs/README.md).
 - [Sequence and evidence contract](docs/architecture/20260720-v1.0-sequence-evidence-contract.md)
 - [Adapter contract](docs/architecture/20260720-v1.0-adapter-contract.md)
 - [Execution profile contract](docs/architecture/20260724-v1.0-execution-profile-contract.md)
-- [Storage and deployment architecture](docs/architecture/20260720-v1.0-storage-deployment-architecture.md)
+- [Storage and deployment architecture](docs/architecture/20260729-v1.1-storage-deployment-architecture.md)
 - [MVP implementation plan](docs/implementation-plan/20260720-v1.0-mvp-implementation-plan.md)
 - [Execution profile implementation plan](docs/implementation-plan/20260724-v1.0-execution-profile-implementation-plan.md)
 - [Validation strategy](docs/testing/20260720-v1.0-validation-strategy.md)

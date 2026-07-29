@@ -13,7 +13,7 @@ which external-runtime gates have passed.
 2. [Sequence and evidence contract](architecture/20260720-v1.0-sequence-evidence-contract.md)
 3. [Adapter contract](architecture/20260720-v1.0-adapter-contract.md)
 4. [Execution profile contract](architecture/20260724-v1.0-execution-profile-contract.md)
-5. [Storage and deployment architecture](architecture/20260720-v1.0-storage-deployment-architecture.md)
+5. [Storage and deployment architecture](architecture/20260729-v1.1-storage-deployment-architecture.md)
 6. [MVP implementation plan](implementation-plan/20260720-v1.0-mvp-implementation-plan.md)
 7. [Execution profile implementation plan](implementation-plan/20260724-v1.0-execution-profile-implementation-plan.md)
 8. [Validation strategy](testing/20260720-v1.0-validation-strategy.md)
