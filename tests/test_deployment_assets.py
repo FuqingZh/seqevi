@@ -44,6 +44,32 @@ def test_systemd_unit_is_loopback_only_and_mount_guarded() -> None:
     assert "EnvironmentFile=%h/.config/seqevi/seqevi-store.env" in unit
 
 
+def test_httpd_ingress_exposes_only_loopback_http_store() -> None:
+    config = (ROOT / "deploy/httpd/seqevi-store.conf").read_text(encoding="utf-8")
+
+    assert "Listen 192.168.30.205:18082" in config
+    assert "Require ip 172.17.0.0/16 192.168.30.0/24" in config
+    assert "ProxyPass / http://127.0.0.1:18081/ nocanon" in config
+    assert "ProxyPassReverse / http://127.0.0.1:18081/" in config
+    for excluded in ("ssl", "certificate", "AuthType", "AuthUserFile", "htpasswd"):
+        assert excluded.lower() not in config.lower()
+    assert "15432" not in config
+    assert "artifacts" not in config.lower()
+    assert "0.0.0.0" not in config
+
+
+def test_httpd_ingress_drops_untrusted_forwarding_headers() -> None:
+    config = (ROOT / "deploy/httpd/seqevi-store.conf").read_text(encoding="utf-8")
+
+    for header in (
+        "Forwarded",
+        "X-Forwarded-For",
+        "X-Forwarded-Host",
+        "X-Forwarded-Proto",
+    ):
+        assert f"RequestHeader unset {header}" in config
+
+
 def _verify_image_reference(reference: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         (str(ROOT / "deploy/systemd/verify-image-reference"), reference),

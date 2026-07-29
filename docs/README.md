@@ -13,7 +13,7 @@ which external-runtime gates have passed.
 2. [Sequence and evidence contract](architecture/20260720-v1.0-sequence-evidence-contract.md)
 3. [Adapter contract](architecture/20260720-v1.0-adapter-contract.md)
 4. [Execution profile contract](architecture/20260724-v1.0-execution-profile-contract.md)
-5. [Storage and deployment architecture](architecture/20260720-v1.0-storage-deployment-architecture.md)
+5. [Storage and deployment architecture](architecture/20260729-v1.1-storage-deployment-architecture.md)
 6. [MVP implementation plan](implementation-plan/20260720-v1.0-mvp-implementation-plan.md)
 7. [Execution profile implementation plan](implementation-plan/20260724-v1.0-execution-profile-implementation-plan.md)
 8. [Validation strategy](testing/20260720-v1.0-validation-strategy.md)
@@ -29,6 +29,9 @@ which external-runtime gates have passed.
 18. [SeqEvi 0.1.0 service release implementation plan](implementation-plan/20260727-v0.1.0-service-release-implementation-plan.md)
 19. [SeqEvi 0.1.0 loopback service runbook](operations/20260727-v0.1.0-loopback-service-runbook.md)
 20. [SeqEvi 0.1.0 stable loopback service acceptance](benchmarks/20260727-v0.1.0-stable-loopback-service-acceptance.md)
+21. [Private cluster ingress implementation plan](implementation-plan/20260729-v0.1.0-private-cluster-ingress-plan.md)
+22. [Private cluster ingress runbook](operations/20260729-v0.1.0-private-cluster-ingress-runbook.md)
+23. [Private cluster ingress acceptance](benchmarks/20260729-v0.1.0-private-cluster-ingress-acceptance.md)
 
 ## Authority
 
