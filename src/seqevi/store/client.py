@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import tempfile
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -42,7 +44,21 @@ _TRANSFER_CHUNK_SIZE = 1024 * 1024
 
 
 class HttpEvidenceStore:
-    """Remote Store client with exact artifact integrity verification."""
+    """Remote Store client with exact artifact integrity verification.
+
+    Store URLs must not contain credentials. For deployment Basic
+    authentication, pass ``basic_auth_file`` as an absolute path to a regular,
+    non-symlink file owned by the process UID with no group/other permissions.
+    The file contains exactly two non-empty UTF-8 lines: username, then
+    password.
+
+    Example:
+        >>> store = HttpEvidenceStore(
+        ...     "https://node4.cluster.local:18443",
+        ...     basic_auth_file="/run/secrets/seqevi-basic-auth",
+        ... )
+        >>> store.close()
+    """
 
     def __init__(
         self,
@@ -51,8 +67,29 @@ class HttpEvidenceStore:
         timeout_seconds: float = 120.0,
         maximum_artifact_bytes: int | None = None,
         maximum_batch_size: int | None = None,
+        basic_auth_file: str | Path | None = None,
         client: httpx.Client | None = None,
     ) -> None:
+        """Initialize one shared Store client.
+
+        Args:
+            base_url: Credential-free HTTP(S) Store URL.
+            timeout_seconds: Complete request timeout.
+            maximum_artifact_bytes: Optional override for health discovery.
+            maximum_batch_size: Optional override for health discovery.
+            basic_auth_file: Optional owner-only two-line Basic-auth file.
+            client: Optional preconfigured HTTPX client for embedding or tests.
+
+        Raises:
+            ValueError: If the URL contains credentials, the auth file is
+                unsafe or malformed, or ``basic_auth_file`` is combined with
+                ``client``.
+        """
+        parsed_url = urlsplit(base_url)
+        if parsed_url.username is not None or parsed_url.password is not None:
+            raise ValueError("shared Store URL must not contain credentials")
+        if client is not None and basic_auth_file is not None:
+            raise ValueError("basic_auth_file cannot be combined with a custom client")
         self._uploaded_artifact_digests: set[str] = set()
         self._download_directory = tempfile.TemporaryDirectory(
             prefix="seqevi-http-artifacts-"
@@ -60,9 +97,11 @@ class HttpEvidenceStore:
         self._download_root = Path(self._download_directory.name)
         self._downloaded_artifacts: dict[str, ArtifactFile] = {}
         self._owns_client = client is None
+        auth = _load_basic_auth_file(Path(basic_auth_file)) if basic_auth_file else None
         self.client = client or httpx.Client(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout_seconds),
+            auth=auth,
         )
         if maximum_artifact_bytes is None or maximum_batch_size is None:
             health = HealthResponse.model_validate(
@@ -294,6 +333,39 @@ def _file_chunks(path: Path) -> Iterator[bytes]:
     with path.open("rb") as handle:
         while chunk := handle.read(_TRANSFER_CHUNK_SIZE):
             yield chunk
+
+
+def _load_basic_auth_file(path: Path) -> httpx.BasicAuth:
+    """Load an owner-only two-line Basic-auth credential file."""
+
+    if not path.is_absolute():
+        raise ValueError("shared Store Basic-auth file path must be absolute")
+    try:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("shared Store Basic-auth file must be a regular file")
+        if metadata.st_uid != os.geteuid():
+            raise ValueError("shared Store Basic-auth file must be owned by this user")
+        if metadata.st_mode & 0o077:
+            raise ValueError(
+                "shared Store Basic-auth file must not permit group/other access"
+            )
+        if not metadata.st_mode & stat.S_IRUSR:
+            raise ValueError("shared Store Basic-auth file must be owner-readable")
+        payload = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError("cannot read shared Store Basic-auth file") from error
+    lines = payload.splitlines()
+    if len(lines) != 2 or not lines[0] or not lines[1]:
+        raise ValueError(
+            "shared Store Basic-auth file must contain username and password lines"
+        )
+    username, password = lines
+    if ":" in username or any(
+        character in username + password for character in "\r\n\x00"
+    ):
+        raise ValueError("shared Store Basic-auth file contains invalid credentials")
+    return httpx.BasicAuth(username, password)
 
 
 def _raise_for_store_status(
