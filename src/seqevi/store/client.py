@@ -46,11 +46,10 @@ _TRANSFER_CHUNK_SIZE = 1024 * 1024
 class HttpEvidenceStore:
     """Remote Store client with exact artifact integrity verification.
 
-    Store URLs must not contain credentials. For deployment Basic
-    authentication, pass ``basic_auth_file`` as an absolute path to a regular,
-    non-symlink file owned by the process UID with no group/other permissions.
-    The file contains exactly two non-empty UTF-8 lines: username, then
-    password.
+    Store URLs must not contain credentials. Deployment Basic authentication
+    requires HTTPS. Pass ``basic_auth_file`` as an absolute path to a regular,
+    non-symlink file owned by the process UID with no group/other permissions;
+    it contains exactly two non-empty UTF-8 lines: username, then password.
 
     Example:
         >>> store = HttpEvidenceStore(
@@ -82,12 +81,15 @@ class HttpEvidenceStore:
 
         Raises:
             ValueError: If the URL contains credentials, the auth file is
-                unsafe or malformed, or ``basic_auth_file`` is combined with
+                unsafe or malformed, file-based authentication is requested
+                over plain HTTP, or ``basic_auth_file`` is combined with
                 ``client``.
         """
         parsed_url = urlsplit(base_url)
         if parsed_url.username is not None or parsed_url.password is not None:
             raise ValueError("shared Store URL must not contain credentials")
+        if basic_auth_file is not None and parsed_url.scheme != "https":
+            raise ValueError("shared Store Basic authentication requires HTTPS")
         if client is not None and basic_auth_file is not None:
             raise ValueError("basic_auth_file cannot be combined with a custom client")
         self._uploaded_artifact_digests: set[str] = set()

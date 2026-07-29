@@ -18,7 +18,12 @@ from polars.testing import assert_frame_equal
 from sqlalchemy import BigInteger, create_engine, make_url
 
 from seqevi.annotate import run_annotation
-from seqevi.errors import EvidenceConflictError, StoreError, StoreIntegrityError
+from seqevi.errors import (
+    EvidenceConflictError,
+    StoreConfigurationError,
+    StoreError,
+    StoreIntegrityError,
+)
 from seqevi.evidence import (
     CommitOutcome,
     EvidenceCommit,
@@ -214,6 +219,20 @@ def test_http_store_rejects_credentials_in_url() -> None:
         )
 
 
+def test_http_store_rejects_basic_auth_over_plain_http(tmp_path: Path) -> None:
+    auth_file = tmp_path / "auth"
+    auth_file.write_text("worker\nsecret\n", encoding="utf-8")
+    auth_file.chmod(0o600)
+
+    with pytest.raises(ValueError, match="requires HTTPS"):
+        HttpEvidenceStore(
+            "http://store.example",
+            basic_auth_file=auth_file,
+            maximum_artifact_bytes=1,
+            maximum_batch_size=1,
+        )
+
+
 def test_http_store_loads_basic_auth_from_owner_only_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -305,6 +324,33 @@ def test_store_factory_passes_basic_auth_file_from_environment(
         "base_url": "https://store.example",
         "basic_auth_file": "/run/secrets/seqevi-auth",
     }
+
+
+@pytest.mark.parametrize(
+    ("store_url", "message"),
+    (
+        ("https://worker:secret@store.example", "must not contain credentials"),
+        ("http://store.example", "requires HTTPS"),
+    ),
+)
+def test_store_factory_translates_auth_validation_to_configuration_error(
+    tmp_path: Path,
+    store_url: str,
+    message: str,
+) -> None:
+    auth_file = tmp_path / "auth"
+    auth_file.write_text("worker\nsecret\n", encoding="utf-8")
+    auth_file.chmod(0o600)
+
+    with pytest.raises(StoreConfigurationError, match=message):
+        with store_factory.open_evidence_store(
+            None,
+            environ={
+                "SEQEVI_STORE": store_url,
+                "SEQEVI_HTTP_BASIC_AUTH_FILE": str(auth_file),
+            },
+        ):
+            pass
 
 
 def test_http_store_preserves_no_hit_without_normalized_artifact(

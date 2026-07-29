@@ -22,7 +22,8 @@ def open_evidence_store(
 ) -> Iterator[EvidenceStore]:
     """Open an explicit local Store path or HTTP(S) shared Store URL.
 
-    HTTP Store URLs must not contain credentials. Set
+    HTTP Store URLs must not contain credentials. File-based Basic
+    authentication requires HTTPS. Set
     ``SEQEVI_HTTP_BASIC_AUTH_FILE`` to the absolute path of an owner-only file
     containing exactly two non-empty lines (username, then password).
 
@@ -53,7 +54,11 @@ def open_evidence_store(
         )
     if raw.startswith(("http://", "https://")):
         auth_file = environment.get("SEQEVI_HTTP_BASIC_AUTH_FILE")
-        with HttpEvidenceStore(raw, basic_auth_file=auth_file) as store:
+        try:
+            store = HttpEvidenceStore(raw, basic_auth_file=auth_file)
+        except ValueError as error:
+            raise StoreConfigurationError(str(error)) from error
+        with store:
             yield store
         return
     if "://" in raw:

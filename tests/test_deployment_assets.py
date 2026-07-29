@@ -58,18 +58,28 @@ def test_httpd_ingress_exposes_only_loopback_http_store() -> None:
     assert "15432" not in config
     assert "artifacts" not in config.lower()
     assert "0.0.0.0" not in config
+    assert "RequestHeader unset Authorization" in config
 
 
 def test_httpd_ingress_drops_untrusted_forwarding_headers() -> None:
     config = (ROOT / "deploy/httpd/seqevi-store.conf").read_text(encoding="utf-8")
 
     for header in (
+        "Authorization",
         "Forwarded",
         "X-Forwarded-For",
         "X-Forwarded-Host",
         "X-Forwarded-Proto",
     ):
         assert f"RequestHeader unset {header}" in config
+
+
+def test_ingress_runbook_checks_certificate_hostname() -> None:
+    runbook = (
+        ROOT / "docs/operations/20260729-v0.1.0-private-cluster-ingress-runbook.md"
+    ).read_text(encoding="utf-8")
+
+    assert "-checkhost node4.cluster.local" in runbook
 
 
 def _verify_image_reference(reference: str) -> subprocess.CompletedProcess[str]:
