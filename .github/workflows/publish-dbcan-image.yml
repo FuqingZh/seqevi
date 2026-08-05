@@ -53,7 +53,9 @@ jobs:
           test "$(docker image inspect seqevi-dbcan:release-candidate --format '{{.Architecture}}')" = amd64
           test "$(docker image inspect seqevi-dbcan:release-candidate --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "${GITHUB_SHA}"
           docker run --rm --entrypoint /opt/venv/bin/seqevi seqevi-dbcan:release-candidate --version | grep -Fx 0.2.0
-          docker run --rm --entrypoint /opt/dbcan-venv/bin/run_dbcan seqevi-dbcan:release-candidate --version | grep -F '5.2.9'
+          docker run --rm --entrypoint /opt/dbcan-venv/bin/python seqevi-dbcan:release-candidate -c \
+            "import importlib.metadata; assert importlib.metadata.version('dbcan') == '5.2.9'"
+          docker run --rm --entrypoint test seqevi-dbcan:release-candidate -x /opt/dbcan-venv/bin/run_dbcan
           docker run --rm --entrypoint diamond seqevi-dbcan:release-candidate version | grep -F '2.1.15'
           docker run --rm --entrypoint sh seqevi-dbcan:release-candidate -c \
             '! find / -xdev -type f \( -name CAZy.dmnd -o -name dbCAN.hmm -o -name dbCAN-sub.hmm -o -name fam-substrate-mapping.tsv \) -print -quit | grep .'

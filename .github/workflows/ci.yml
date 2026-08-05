@@ -141,7 +141,9 @@ jobs:
       - name: Inspect runtime contract
         run: |
           docker run --rm --entrypoint /opt/venv/bin/seqevi seqevi-dbcan:ci --version | grep -Fx 0.2.0
-          docker run --rm --entrypoint /opt/dbcan-venv/bin/run_dbcan seqevi-dbcan:ci --version | grep -F '5.2.9'
+          docker run --rm --entrypoint /opt/dbcan-venv/bin/python seqevi-dbcan:ci -c \
+            "import importlib.metadata; assert importlib.metadata.version('dbcan') == '5.2.9'"
+          docker run --rm --entrypoint test seqevi-dbcan:ci -x /opt/dbcan-venv/bin/run_dbcan
           docker run --rm --entrypoint diamond seqevi-dbcan:ci version | grep -F '2.1.15'
           docker run --rm --entrypoint sh seqevi-dbcan:ci -c \
             'test -s /usr/share/seqevi/compliance/NOTICE && test -s /usr/share/seqevi/compliance/SOURCE-CORRESPONDENCE.md'
