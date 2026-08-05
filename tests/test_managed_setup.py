@@ -164,7 +164,12 @@ def test_setup_requires_dry_run_until_apply_slice(tmp_path: Path) -> None:
 
 
 def test_setup_help_exposes_dry_run_and_json_but_not_plan() -> None:
-    result = runner.invoke(app, ["setup", "--help"], terminal_width=240)
+    result = runner.invoke(
+        app,
+        ["setup", "--help"],
+        terminal_width=240,
+        color=False,
+    )
 
     assert result.exit_code == 0
     assert "--dry-run" in result.stdout
