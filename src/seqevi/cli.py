@@ -17,7 +17,7 @@ from .adapters import (
     create_adapter,
 )
 from .api import _run_annotation_application
-from .distribution import SetupPlan, build_setup_plan
+from .distribution import SetupPlan, apply_setup, build_setup_plan
 from .errors import AnnotationError, FastaValidationError, SetupError, StoreError
 from .execution_profile import (
     initialize_named_profile,
@@ -273,7 +273,7 @@ def setup_command(
         str | None,
         typer.Option(
             "--profile-name",
-            help="Named v2 profile to inspect or publish later (default: kit name).",
+            help="Named v2 profile to inspect or publish (default: kit name).",
         ),
     ] = None,
     dry_run: Annotated[
@@ -287,7 +287,7 @@ def setup_command(
         bool,
         typer.Option(
             "--yes",
-            help="Reserved for setup apply; Slice A never mutates state.",
+            help="Apply the validated setup plan without confirmation.",
         ),
     ] = False,
     json_output: Annotated[
@@ -300,7 +300,6 @@ def setup_command(
 ) -> None:
     """Plan managed adapter setup without installing tools or databases."""
 
-    del yes
     if resource is None and not json_output and sys.stdin.isatty():
         resource_text = typer.prompt("Caller-owned dbCAN resource directory")
         resource = Path(resource_text)
@@ -314,19 +313,40 @@ def setup_command(
     except (AnnotationError, SetupError) as error:
         _emit_setup_error(error, json_output=json_output)
 
-    if json_output:
-        typer.echo(json.dumps(plan.as_dict(), sort_keys=True))
-    else:
-        typer.echo(_render_setup_plan(plan), nl=False)
+    if dry_run or not plan.ready_for_apply:
+        if json_output:
+            typer.echo(json.dumps(plan.as_dict(), sort_keys=True))
+        else:
+            typer.echo(_render_setup_plan(plan), nl=False)
+        if not plan.ready_for_apply:
+            raise typer.Exit(code=1)
+        return
 
-    if not dry_run:
-        typer.echo(
-            "Error: setup apply is not implemented yet; rerun with --dry-run "
-            "for a read-only plan.",
-            err=True,
+    if not yes and not sys.stdin.isatty():
+        _emit_setup_error(
+            SetupError("non-interactive setup apply requires --yes"),
+            json_output=json_output,
         )
-        raise typer.Exit(code=2)
-    if not plan.ready_for_apply:
+    if not json_output:
+        typer.echo(_render_setup_plan(plan), nl=False)
+    if not yes:
+        confirmed = typer.confirm(
+            "Apply this setup plan?",
+            default=False,
+            err=json_output,
+        )
+        if not confirmed:
+            raise typer.Exit(code=1)
+    try:
+        applied = apply_setup(plan)
+    except (AnnotationError, SetupError) as error:
+        _emit_setup_error(error, json_output=json_output)
+
+    if json_output:
+        typer.echo(json.dumps(applied.as_dict(), sort_keys=True))
+    else:
+        typer.echo(_render_setup_plan(applied), nl=False)
+    if applied.status != "applied":
         raise typer.Exit(code=1)
 
 
@@ -378,7 +398,7 @@ def _render_setup_plan(plan: SetupPlan) -> str:
     lines.extend(
         (
             f"smoke: {plan.smoke_status} ({plan.smoke_reason})",
-            f"next_command: {plan.next_command or '(setup apply is not available in this release)'}",
+            f"next_command: {plan.next_command or ('managed OCI annotation is Slice C' if plan.status == 'applied' else '(setup apply is available with --yes)')}",
         )
     )
     if plan.issues:

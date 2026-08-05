@@ -6,16 +6,16 @@
 SeqEvi has implemented the v1 local and shared Store paths. The current tree
 also contains the DuckDB result surface, fixture-backed contracts for the three
 initial adapters, the public dbCAN runtime-image publication record, and the
-read-only Slice A managed-setup planner. This index keeps apply/OCI work
-explicitly separate so planned behavior is not mistaken for shipped behavior.
+Slice B managed-setup apply path. This index keeps OCI execution explicitly
+separate so planned behavior is not mistaken for shipped behavior.
 
 The active optimization sequence delivered one self-describing DuckDB result
 with a native Python relation API and the local `dbcan-cazyme` scientific
 adapter. Official-runtime parity, incremental reuse, shared Store replay and
 the real eggNOG/InterPro result-consumption matrix are accepted. Managed
-onboarding is being delivered as a separate vertical slice: the runtime-image
-publication is recorded and Slice A planning is current; setup apply and OCI
-execution are pending.
+onboarding is being delivered as a separate vertical slice: runtime-image
+publication, strict planning, resource verification, smoke and atomic profile
+publication are current; OCI execution remains pending.
 
 ## Capability Status
 
@@ -25,7 +25,7 @@ execution are pending.
 | eggNOG and InterPro/Pfam | official-runtime parity accepted | [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
 | dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; managed onboarding remains separate | [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [dbCAN plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
 | execution profiles | profile v1 only; users supply host executables and resources | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md) |
-| managed onboarding | Slice A implements strict profile v2 reading, the dbCAN kit manifest and read-only `seqevi setup ... --dry-run [--json]`; setup apply and OCI annotation remain pending | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
+| managed onboarding | Slice B implements strict profile v2 reading, the dbCAN kit manifest, read-only planning, digest pull, resource verification, ephemeral smoke and atomic `seqevi setup ... --yes`; OCI annotation remains pending | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
 
 ## Start Here
 
@@ -62,11 +62,10 @@ execution are pending.
 31. [dbCAN runtime image release review](architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 32. [dbCAN runtime image publication](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md)
 
-## Proposed Future Contracts
+## Managed Boundary Contracts
 
-These documents preserve the accepted managed-onboarding boundary. Slice A has
-activated strict reading and planning only; setup apply and OCI execution are
-not yet current behavior:
+These documents preserve the accepted managed-onboarding boundary. Slice B has
+activated setup apply and smoke; OCI execution is not yet current behavior:
 
 - [Managed adapter distribution architecture v1.1](architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)
 - [Execution profile v2.1 contract](architecture/20260805-v2.1-execution-profile-contract.md)
