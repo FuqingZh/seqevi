@@ -78,7 +78,7 @@ four-file dbCAN resource, and edit the generated profile paths. The managed
 The real local/shared Store acceptance for eggNOG and InterPro/Pfam is recorded
 in the [result-consumption runtime report](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md).
 The managed dbCAN distribution gate is tracked in the
-[redistribution/license review](docs/architecture/20260805-v1.0-dbcan-redistribution-license-review.md).
+[runtime image release review](docs/architecture/20260805-v1.1-dbcan-runtime-image-release-review.md).
 
 Run repeated annotations by name:
 
@@ -186,7 +186,7 @@ Start with [the documentation index](docs/README.md).
 - [InterProScan Pfam runtime validation](docs/benchmarks/20260723-v1.0-interproscan-runtime-validation.md)
 - [dbCAN CAZyme adapter implementation plan](docs/implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md)
 - [DuckDB result-consumption runtime acceptance](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md)
-- [dbCAN redistribution and license review](docs/architecture/20260805-v1.0-dbcan-redistribution-license-review.md)
+- [dbCAN runtime image release review](docs/architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 
 Proposed future contracts, not current CLI behavior:
 
@@ -241,7 +241,7 @@ no `seqevi setup` command. SeqEvi v1 targets
 [InterProScan](https://www.ebi.ac.uk/interpro/interproscan.html) with the Pfam
 application, and [dbCAN](https://github.com/bcb-unl/run_dbcan) for protein-level
 CAZyme annotation. A future managed path may publish a SeqEvi-maintained runtime
-image built from an official upstream release after license review; it would
+image built from locked upstream inputs after runtime compliance review; it would
 not be an upstream-official image. Annotation databases remain separate and
 are never bundled in the wheel or runtime image. The proposed managed path
 uses a public, digest-pinned

@@ -14,7 +14,7 @@ with a native Python relation API and the local `dbcan-cazyme` scientific
 adapter. Official-runtime parity, incremental reuse, shared Store replay and
 the real eggNOG/InterPro result-consumption matrix are accepted. Managed
 setup/OCI onboarding remains a separate future vertical slice and is currently
-blocked on redistribution/provenance sign-off.
+pending runtime-image implementation and compliance evidence.
 
 ## Capability Status
 
@@ -57,7 +57,8 @@ blocked on redistribution/provenance sign-off.
 27. [dbCAN CAZyme adapter implementation plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md)
 28. [dbCAN 5.2.9 runtime validation](benchmarks/20260804-v1.0-dbcan-runtime-validation.md)
 29. [DuckDB result-consumption runtime acceptance](benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md)
-30. [dbCAN redistribution and license review](architecture/20260805-v1.0-dbcan-redistribution-license-review.md)
+30. [Superseded dbCAN redistribution review](architecture/20260805-v1.0-dbcan-redistribution-license-review.md)
+31. [dbCAN runtime image release review](architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 
 ## Proposed Future Contracts
 
@@ -67,6 +68,7 @@ They are not current CLI or compatibility contracts:
 - [Managed adapter distribution architecture v1.1](architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)
 - [Execution profile v2.1 contract](architecture/20260805-v2.1-execution-profile-contract.md)
 - [Managed adapter onboarding and distribution roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md)
+- [dbCAN runtime image release review v1.1](architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 
 ## Authority
 
