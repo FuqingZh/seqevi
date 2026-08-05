@@ -1,0 +1,15 @@
+SeqEvi dbCAN runtime image
+==========================
+
+This image combines SeqEvi 0.2.0 (MIT), dbCAN 5.2.9 (GPL-3.0), DIAMOND
+2.1.15 (GPL-3.0), CPython 3.13.11 and the hash-locked Python dependencies
+recorded in requirements-seqevi.lock and requirements-dbcan.lock.
+
+The complete license texts shipped by installed Python distributions are under
+/usr/share/seqevi/licenses/python. The SeqEvi, dbCAN and DIAMOND license texts
+are under /usr/share/seqevi/licenses. Component versions and upstream source
+locations are recorded in /usr/share/seqevi/compliance.
+
+The image does not contain a dbCAN annotation database. The files CAZy.dmnd,
+dbCAN.hmm, dbCAN-sub.hmm and fam-substrate-mapping.tsv must be supplied and
+mounted read-only by the caller.

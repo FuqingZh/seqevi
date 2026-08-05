@@ -1,0 +1,3 @@
+# Upstream dbCAN is isolated because 5.2.9 pins Biopython 1.85 while SeqEvi
+# 0.2.0 requires Biopython 1.87 or newer.
+dbcan==5.2.9
