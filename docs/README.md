@@ -24,7 +24,7 @@ blocked on redistribution/provenance sign-off.
 | eggNOG and InterPro/Pfam | official-runtime parity accepted | [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
 | dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; managed onboarding remains separate | [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [dbCAN plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
 | execution profiles | profile v1 only; users supply host executables and resources | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md) |
-| managed onboarding | `seqevi setup`, profile v2, runtime image and kit manifest are not implemented | [managed roadmap](implementation-plan/20260804-v1.0-managed-adapter-onboarding-implementation-plan.md) |
+| managed onboarding | `seqevi setup`, profile v2, GHCR runtime image and kit manifest are not implemented | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md) |
 
 ## Start Here
 
@@ -64,9 +64,9 @@ blocked on redistribution/provenance sign-off.
 These documents preserve reviewed decisions for the next implementation phase.
 They are not current CLI or compatibility contracts:
 
-- [Managed adapter distribution architecture](architecture/20260804-v1.0-managed-adapter-distribution-architecture.md)
-- [Execution profile v2 contract](architecture/20260804-v2.0-execution-profile-contract.md)
-- [Managed adapter onboarding and distribution roadmap](implementation-plan/20260804-v1.0-managed-adapter-onboarding-implementation-plan.md)
+- [Managed adapter distribution architecture v1.1](architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)
+- [Execution profile v2.1 contract](architecture/20260805-v2.1-execution-profile-contract.md)
+- [Managed adapter onboarding and distribution roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md)
 
 ## Authority
 

@@ -158,7 +158,8 @@ seqevi resource verify \
 - Exact, immutable evidence keys.
 - Explicit `eggnog`, `interpro-pfam`, and official-runtime-validated
   `dbcan-cazyme` adapters. dbCAN direct/local/shared scientific acceptance is
-  complete; managed image/resource redistribution remains a separate open gate.
+  complete; publishing the managed runtime image remains separate work, and
+  annotation databases remain caller supplied.
 - Local SQLite/POSIX Store and shared PostgreSQL/POSIX Store service.
 - One self-describing DuckDB result per invocation; adapter-native normalized
   evidence remains Parquet inside the incremental Store.
@@ -189,9 +190,9 @@ Start with [the documentation index](docs/README.md).
 
 Proposed future contracts, not current CLI behavior:
 
-- [Managed adapter onboarding roadmap](docs/implementation-plan/20260804-v1.0-managed-adapter-onboarding-implementation-plan.md)
-- [Proposed managed-distribution architecture](docs/architecture/20260804-v1.0-managed-adapter-distribution-architecture.md)
-- [Proposed execution profile v2 contract](docs/architecture/20260804-v2.0-execution-profile-contract.md)
+- [Managed adapter onboarding roadmap v1.1](docs/implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md)
+- [Proposed managed-distribution architecture v1.1](docs/architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)
+- [Proposed execution profile v2.1 contract](docs/architecture/20260805-v2.1-execution-profile-contract.md)
 
 ## Python And Result Discovery
 
@@ -242,7 +243,10 @@ application, and [dbCAN](https://github.com/bcb-unl/run_dbcan) for protein-level
 CAZyme annotation. A future managed path may publish a SeqEvi-maintained runtime
 image built from an official upstream release after license review; it would
 not be an upstream-official image. Annotation databases remain separate and
-are never bundled in the wheel or runtime image.
+are never bundled in the wheel or runtime image. The proposed managed path
+uses a public, digest-pinned
+`ghcr.io/fuqingzh/seqevi-dbcan` runtime package; callers continue to provide the
+database path, and internal registry mirrors remain deployment policy.
 
 ## License
 
