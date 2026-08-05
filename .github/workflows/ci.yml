@@ -71,13 +71,13 @@ jobs:
           python -m venv /tmp/seqevi-wheel
           /tmp/seqevi-wheel/bin/pip install "${wheel_path}[server]"
           /tmp/seqevi-wheel/bin/pip check
-          test "$(/tmp/seqevi-wheel/bin/seqevi --version)" = "0.1.0"
+          test "$(/tmp/seqevi-wheel/bin/seqevi --version)" = "0.2.0"
           /tmp/seqevi-wheel/bin/seqevi serve --help
       - name: Build and inspect service image
         run: |
           docker build --tag seqevi:ci .
           test "$(docker image inspect seqevi:ci --format '{{.Config.User}}')" = "seqevi"
-          docker run --rm seqevi:ci --version | grep -Fx "0.1.0"
+          docker run --rm seqevi:ci --version | grep -Fx "0.2.0"
           docker run --rm --entrypoint python seqevi:ci -c \
             "import importlib.util; assert importlib.util.find_spec('seqevi'); assert importlib.util.find_spec('fastapi'); assert importlib.util.find_spec('psycopg')"
           docker run --rm --entrypoint sh seqevi:ci -c \
