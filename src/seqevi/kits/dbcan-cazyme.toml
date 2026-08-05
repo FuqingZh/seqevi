@@ -1,0 +1,35 @@
+schema_version = 1
+kit_id = "dbcan-cazyme-5.2.9-db-2026.05.05"
+adapter = "dbcan-cazyme"
+platform = "linux/amd64"
+dbcan_version = "5.2.9"
+diamond_version = "2.1.15"
+image = "ghcr.io/fuqingzh/seqevi-dbcan@sha256:57976d498711ba83835485d2621b60ad4c49fcd08ab13b5bdb9105977f7b4f66"
+
+[resource]
+name = "dbcan"
+version = "db_v5-2-9_5-5-2026"
+
+[[resource.component]]
+name = "CAZy-diamond"
+path = "CAZy.dmnd"
+size = 2177198564
+sha256 = "aed31a864ee6fed9a5550eb34750b51f379cf151013f50a9cccd5bf2499b4662"
+
+[[resource.component]]
+name = "dbCAN-HMM"
+path = "dbCAN.hmm"
+size = 129842960
+sha256 = "396c791fb13defab152864d8046687ef03b492937ec6f9bbab008bc77cbaa7a5"
+
+[[resource.component]]
+name = "dbCAN-sub-HMM"
+path = "dbCAN-sub.hmm"
+size = 5132429983
+sha256 = "8e58b944108272142b57c0c260f996220b4f11c8ef290896a46d67dba6ab5136"
+
+[[resource.component]]
+name = "fam-substrate-mapping"
+path = "fam-substrate-mapping.tsv"
+size = 94399
+sha256 = "6d31a84cac27dec72a3d0f209b81291336bccb8572abc5acb995d71f54df03dc"

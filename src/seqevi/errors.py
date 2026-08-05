@@ -53,6 +53,10 @@ class ProfileConfigurationError(AnnotationError):
     """Raised when an execution profile cannot be resolved safely."""
 
 
+class SetupError(AnnotationError):
+    """Raised when a managed adapter setup plan cannot be built safely."""
+
+
 class AdapterError(AnnotationError):
     """Raised when an adapter cannot produce valid terminal evidence."""
 

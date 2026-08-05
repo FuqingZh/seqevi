@@ -70,10 +70,24 @@ environment variable names, never their values. The original complete
 templates remain available through `profile example --adapter ADAPTER`.
 
 These profile commands configure SeqEvi; they do not install annotation
-software or databases. In particular, the current dbCAN path requires the user
-to install the official `run_dbcan` Python runtime and DIAMOND, provide the
-four-file dbCAN resource, and edit the generated profile paths. The managed
-`seqevi setup` path is planned but is not available in the current CLI.
+software or databases. The managed dbCAN runtime image is published by SeqEvi,
+but the current Slice A setup surface is intentionally read-only:
+
+```bash
+seqevi setup dbcan-cazyme \
+  --resource /data/dbcan/db_v5-2-9_5-5-2026/raw \
+  --dry-run
+
+seqevi setup dbcan-cazyme \
+  --resource /data/dbcan/db_v5-2-9_5-5-2026/raw \
+  --dry-run --json
+```
+
+The plan validates the exact kit and caller-owned resource metadata without
+pulling an image, creating `seqevi.lock`, writing a profile or starting a
+container. Setup apply and managed OCI annotation are later slices. Until they
+ship, the direct dbCAN path still requires the user to install the official
+`run_dbcan` Python runtime and DIAMOND and configure a v1 profile.
 
 The real local/shared Store acceptance for eggNOG and InterPro/Pfam is recorded
 in the [result-consumption runtime report](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md).
@@ -188,7 +202,8 @@ Start with [the documentation index](docs/README.md).
 - [DuckDB result-consumption runtime acceptance](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md)
 - [dbCAN runtime image release review](docs/architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 
-Proposed future contracts, not current CLI behavior:
+Accepted managed-boundary documents; Slice A implements only strict reading and
+read-only planning, not setup apply or OCI execution:
 
 - [Managed adapter onboarding roadmap v1.1](docs/implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md)
 - [Proposed managed-distribution architecture v1.1](docs/architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)

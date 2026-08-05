@@ -265,6 +265,11 @@ def _resolved_from_profile(
     threads: int | None,
     timeout_seconds: float | None,
 ) -> ResolvedAnnotationInputs:
+    if profile.version != 1 or profile.executable is None:
+        raise AnnotationError(
+            "managed execution profile v2 is not available in this release; "
+            "use a v1 local profile or explicit local mode"
+        )
     return ResolvedAnnotationInputs(
         adapter=profile.adapter,
         executable=profile.executable,

@@ -64,6 +64,22 @@ def resource_lock_path(database: Path) -> Path:
     return database / LOCK_FILENAME
 
 
+def read_resource_lock(database: Path) -> ResourceLock | None:
+    """Read an existing lock without hashing files or publishing state.
+
+    This read-only boundary is used by managed setup planning.  In contrast to
+    :func:`resolve_resource_lock`, it never creates a missing ``seqevi.lock``.
+    """
+
+    database = database.resolve()
+    path = resource_lock_path(database)
+    if path.is_symlink():
+        raise ResourceLockError(f"resource lock must not be a symlink: {path}")
+    if not path.exists():
+        return None
+    return _read_lock(path)
+
+
 def resolve_resource_lock(
     *,
     database: Path,
