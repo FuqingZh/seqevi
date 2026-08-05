@@ -10,6 +10,7 @@ from typing import NoReturn
 from seqevi.errors import AdapterUnavailableError
 
 from .base import AnnotationAdapter
+from .dbcan_cazyme import DBCanCazymeAdapter
 from .eggnog import EggnogAdapter
 from .interpro_pfam import InterProPfamAdapter
 
@@ -19,6 +20,7 @@ class AdapterName(StrEnum):
 
     EGGNOG = "eggnog"
     INTERPRO_PFAM = "interpro-pfam"
+    DBCAN_CAZYME = "dbcan-cazyme"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +46,13 @@ def create_adapter(configuration: AdapterConfiguration) -> AnnotationAdapter:
         )
     if configuration.name is AdapterName.EGGNOG:
         return EggnogAdapter(
+            executable=configuration.executable,
+            database=configuration.database,
+            verify_resource=configuration.verify_resource,
+            environment=dict(configuration.environment),
+        )
+    if configuration.name is AdapterName.DBCAN_CAZYME:
+        return DBCanCazymeAdapter(
             executable=configuration.executable,
             database=configuration.database,
             verify_resource=configuration.verify_resource,

@@ -8,6 +8,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
+import duckdb
 import polars as pl
 
 from seqevi.adapters import (
@@ -227,3 +228,14 @@ def write_artifact_file(path: Path, data: bytes, media_type: str) -> ArtifactFil
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
     return ArtifactFile.from_path(path, media_type)
+
+
+def read_result_table(path: Path, relation: str) -> pl.DataFrame:
+    """Read one public or catalog relation from a published result fixture."""
+
+    with duckdb.connect(
+        str(path),
+        read_only=True,
+        config={"storage_compatibility_version": "v1.0.0"},
+    ) as connection:
+        return connection.sql(f"SELECT * FROM {relation}").pl()

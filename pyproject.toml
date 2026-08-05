@@ -1,6 +1,6 @@
 [project]
 name = "seqevi"
-version = "0.1.0"
+version = "0.2.0"
 description = "Content-addressed, reusable protein sequence annotation evidence."
 authors = [
     {name = "Fuqing Zhang", email = "fu.qing.zhang.work@gmail.com"},
@@ -9,9 +9,9 @@ authors = [
 dependencies = [
     "alembic>=1.18,<2",
     "biopython>=1.87,<2",
-    "dplib-py>=1.1,<2",
+    "duckdb>=1.5,<2",
     "httpx>=0.28,<1",
-    "polars>=1.40,<2",
+    "polars[pyarrow]>=1.40,<2",
     "pydantic>=2.12,<3",
     "sqlalchemy>=2.0,<3",
     "typer>=0.27,<1",

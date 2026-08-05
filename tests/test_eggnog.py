@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import gzip
-import json
 import stat
 import sys
 from pathlib import Path
 
-import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 from typer.testing import CliRunner
@@ -18,6 +16,8 @@ from seqevi.errors import AdapterError, AnnotationError, ResourceLockError
 from seqevi.resource_lock import LOCK_FILENAME
 from seqevi.sequence import read_fasta, unique_identities
 from seqevi.store import LocalStore
+
+from .support import read_result_table
 
 runner = CliRunner()
 
@@ -278,14 +278,16 @@ def test_eggnog_annotation_preserves_native_columns_and_no_hits(
         fetched = store.fetch(adapter.contract.evidence_key(hit_identity))
 
     assert (summary.hits, summary.no_hits) == (1, 1)
-    frame = pl.read_parquet(summary.output_dir / "evidence.parquet")
+    frame = read_result_table(summary.output_dir, "main.evidence")
     assert frame.schema == EGGNOG_EVIDENCE_SCHEMA
     assert frame.row(0, named=True)["seed_ortholog"] == "9606.ENSP000001"
     assert frame.row(0, named=True)["PFAMs"] == "PF00001,PF00002"
     assert frame.row(0, named=True)["KEGG_TC"] is None
-    assert pl.read_parquet(summary.output_dir / "no-hits.parquet").height == 1
-    package = json.loads((summary.output_dir / "datapackage.json").read_text())
-    assert package["seqevi"]["adapter"] == "eggnog"
+    assert read_result_table(summary.output_dir, "main.no_hits").height == 1
+    metadata = read_result_table(summary.output_dir, "_seqevi.metadata").row(
+        0, named=True
+    )
+    assert metadata["Adapter"] == "eggnog"
     assert fetched is not None
     assert fetched.raw_artifact is not None
     with gzip.open(fetched.raw_artifact.path, "rt", encoding="utf-8") as handle:
@@ -320,8 +322,8 @@ def test_eggnog_threads_change_execution_but_not_scientific_payload(
         )
 
     assert_frame_equal(
-        pl.read_parquet(one.output_dir / "evidence.parquet"),
-        pl.read_parquet(four.output_dir / "evidence.parquet"),
+        read_result_table(one.output_dir, "main.evidence"),
+        read_result_table(four.output_dir, "main.evidence"),
     )
     assert one.metrics.configured_threads == 1
     assert four.metrics.configured_threads == 4

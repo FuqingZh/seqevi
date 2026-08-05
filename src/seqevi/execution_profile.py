@@ -262,6 +262,10 @@ def profile_example(adapter: AdapterName) -> str:
         executable = "/opt/interproscan/interproscan.sh"
         resource = "/opt/interproscan/data"
         environment = 'path_prepend = ["/opt/jdk-17/bin"]\n'
+    elif adapter is AdapterName.DBCAN_CAZYME:
+        executable = "/opt/dbcan-5.2.9/bin/run_dbcan"
+        resource = "/data/dbcan/db_v5-2-9_5-5-2026/raw"
+        environment = ""
     else:
         executable = "/opt/eggnog-mapper/bin/emapper.py"
         resource = "/data/eggnog-5.0.2"

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import stat
 import sys
 from pathlib import Path
 
-import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 from typer.testing import CliRunner
@@ -22,6 +20,8 @@ from seqevi.errors import AdapterError, AnnotationError, ResourceLockError
 from seqevi.evidence import EvidenceQuery
 from seqevi.sequence import read_fasta, unique_identities
 from seqevi.store import LocalStore
+
+from .support import read_result_table
 
 runner = CliRunner()
 
@@ -331,7 +331,7 @@ def test_interpro_pfam_annotation_preserves_matches_and_accounts_for_no_hits(
     assert summary.unique_sequences == 2
     assert summary.hits == 1
     assert summary.no_hits == 1
-    frame = pl.read_parquet(summary.output_dir / "evidence.parquet")
+    frame = read_result_table(summary.output_dir, "main.evidence")
     assert frame.schema == INTERPRO_PFAM_EVIDENCE_SCHEMA
     assert frame.height == 2
     assert frame.get_column("SignatureAccession").to_list() == [
@@ -340,13 +340,13 @@ def test_interpro_pfam_annotation_preserves_matches_and_accounts_for_no_hits(
     ]
     assert "RunDate" not in frame.columns
     assert frame.row(1, named=True)["SignatureDescription"] is None
-    assert pl.read_parquet(summary.output_dir / "no-hits.parquet").height == 1
+    assert read_result_table(summary.output_dir, "main.no_hits").height == 1
 
-    descriptor = json.loads(
-        (summary.output_dir / "datapackage.json").read_text(encoding="utf-8")
+    metadata = read_result_table(summary.output_dir, "_seqevi.metadata").row(
+        0, named=True
     )
-    assert descriptor["seqevi"]["adapter"] == "interpro-pfam"
-    assert descriptor["seqevi"]["resourceId"] == adapter.contract.resource_id
+    assert metadata["Adapter"] == "interpro-pfam"
+    assert metadata["ResourceID"] == adapter.contract.resource_id
 
 
 def test_interpro_threads_change_execution_but_not_scientific_payload(
@@ -375,8 +375,8 @@ def test_interpro_threads_change_execution_but_not_scientific_payload(
         )
 
     assert_frame_equal(
-        pl.read_parquet(one.output_dir / "evidence.parquet"),
-        pl.read_parquet(four.output_dir / "evidence.parquet"),
+        read_result_table(one.output_dir, "main.evidence"),
+        read_result_table(four.output_dir, "main.evidence"),
     )
     assert one.metrics.configured_threads == 1
     assert four.metrics.configured_threads == 4
@@ -437,8 +437,8 @@ def test_interpro_pfam_run_date_is_excluded_from_scientific_payload(
         )
 
     assert_frame_equal(
-        pl.read_parquet(tmp_path / "first" / "evidence.parquet"),
-        pl.read_parquet(tmp_path / "second" / "evidence.parquet"),
+        read_result_table(tmp_path / "first", "main.evidence"),
+        read_result_table(tmp_path / "second", "main.evidence"),
     )
 
 
@@ -516,4 +516,4 @@ def test_interpro_pfam_runs_through_public_cli(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert "2 unique sequences (0 cached, 2 computed)" in result.stdout
-    assert (tmp_path / "output" / "datapackage.json").is_file()
+    assert (tmp_path / "output").is_file()
