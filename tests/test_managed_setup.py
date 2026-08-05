@@ -205,6 +205,8 @@ def test_setup_help_exposes_dry_run_and_json_but_not_plan() -> None:
     assert "--dry-run" in help_text
     assert "--json" in help_text
     assert "--plan" not in help_text
+
+
 def _fixture_manifest() -> KitManifest:
     files = (
         ("CAZy-diamond", "CAZy.dmnd", b"diamond"),
