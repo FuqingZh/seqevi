@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tomllib
+from click import unstyle
 from importlib.resources import files
 from pathlib import Path
 
@@ -172,6 +173,7 @@ def test_setup_help_exposes_dry_run_and_json_but_not_plan() -> None:
     )
 
     assert result.exit_code == 0
-    assert "--dry-run" in result.stdout
-    assert "--json" in result.stdout
-    assert "--plan" not in result.stdout
+    help_text = unstyle(result.stdout)
+    assert "--dry-run" in help_text
+    assert "--json" in help_text
+    assert "--plan" not in help_text
