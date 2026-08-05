@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-import polars as pl
+import duckdb
 
 from seqevi.annotate import AnnotationSummary, run_annotation
 from seqevi.store import open_evidence_store
@@ -50,7 +50,7 @@ def _run(
     _write_fasta(fasta, indices)
     return run_annotation(
         fasta_path=fasta,
-        output_dir=root / name,
+        output_dir=root / f"{name}.duckdb",
         adapter=adapter,
         store=store,
         threads=threads,
@@ -160,8 +160,13 @@ def main() -> None:
             or run_c.computed != half
         ):
             raise RuntimeError("A/B/C reuse counts do not match the benchmark contract")
-        if not pl.read_parquet(root / "a-new" / "evidence.parquet").schema:
-            raise RuntimeError("benchmark evidence schema is empty")
+        with duckdb.connect(
+            str(root / "a-new.duckdb"),
+            read_only=True,
+            config={"storage_compatibility_version": "v1.0.0"},
+        ) as result_connection:
+            if not result_connection.sql("SELECT * FROM main.evidence LIMIT 0").columns:
+                raise RuntimeError("benchmark evidence schema is empty")
 
         report = {
             "schema_version": 1,

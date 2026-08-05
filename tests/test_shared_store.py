@@ -9,12 +9,10 @@ from pathlib import Path
 from typing import cast
 
 import httpx
-import polars as pl
 import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from polars.testing import assert_frame_equal
 from sqlalchemy import BigInteger, create_engine, make_url
 
 from seqevi.annotate import run_annotation
@@ -37,9 +35,12 @@ from seqevi.store import migration as store_migration
 from seqevi.store.schema import artifacts
 from seqevi.store.transport import CommitModel
 
+from polars.testing import assert_frame_equal
+
 from .support import (
     FixtureAdapter,
     NeverRunAdapter,
+    read_result_table,
     write_artifact_file,
     write_fixture_database,
     write_fixture_tool,
@@ -476,7 +477,7 @@ def test_service_returns_422_for_invalid_domain_values_and_missing_raw_artifact(
     assert coerced_byte_size_response.status_code == 422
 
 
-def test_annotation_packages_are_equivalent_for_local_and_http_store(
+def test_annotation_results_are_equivalent_for_local_and_http_store(
     tmp_path: Path,
 ) -> None:
     fasta = tmp_path / "proteins.fasta"
@@ -514,14 +515,15 @@ def test_annotation_packages_are_equivalent_for_local_and_http_store(
 
     assert first.computed == 2
     assert second.cache_hits == 2
-    for name in ("evidence.parquet", "no-hits.parquet"):
+    for relation in ("main.evidence", "main.no_hits"):
         assert_frame_equal(
-            pl.read_parquet(tmp_path / "local-output" / name),
-            pl.read_parquet(tmp_path / "remote-output" / name),
+            read_result_table(tmp_path / "local-output", relation),
+            read_result_table(tmp_path / "remote-output", relation),
         )
-    assert (tmp_path / "local-output" / "sequence-map.tsv").read_text(
-        encoding="utf-8"
-    ) == (tmp_path / "remote-output" / "sequence-map.tsv").read_text(encoding="utf-8")
+    assert_frame_equal(
+        read_result_table(tmp_path / "local-output", "main.sequence_map"),
+        read_result_table(tmp_path / "remote-output", "main.sequence_map"),
+    )
 
 
 @contextmanager

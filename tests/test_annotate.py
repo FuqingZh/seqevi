@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import json
+import importlib
 from collections.abc import Iterable
 from pathlib import Path
 
 import polars as pl
 import pytest
-from dplib.actions.package.check import check_package
 from polars.testing import assert_frame_equal
 
-import seqevi.annotate
 from seqevi.adapters import AdapterBatchResult
 from seqevi.annotate import run_annotation
 from seqevi.errors import AdapterError, AnnotationError, FastaValidationError
@@ -20,7 +18,6 @@ from seqevi.evidence import (
     EvidenceQuery,
     EvidenceRecord,
     FetchedEvidence,
-    sha256_digest,
 )
 from seqevi.sequence import read_fasta, unique_identities
 from seqevi.store import LocalStore
@@ -28,9 +25,12 @@ from seqevi.store import LocalStore
 from .support import (
     FixtureAdapter,
     NeverRunAdapter,
+    read_result_table,
     write_fixture_database,
     write_fixture_tool,
 )
+
+annotate_module = importlib.import_module("seqevi.annotate")
 
 
 class _CountingStore:
@@ -103,7 +103,7 @@ def write_input(path: Path) -> Path:
     return path
 
 
-def test_annotation_materializes_complete_package_and_reuses_cache(
+def test_annotation_materializes_complete_result_and_reuses_cache(
     tmp_path: Path,
 ) -> None:
     fasta = write_input(tmp_path / "proteins.fasta")
@@ -143,16 +143,8 @@ def test_annotation_materializes_complete_package_and_reuses_cache(
     assert second.computed == 0
     assert repeated.computed == 2
 
-    expected_files = {
-        "datapackage.json",
-        "evidence.parquet",
-        "no-hits.parquet",
-        "sequence-map.tsv",
-    }
-    assert {path.name for path in first.output_dir.iterdir()} == expected_files
-    assert check_package(str(first.output_dir / "datapackage.json")) == []
-
-    df_map = pl.read_csv(first.output_dir / "sequence-map.tsv", separator="\t")
+    assert first.output_dir.is_file()
+    df_map = read_result_table(first.output_dir, "main.sequence_map")
     assert df_map.get_column("InputOrder").to_list() == [1, 2, 3]
     assert df_map.get_column("EvidenceSource").to_list() == [
         "computed",
@@ -160,52 +152,28 @@ def test_annotation_materializes_complete_package_and_reuses_cache(
         "computed",
     ]
     assert df_map.get_column("SequenceID").n_unique() == 2
-    assert pl.read_parquet(first.output_dir / "evidence.parquet").height == 1
-    assert pl.read_parquet(first.output_dir / "no-hits.parquet").height == 1
+    assert read_result_table(first.output_dir, "main.evidence").height == 1
+    assert read_result_table(first.output_dir, "main.no_hits").height == 1
 
-    df_cached_map = pl.read_csv(second.output_dir / "sequence-map.tsv", separator="\t")
+    df_cached_map = read_result_table(second.output_dir, "main.sequence_map")
     assert set(df_cached_map.get_column("EvidenceSource")) == {"cache"}
 
-    descriptor = json.loads(
-        (first.output_dir / "datapackage.json").read_text(encoding="utf-8")
+    metadata = read_result_table(first.output_dir, "_seqevi.metadata").row(
+        0, named=True
     )
-    assert descriptor["$schema"].endswith("/2.0/datapackage.json")
-    assert descriptor["seqevi"]["adapter"] == "fixture"
-    assert descriptor["seqevi"]["extensionVersion"] == "1.0"
-    resources_by_name = {
-        resource["name"]: resource for resource in descriptor["resources"]
-    }
-    assert resources_by_name["evidence"]["rowCount"] == 1
-    assert resources_by_name["sequence-map"]["rowCount"] == 3
-    assert resources_by_name["no-hits"]["rowCount"] == 1
-    for resource in resources_by_name.values():
-        data = (first.output_dir / resource["path"]).read_bytes()
-        assert resource["bytes"] == len(data)
-        assert resource["hash"] == f"sha256:{sha256_digest(data)}"
-
-    repeated_descriptor = json.loads(
-        (repeated.output_dir / "datapackage.json").read_text(encoding="utf-8")
-    )
-    for resource in descriptor["resources"]:
-        resource.pop("bytes")
-        resource.pop("hash")
-    for resource in repeated_descriptor["resources"]:
-        resource.pop("bytes")
-        resource.pop("hash")
-    descriptor.pop("created")
-    repeated_descriptor.pop("created")
-    assert repeated_descriptor == descriptor
-    assert_frame_equal(
-        pl.read_parquet(first.output_dir / "evidence.parquet"),
-        pl.read_parquet(repeated.output_dir / "evidence.parquet"),
+    assert metadata["Adapter"] == "fixture"
+    assert metadata["ResultFormatVersion"] == "seqevi-duckdb/1"
+    assert (
+        read_result_table(first.output_dir, "_seqevi.table_info")
+        .filter(pl.col("RelationName") == "annotations")
+        .get_column("RowCount")
+        .item()
+        == 3
     )
     assert_frame_equal(
-        pl.read_parquet(first.output_dir / "no-hits.parquet"),
-        pl.read_parquet(repeated.output_dir / "no-hits.parquet"),
+        read_result_table(first.output_dir, "main.annotations"),
+        read_result_table(repeated.output_dir, "main.annotations"),
     )
-    assert (first.output_dir / "sequence-map.tsv").read_text(encoding="utf-8") == (
-        repeated.output_dir / "sequence-map.tsv"
-    ).read_text(encoding="utf-8")
 
 
 def test_annotation_passes_operational_threads_without_changing_contract(
@@ -317,8 +285,8 @@ def test_annotation_writes_typed_empty_terminal_tables(
             store=store,
         )
 
-    df_evidence = pl.read_parquet(summary.output_dir / "evidence.parquet")
-    df_no_hits = pl.read_parquet(summary.output_dir / "no-hits.parquet")
+    df_evidence = read_result_table(summary.output_dir, "main.evidence")
+    df_no_hits = read_result_table(summary.output_dir, "main.no_hits")
     assert df_evidence.schema == adapter.evidence_schema
     assert df_evidence.height == evidence_rows
     assert df_no_hits.schema == {
@@ -358,8 +326,8 @@ def test_invalid_fasta_never_accesses_store_and_removes_staging(
 def test_annotation_bounds_store_and_tool_batches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(seqevi.annotate, "_STORE_BATCH_SIZE", 2)
-    monkeypatch.setattr(seqevi.annotate, "_ANNOTATION_BATCH_SIZE", 3)
+    monkeypatch.setattr(annotate_module, "_STORE_BATCH_SIZE", 2)
+    monkeypatch.setattr(annotate_module, "_ANNOTATION_BATCH_SIZE", 3)
     fasta = tmp_path / "proteins.fasta"
     fasta.write_text(
         "".join(
@@ -393,8 +361,8 @@ def test_annotation_bounds_store_and_tool_batches(
 def test_completed_batch_is_reused_after_later_tool_batch_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(seqevi.annotate, "_STORE_BATCH_SIZE", 2)
-    monkeypatch.setattr(seqevi.annotate, "_ANNOTATION_BATCH_SIZE", 2)
+    monkeypatch.setattr(annotate_module, "_STORE_BATCH_SIZE", 2)
+    monkeypatch.setattr(annotate_module, "_ANNOTATION_BATCH_SIZE", 2)
     fasta = tmp_path / "proteins.fasta"
     fasta.write_text(
         ">first\nMPEPTIDE\n>second\nMSEQUENCE\n>third\nMTHIRDSEQ\n",

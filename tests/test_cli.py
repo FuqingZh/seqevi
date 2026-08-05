@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def test_cli_reports_version() -> None:
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "0.1.0"
+    assert result.stdout.strip() == "0.2.0"
 
 
 def test_cli_without_command_describes_current_surface() -> None:
@@ -82,7 +83,7 @@ def test_annotate_cli_runs_injected_adapter(
     fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
     executable = write_fixture_tool(tmp_path / "fixture-tool")
     database = write_fixture_database(tmp_path / "database")
-    output = tmp_path / "output"
+    output = tmp_path / "output.duckdb"
     monkeypatch.setenv(
         "PATH",
         os.pathsep.join((str(executable.parent), os.environ.get("PATH", ""))),
@@ -117,7 +118,7 @@ def test_annotate_cli_runs_injected_adapter(
 
     assert result.exit_code == 0, result.output
     assert "1 unique sequences (0 cached, 1 computed)" in result.stdout
-    assert (output / "datapackage.json").is_file()
+    assert output.is_file()
 
 
 def test_annotate_cli_loads_explicit_execution_profile(
@@ -164,7 +165,7 @@ def test_annotate_cli_loads_explicit_execution_profile(
             "--fasta",
             str(fasta),
             "--output",
-            str(tmp_path / "output"),
+            str(tmp_path / "output.duckdb"),
         ],
     )
 
@@ -172,6 +173,79 @@ def test_annotate_cli_loads_explicit_execution_profile(
     assert captured[0].name.value == "interpro-pfam"
     assert captured[0].database == database.resolve()
     assert captured[0].environment == (("JAVA_HOME", "/opt/jdk-17"),)
+
+
+def test_annotate_cli_json_reports_result_and_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    executable = write_fixture_tool(tmp_path / "fixture-tool")
+    database = write_fixture_database(tmp_path / "database")
+    monkeypatch.setattr(
+        seqevi.cli,
+        "create_adapter",
+        lambda configuration: FixtureAdapter(
+            executable=configuration.executable,
+            database=configuration.database,
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "annotate",
+            "--json",
+            "--adapter",
+            "interpro-pfam",
+            "--fasta",
+            str(fasta),
+            "--store",
+            str(tmp_path / "store"),
+            "--output",
+            str(tmp_path / "output.duckdb"),
+            "--executable",
+            str(executable),
+            "--resource",
+            str(database),
+        ],
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.exit_code == 0, result.output
+    assert payload["status"] == "ok"
+    assert payload["adapter"] == "fixture"
+    assert payload["result_schema"] == "fixture/1"
+    assert payload["counts"] == {
+        "input_records": 1,
+        "unique_sequences": 1,
+        "cache_hits": 0,
+        "computed": 1,
+        "hits": 1,
+        "no_hits": 0,
+    }
+    assert payload["output"].endswith("output.duckdb")
+
+
+def test_annotate_cli_json_reports_typed_error(tmp_path: Path) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "annotate",
+            "--json",
+            "--fasta",
+            str(fasta),
+            "--output",
+            str(tmp_path / "output.duckdb"),
+        ],
+    )
+
+    payload = json.loads(result.stderr)
+    assert result.exit_code == 1
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "AnnotationError"
 
 
 def test_annotate_cli_rejects_mixed_profile_and_explicit_identity(
@@ -224,6 +298,15 @@ def test_profile_example_is_complete_toml() -> None:
     assert 'adapter = "interpro-pfam"' in result.stdout
     assert 'resource = "/opt/interproscan/data"' in result.stdout
     assert 'path_prepend = ["/opt/jdk-17/bin"]' in result.stdout
+
+    dbcan = runner.invoke(
+        app,
+        ["profile", "example", "--adapter", "dbcan-cazyme"],
+    )
+    assert dbcan.exit_code == 0
+    assert 'adapter = "dbcan-cazyme"' in dbcan.stdout
+    assert 'executable = "/opt/dbcan-5.2.9/bin/run_dbcan"' in dbcan.stdout
+    assert 'resource = "/data/dbcan/db_v5-2-9_5-5-2026/raw"' in dbcan.stdout
 
 
 def test_profile_init_list_and_show_use_isolated_xdg_home(tmp_path: Path) -> None:

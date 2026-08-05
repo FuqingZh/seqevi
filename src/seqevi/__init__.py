@@ -1,5 +1,7 @@
 """Content-addressed protein sequence annotation evidence."""
 
-__all__ = ["__version__"]
+__version__ = "0.2.0"
 
-__version__ = "0.1.0"
+from .api import annotate, scan_annotations
+
+__all__ = ["__version__", "annotate", "scan_annotations"]

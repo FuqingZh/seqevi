@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import json
 import shutil
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -15,10 +15,9 @@ from .adapters import (
     AdapterName,
     create_adapter,
 )
-from .annotate import run_annotation
+from .api import _run_annotation_application
 from .errors import AnnotationError, FastaValidationError, StoreError
 from .execution_profile import (
-    ExecutionProfile,
     initialize_named_profile,
     list_named_profiles,
     load_execution_profile,
@@ -27,7 +26,6 @@ from .execution_profile import (
     redacted_effective_configuration,
 )
 from .resource_lock import resource_lock_path
-from .store import open_evidence_store
 
 app = typer.Typer(
     name="seqevi",
@@ -47,17 +45,6 @@ profile_app = typer.Typer(
 )
 app.add_typer(resource_app, name="resource")
 app.add_typer(profile_app, name="profile")
-
-
-@dataclass(frozen=True, slots=True)
-class _ResolvedAnnotationInputs:
-    adapter: AdapterName
-    executable: Path
-    resource: Path
-    store: str | None
-    threads: int
-    timeout_seconds: float | None
-    environment: tuple[tuple[str, str], ...] = ()
 
 
 def _version_callback(value: bool) -> None:
@@ -113,11 +100,11 @@ def annotate_command(
         typer.Option(
             "-o",
             "--output",
-            file_okay=False,
-            dir_okay=True,
+            file_okay=True,
+            dir_okay=False,
             writable=True,
             resolve_path=True,
-            help="New directory for the invocation package.",
+            help="New DuckDB result file (normally ending in .duckdb).",
         ),
     ],
     adapter: Annotated[
@@ -188,118 +175,81 @@ def annotate_command(
             help="Worker threads; overrides the profile default.",
         ),
     ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit one machine-readable JSON result or error document.",
+        ),
+    ] = False,
 ) -> None:
-    """Reuse exact evidence and annotate only cache-miss sequences."""
+    """Reuse exact evidence and publish one immutable DuckDB result."""
 
     try:
-        inputs = _resolve_annotation_inputs(
-            profile_name=profile,
-            config_path=config,
+        invocation = _run_annotation_application(
+            fasta=fasta,
+            output=output,
+            profile=profile,
+            config=config,
             adapter=adapter,
             executable=executable,
             resource=resource,
             store=store,
             threads=threads,
             timeout_seconds=timeout_seconds,
+            adapter_factory=create_adapter,
         )
-        configured_adapter = create_adapter(
-            AdapterConfiguration(
-                name=inputs.adapter,
-                executable=inputs.executable,
-                database=inputs.resource,
-                environment=inputs.environment,
-            )
-        )
-        with open_evidence_store(inputs.store) as evidence_store:
-            summary = run_annotation(
-                fasta_path=fasta,
-                output_dir=output,
-                adapter=configured_adapter,
-                store=evidence_store,
-                timeout_seconds=inputs.timeout_seconds,
-                threads=inputs.threads,
-            )
     except (AnnotationError, FastaValidationError, StoreError) as error:
-        typer.echo(f"Error: {error}", err=True)
+        if json_output:
+            typer.echo(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "error",
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    },
+                    sort_keys=True,
+                ),
+                err=True,
+            )
+        else:
+            typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from error
+
+    summary = invocation.summary
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "ok",
+                    "adapter": invocation.adapter,
+                    "result_schema": invocation.result_schema_id,
+                    "counts": {
+                        "input_records": summary.input_records,
+                        "unique_sequences": summary.unique_sequences,
+                        "cache_hits": summary.cache_hits,
+                        "computed": summary.computed,
+                        "hits": summary.hits,
+                        "no_hits": summary.no_hits,
+                    },
+                    "output": str(summary.output_dir),
+                    "metrics": {
+                        "elapsed_seconds": summary.metrics.elapsed_seconds,
+                        "package_seconds": summary.metrics.package_seconds,
+                        "configured_threads": summary.metrics.configured_threads,
+                    },
+                },
+                sort_keys=True,
+            )
+        )
+        return
 
     typer.echo(
         f"Annotated {summary.unique_sequences} unique sequences "
         f"({summary.cache_hits} cached, {summary.computed} computed); "
         f"output: {summary.output_dir}"
-    )
-
-
-def _resolve_annotation_inputs(
-    *,
-    profile_name: str | None,
-    config_path: Path | None,
-    adapter: AdapterName | None,
-    executable: Path | None,
-    resource: Path | None,
-    store: str | None,
-    threads: int | None,
-    timeout_seconds: float | None,
-) -> _ResolvedAnnotationInputs:
-    if profile_name is not None and config_path is not None:
-        raise AnnotationError("--profile and --config cannot be used together")
-    selected_profile: ExecutionProfile | None = None
-    if profile_name is not None:
-        selected_profile = load_named_profile(profile_name)
-    elif config_path is not None:
-        selected_profile = load_execution_profile(config_path)
-
-    explicit_identity = (adapter, executable, resource)
-    if selected_profile is not None:
-        if any(value is not None for value in explicit_identity):
-            raise AnnotationError(
-                "--adapter, --executable and --resource cannot be combined with "
-                "--profile or --config"
-            )
-        return _ResolvedAnnotationInputs(
-            adapter=selected_profile.adapter,
-            executable=selected_profile.executable,
-            resource=selected_profile.resource,
-            store=store if store is not None else selected_profile.store,
-            threads=(
-                threads
-                if threads is not None
-                else selected_profile.threads
-                if selected_profile.threads is not None
-                else 1
-            ),
-            timeout_seconds=(
-                timeout_seconds
-                if timeout_seconds is not None
-                else selected_profile.timeout_seconds
-            ),
-            environment=selected_profile.environment,
-        )
-
-    missing = [
-        option
-        for option, value in (
-            ("--adapter", adapter),
-            ("--executable", executable),
-            ("--resource", resource),
-        )
-        if value is None
-    ]
-    if missing:
-        raise AnnotationError(
-            "explicit mode requires " + ", ".join(missing) + "; "
-            "alternatively select --profile or --config"
-        )
-    assert adapter is not None
-    assert executable is not None
-    assert resource is not None
-    return _ResolvedAnnotationInputs(
-        adapter=adapter,
-        executable=executable,
-        resource=resource,
-        store=store,
-        threads=threads if threads is not None else 1,
-        timeout_seconds=timeout_seconds,
     )
 
 

@@ -6,13 +6,13 @@ sequence annotation evidence.
 SeqEvi identifies proteins by canonical sequence content, determines which
 sequences already have evidence under an exact annotation contract, runs an
 external annotation tool only for cache misses, and exports an adapter-specific
-result package for the current FASTA.
+single-file DuckDB result for the current FASTA.
 
 ## Status
 
-The target architecture and v1 contracts are approved. Phases 1 and 2 implement
-strict protein sequence identity, the single-host SQLite/POSIX Store, the
-external tool runner, exact cache-miss orchestration, and atomic Data Package
+The target architecture and v1.1 result contracts are approved. SeqEvi 0.2.0
+uses strict protein sequence identity, the single-host SQLite/POSIX Store, the
+external tool runner, exact cache-miss orchestration, and atomic DuckDB result
 materialization.
 
 The `interpro-pfam` and eggNOG-mapper 2.x `eggnog` adapters are implemented with
@@ -24,8 +24,8 @@ POSIX artifacts, and PostgreSQL persistence are implemented and covered by
 local/shared plus provisioned PostgreSQL integration tests. Phase 6 resource
 locks avoid repeated hashing of large immutable database files and provide an
 explicit full-content verification command. Annotation now uses atomic FASTA
-staging, file-backed artifacts, bounded Store batches, lazy Parquet
-materialization, and an operational thread setting.
+staging, file-backed artifacts, bounded Store batches, adapter-native Parquet
+artifacts, and an operational thread setting.
 
 ## Why SeqEvi
 
@@ -51,6 +51,7 @@ For repeated use, keep one machine-local TOML per adapter runtime under
 ```bash
 seqevi profile init eggnog-5.0.2 --adapter eggnog
 seqevi profile init interpro-pfam-38.1 --adapter interpro-pfam
+seqevi profile init dbcan-5.2.9 --adapter dbcan-cazyme
 ```
 
 Each command creates a complete adapter-specific TOML file and refuses to
@@ -68,13 +69,24 @@ seqevi profile validate \
 environment variable names, never their values. The original complete
 templates remain available through `profile example --adapter ADAPTER`.
 
+These profile commands configure SeqEvi; they do not install annotation
+software or databases. In particular, the current dbCAN path requires the user
+to install the official `run_dbcan` Python runtime and DIAMOND, provide the
+four-file dbCAN resource, and edit the generated profile paths. The managed
+`seqevi setup` path is planned but is not available in the current CLI.
+
+The real local/shared Store acceptance for eggNOG and InterPro/Pfam is recorded
+in the [result-consumption runtime report](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md).
+The managed dbCAN distribution gate is tracked in the
+[runtime image release review](docs/architecture/20260805-v1.1-dbcan-runtime-image-release-review.md).
+
 Run repeated annotations by name:
 
 ```bash
 seqevi annotate \
   --profile eggnog-5.0.2 \
   --fasta proteins.fasta \
-  --output results/eggnog
+  --output results/eggnog.duckdb
 ```
 
 ```bash
@@ -82,7 +94,14 @@ seqevi annotate \
   --profile interpro-pfam-38.1 \
   --fasta proteins.fasta \
   --store https://seqevi.example.org \
-  --output results/pfam
+  --output results/pfam.duckdb
+```
+
+```bash
+seqevi annotate \
+  --profile dbcan-5.2.9 \
+  --fasta proteins.fasta \
+  --output results/dbcan.duckdb
 ```
 
 An exact profile file can be selected with `--config PATH`. Complete explicit
@@ -93,7 +112,7 @@ seqevi annotate \
   --adapter eggnog \
   --fasta proteins.fasta \
   --store /data/seqevi-store \
-  --output results/eggnog \
+  --output results/eggnog.duckdb \
   --executable /opt/eggnog-mapper/emapper.py \
   --resource /data/eggnog-5.0.2 \
   --threads 8
@@ -104,7 +123,7 @@ seqevi annotate \
   --adapter interpro-pfam \
   --fasta proteins.fasta \
   --store https://seqevi.example.org \
-  --output results/pfam \
+  --output results/pfam.duckdb \
   --executable /opt/interproscan/interproscan.sh \
   --resource /data/interproscan-5.77-108.0/data
 ```
@@ -137,9 +156,13 @@ seqevi resource verify \
 - Protein FASTA input with strict, deterministic canonicalization.
 - GA4GH `SQ.` sequence identifiers plus MD5 compatibility aliases.
 - Exact, immutable evidence keys.
-- Official `eggnog` and `interpro-pfam` adapters.
+- Explicit `eggnog`, `interpro-pfam`, and official-runtime-validated
+  `dbcan-cazyme` adapters. dbCAN direct/local/shared scientific acceptance is
+  complete; publishing the managed runtime image remains separate work, and
+  annotation databases remain caller supplied.
 - Local SQLite/POSIX Store and shared PostgreSQL/POSIX Store service.
-- Adapter-specific Parquet results and a Data Package v2 descriptor.
+- One self-describing DuckDB result per invocation; adapter-native normalized
+  evidence remains Parquet inside the incremental Store.
 
 SeqEvi does not infer species, manage projects, schedule workflows, install
 third-party tools, distribute annotation databases, or merge unrelated adapter
@@ -150,8 +173,9 @@ schemas.
 Start with [the documentation index](docs/README.md).
 
 - [Architecture overview](docs/architecture/20260720-v1.0-seqevi-architecture.md)
-- [Sequence and evidence contract](docs/architecture/20260720-v1.0-sequence-evidence-contract.md)
-- [Adapter contract](docs/architecture/20260720-v1.0-adapter-contract.md)
+- [Sequence and evidence contract](docs/architecture/20260804-v1.1-sequence-evidence-contract.md)
+- [Adapter contract](docs/architecture/20260804-v1.1-adapter-contract.md)
+- [Result consumption contract](docs/architecture/20260804-v1.1-result-consumption-contract.md)
 - [Execution profile contract](docs/architecture/20260724-v1.0-execution-profile-contract.md)
 - [Storage and deployment architecture](docs/architecture/20260729-v1.1-storage-deployment-architecture.md)
 - [MVP implementation plan](docs/implementation-plan/20260720-v1.0-mvp-implementation-plan.md)
@@ -160,14 +184,69 @@ Start with [the documentation index](docs/README.md).
 - [Annotate runtime and bounded-memory plan](docs/implementation-plan/20260722-v1.0-annotate-bounded-memory-plan.md)
 - [Bounded-memory and operational performance](docs/benchmarks/20260722-v1.0-bounded-memory-performance.md)
 - [InterProScan Pfam runtime validation](docs/benchmarks/20260723-v1.0-interproscan-runtime-validation.md)
+- [dbCAN CAZyme adapter implementation plan](docs/implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md)
+- [DuckDB result-consumption runtime acceptance](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md)
+- [dbCAN runtime image release review](docs/architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
+
+Proposed future contracts, not current CLI behavior:
+
+- [Managed adapter onboarding roadmap v1.1](docs/implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md)
+- [Proposed managed-distribution architecture v1.1](docs/architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)
+- [Proposed execution profile v2.1 contract](docs/architecture/20260805-v2.1-execution-profile-contract.md)
+
+## Python And Result Discovery
+
+The public Python API returns DuckDB's native relation, so the same object can
+be queried from a notebook or passed to Arrow/Polars without a SeqEvi wrapper:
+
+```python
+import seqevi
+
+annotations = seqevi.annotate(
+    "proteins.faa",
+    profile="interpro-pfam-38.1",
+    output="results/pfam.duckdb",
+)
+print(annotations.columns)
+pfam = annotations.select("InputID", "SignatureAccession")
+```
+
+An existing result can be opened read-only with `seqevi.scan_annotations()`. If
+the adapter columns are not known in advance, inspect the native relation or
+the stable catalog first:
+
+```python
+annotations = seqevi.scan_annotations("results/pfam.duckdb")
+print(annotations.columns)
+print(annotations.pl(lazy=True).collect_schema())
+```
+
+The normal protein-level join key is `InputID`. `SequenceID` is the content
+identity used for exact Store reuse. InterPro/Pfam keeps one-to-many domain
+rows, so aggregate it before joining to a one-row-per-protein table when that
+is the desired grain. SQL, R, and workflow tasks can open the same file and
+query `main.annotations`; `_seqevi.column_info`, `_seqevi.table_info`, and
+`_seqevi.metadata` provide column descriptions, row grain, and provenance.
+
+SeqEvi 0.2.0 is a deliberate output cutover from the 0.1.0 directory Data
+Package. Existing 0.1.0 packages remain readable by their own Data Package
+tools, but new SeqEvi invocations publish DuckDB only; rerun an annotation to
+produce the new result file.
 
 ## External Tools
 
-Annotation runtimes and databases are supplied by the user. SeqEvi v1 targets
+Annotation runtimes and databases are supplied by the user. The current CLI has
+no `seqevi setup` command. SeqEvi v1 targets
 [eggNOG-mapper](https://github.com/eggnogdb/eggnog-mapper) and
 [InterProScan](https://www.ebi.ac.uk/interpro/interproscan.html) with the Pfam
-application. Runtime images may be published separately where upstream
-licenses permit, but annotation databases are never bundled.
+application, and [dbCAN](https://github.com/bcb-unl/run_dbcan) for protein-level
+CAZyme annotation. A future managed path may publish a SeqEvi-maintained runtime
+image built from locked upstream inputs after runtime compliance review; it would
+not be an upstream-official image. Annotation databases remain separate and
+are never bundled in the wheel or runtime image. The proposed managed path
+uses a public, digest-pinned
+`ghcr.io/fuqingzh/seqevi-dbcan` runtime package; callers continue to provide the
+database path, and internal registry mirrors remain deployment policy.
 
 ## License
 

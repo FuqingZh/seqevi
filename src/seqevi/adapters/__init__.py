@@ -6,6 +6,7 @@ from .base import (
     AdapterSequenceResult,
     AnnotationAdapter,
 )
+from .dbcan_cazyme import DBCAN_EVIDENCE_SCHEMA, DBCanCazymeAdapter, DBCanParameters
 from .eggnog import (
     EGGNOG_EVIDENCE_SCHEMA,
     EggnogAdapter,
@@ -26,6 +27,9 @@ __all__ = [
     "AdapterName",
     "AdapterSequenceResult",
     "AnnotationAdapter",
+    "DBCAN_EVIDENCE_SCHEMA",
+    "DBCanCazymeAdapter",
+    "DBCanParameters",
     "EGGNOG_EVIDENCE_SCHEMA",
     "EggnogAdapter",
     "EggnogParameters",

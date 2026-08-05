@@ -7,9 +7,13 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from itertools import batched
 from pathlib import Path
+from typing import Literal
 
+from . import __version__
 from .adapters.base import AdapterBatchResult, AnnotationAdapter
 from .errors import AnnotationError, OutputPackageError
 from .evidence import (
@@ -18,7 +22,7 @@ from .evidence import (
     EvidenceSource,
     EvidenceStatus,
 )
-from .package import materialize_output_package
+from .result import RESULT_FORMAT_VERSION, materialize_result_database
 from .runner import ToolCommand, ToolRunResult, ToolRunner
 from .sequence import (
     SequenceIdentity,
@@ -100,8 +104,10 @@ def run_annotation(
     runner: ToolRunner | None = None,
     timeout_seconds: float | None = None,
     threads: int = 1,
+    output_format: Literal["duckdb"] = "duckdb",
+    result_metadata: Mapping[str, str] | None = None,
 ) -> AnnotationSummary:
-    """Resolve exact evidence, compute misses, and write the output package."""
+    """Resolve exact evidence, compute misses, and publish one DuckDB result."""
 
     if threads < 1:
         raise ValueError("threads must be positive")
@@ -208,17 +214,33 @@ def run_annotation(
             for sequence_id in keys_by_sequence_id
         }
 
+        statuses = [
+            fetched.record.status for fetched in fetched_by_sequence_id.values()
+        ]
         package_started = time.perf_counter()
-        materialize_output_package(
-            output_dir=output_dir,
+        if output_format != "duckdb":
+            raise AnnotationError(f"unsupported output format: {output_format}")
+        metadata = dict(result_metadata or _default_result_metadata(adapter))
+        metadata["InputDigest"] = stage.input_digest
+        metadata.setdefault("CreatedAt", datetime.now(UTC).isoformat())
+        materialize_result_database(
+            output_path=output_dir,
             records=iter_staged_records(stage),
-            identities=iter_staged_identities(stage),
             input_record_count=stage.input_records,
             fetched_by_sequence_id=fetched_by_sequence_id,
             source_by_sequence_id=source_by_sequence_id,
             evidence_schema=adapter.evidence_schema,
             adapter_contract=adapter.contract,
             input_digest=stage.input_digest,
+            metadata=metadata,
+            run_metrics={
+                "input_records": stage.input_records,
+                "unique_sequences": stage.unique_sequences,
+                "cache_hits": stage.unique_sequences - len(computed_ids),
+                "computed": len(computed_ids),
+                "hits": statuses.count(EvidenceStatus.HIT),
+                "no_hits": statuses.count(EvidenceStatus.NO_HIT),
+            },
         )
         package_seconds = time.perf_counter() - package_started
     except Exception as error:
@@ -266,6 +288,37 @@ def run_annotation(
             configured_threads=threads,
         ),
     )
+
+
+def _default_result_metadata(adapter: AnnotationAdapter) -> dict[str, str]:
+    """Build a complete generic result identity for direct orchestration calls."""
+
+    adapter_name = adapter.contract.name
+    if adapter_name == "eggnog":
+        upstream_tool = "eggNOG-mapper"
+        result_schema = "eggnog-mapper/2"
+    elif adapter_name == "interpro-pfam":
+        upstream_tool = "InterProScan"
+        result_schema = "interproscan-pfam/5"
+    elif adapter_name == "dbcan-cazyme":
+        upstream_tool = "dbCAN"
+        result_schema = "dbcan-cazyme/5"
+    else:
+        upstream_tool = adapter_name
+        result_schema = f"{adapter_name}/1"
+    return {
+        "ResultFormatVersion": RESULT_FORMAT_VERSION,
+        "ResultSchemaID": result_schema,
+        "SeqEviVersion": __version__,
+        "Adapter": adapter_name,
+        "AdapterContractVersion": adapter.contract.version,
+        "UpstreamTool": upstream_tool,
+        "UpstreamToolVersion": "unknown",
+        "ToolRuntimeDigest": adapter.contract.tool_runtime_digest,
+        "ResourceID": adapter.contract.resource_id,
+        "InputDigest": "unknown",
+        "CreatedAt": datetime.now(UTC).isoformat(),
+    }
 
 
 def _peak_rss_kib() -> int | None:
