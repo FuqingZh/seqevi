@@ -59,8 +59,7 @@ RUN install -m 0644 /usr/local/lib/python3.13/LICENSE.txt \
 
 RUN install -d -m 1777 /work /tmp \
     && /opt/venv/bin/seqevi --version \
-    && test -x /opt/dbcan-venv/bin/run_dbcan \
-    && /opt/dbcan-venv/bin/python -c "import importlib.metadata; assert importlib.metadata.version('dbcan') == '5.2.9'" \
+    && /opt/dbcan-venv/bin/run_dbcan version | grep -F 5.2.9 \
     && diamond version \
     && ! find / -xdev -type f \( -name CAZy.dmnd -o -name dbCAN.hmm -o -name dbCAN-sub.hmm -o -name fam-substrate-mapping.tsv \) -print -quit | grep .
 

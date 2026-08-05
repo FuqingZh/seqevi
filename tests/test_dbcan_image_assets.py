@@ -71,8 +71,9 @@ def test_image_build_has_public_labels_and_no_database_acquisition() -> None:
     )
     assert 'org.opencontainers.image.revision="${REVISION}"' in dockerfile
     assert "PATH=/opt/venv/bin:/opt/dbcan-venv/bin:" in dockerfile
-    assert "/opt/dbcan-venv/bin/run_dbcan" in dockerfile
+    assert "/opt/dbcan-venv/bin/run_dbcan version | grep -F 5.2.9" in dockerfile
     assert "cp /opt/dbcan-venv/bin/run_dbcan" not in dockerfile
+    assert "importlib.metadata.version('dbcan')" not in dockerfile
     assert "/usr/local/bin/diamond" in dockerfile
     for database_file in DATABASE_FILES:
         assert database_file not in inputs
@@ -114,5 +115,15 @@ def test_publish_workflow_uses_ghcr_attestations_without_latest() -> None:
     assert "${{ github.token }}" in workflow
     assert ":latest" not in workflow
     assert 'docker pull "${reference}"' in workflow
+    assert (
+        'docker run --rm --entrypoint /opt/dbcan-venv/bin/run_dbcan "${reference}" version'
+        " | grep -F '5.2.9'" in workflow
+    )
+    assert (
+        'docker run --rm --entrypoint /opt/venv/bin/seqevi "${reference}" --version'
+        in workflow
+    )
+    assert 'docker run --rm --entrypoint diamond "${reference}" version' in workflow
+    assert 'docker run --rm --entrypoint sh "${reference}" -c' in workflow
     assert "database_url" not in workflow.casefold()
     assert "resource_url" not in workflow.casefold()
