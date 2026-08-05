@@ -75,6 +75,11 @@ to install the official `run_dbcan` Python runtime and DIAMOND, provide the
 four-file dbCAN resource, and edit the generated profile paths. The managed
 `seqevi setup` path is planned but is not available in the current CLI.
 
+The real local/shared Store acceptance for eggNOG and InterPro/Pfam is recorded
+in the [result-consumption runtime report](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md).
+The managed dbCAN distribution gate is tracked in the
+[redistribution/license review](docs/architecture/20260805-v1.0-dbcan-redistribution-license-review.md).
+
 Run repeated annotations by name:
 
 ```bash
@@ -151,8 +156,9 @@ seqevi resource verify \
 - Protein FASTA input with strict, deterministic canonicalization.
 - GA4GH `SQ.` sequence identifiers plus MD5 compatibility aliases.
 - Exact, immutable evidence keys.
-- Explicit `eggnog`, `interpro-pfam`, and fixture-validated `dbcan-cazyme`
-  adapters. dbCAN official-runtime parity is still an installation gate.
+- Explicit `eggnog`, `interpro-pfam`, and official-runtime-validated
+  `dbcan-cazyme` adapters. dbCAN direct/local/shared scientific acceptance is
+  complete; managed image/resource redistribution remains a separate open gate.
 - Local SQLite/POSIX Store and shared PostgreSQL/POSIX Store service.
 - One self-describing DuckDB result per invocation; adapter-native normalized
   evidence remains Parquet inside the incremental Store.
@@ -178,6 +184,8 @@ Start with [the documentation index](docs/README.md).
 - [Bounded-memory and operational performance](docs/benchmarks/20260722-v1.0-bounded-memory-performance.md)
 - [InterProScan Pfam runtime validation](docs/benchmarks/20260723-v1.0-interproscan-runtime-validation.md)
 - [dbCAN CAZyme adapter implementation plan](docs/implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md)
+- [DuckDB result-consumption runtime acceptance](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md)
+- [dbCAN redistribution and license review](docs/architecture/20260805-v1.0-dbcan-redistribution-license-review.md)
 
 Proposed future contracts, not current CLI behavior:
 

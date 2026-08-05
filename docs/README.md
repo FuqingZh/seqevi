@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-08-04
+> Last updated: 2026-08-05
 
 SeqEvi has implemented the v1 local and shared Store paths. The current working
 tree also contains the DuckDB result surface and fixture-backed contracts for
@@ -11,15 +11,16 @@ mistaken for shipped behavior.
 
 The active optimization sequence delivered one self-describing DuckDB result
 with a native Python relation API and the local `dbcan-cazyme` scientific
-adapter. Official-runtime parity, incremental reuse and the shared Store replay
-are accepted. Managed setup/OCI onboarding remains a separate future vertical
-slice.
+adapter. Official-runtime parity, incremental reuse, shared Store replay and
+the real eggNOG/InterPro result-consumption matrix are accepted. Managed
+setup/OCI onboarding remains a separate future vertical slice and is currently
+blocked on redistribution/provenance sign-off.
 
 ## Capability Status
 
 | Surface | Current state | Contract or plan |
 | --- | --- | --- |
-| result consumption | single-file DuckDB and native Python relation implemented in the working tree | [result contract v1.1](architecture/20260804-v1.1-result-consumption-contract.md) |
+| result consumption | single-file DuckDB and native Python relation; real local/shared runtime acceptance passed | [result contract v1.1](architecture/20260804-v1.1-result-consumption-contract.md), [acceptance](benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md) |
 | eggNOG and InterPro/Pfam | official-runtime parity accepted | [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
 | dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; managed onboarding remains separate | [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [dbCAN plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
 | execution profiles | profile v1 only; users supply host executables and resources | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md) |
@@ -55,6 +56,8 @@ slice.
 26. [Queryable annotation result and Python API implementation plan](implementation-plan/20260804-v1.0-result-consumption-implementation-plan.md)
 27. [dbCAN CAZyme adapter implementation plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md)
 28. [dbCAN 5.2.9 runtime validation](benchmarks/20260804-v1.0-dbcan-runtime-validation.md)
+29. [DuckDB result-consumption runtime acceptance](benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md)
+30. [dbCAN redistribution and license review](architecture/20260805-v1.0-dbcan-redistribution-license-review.md)
 
 ## Proposed Future Contracts
 
