@@ -1,0 +1,10 @@
+# Runtime closure for the SeqEvi dbCAN image. Regenerate for CPython 3.13,
+# Linux/amd64 with the command recorded in requirements.lock.
+alembic>=1.18,<2
+biopython>=1.87,<2
+duckdb>=1.5,<2
+httpx>=0.28,<1
+polars[pyarrow]>=1.40,<2
+pydantic>=2.12,<3
+sqlalchemy>=2.0,<3
+typer>=0.27,<1

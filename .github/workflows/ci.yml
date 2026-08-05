@@ -109,3 +109,41 @@ jobs:
             test "${attempt}" -lt 30
             sleep 1
           done
+
+  dbcan-runtime-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pdm-project/setup-pdm@v4
+        with:
+          version: 2.26.9
+          python-version: "3.13"
+          cache: true
+      - run: pdm build
+      - name: Prepare wheel context
+        run: |
+          mkdir -p "${RUNNER_TEMP}/seqevi-wheel"
+          cp dist/seqevi-0.2.0-*.whl "${RUNNER_TEMP}/seqevi-wheel/"
+          cp LICENSE "${RUNNER_TEMP}/seqevi-wheel/LICENSE"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build Linux/amd64 runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: containers/dbcan
+          file: containers/dbcan/Dockerfile
+          build-contexts: |
+            seqevi-wheel=${{ runner.temp }}/seqevi-wheel
+          build-args: |
+            REVISION=${{ github.sha }}
+          platforms: linux/amd64
+          load: true
+          tags: seqevi-dbcan:ci
+      - name: Inspect runtime contract
+        run: |
+          docker run --rm --entrypoint /opt/venv/bin/seqevi seqevi-dbcan:ci --version | grep -Fx 0.2.0
+          docker run --rm --entrypoint /opt/dbcan-venv/bin/run_dbcan seqevi-dbcan:ci version | grep -F '5.2.9'
+          docker run --rm --entrypoint diamond seqevi-dbcan:ci version | grep -F '2.1.15'
+          docker run --rm --entrypoint sh seqevi-dbcan:ci -c \
+            'test -s /usr/share/seqevi/compliance/NOTICE && test -s /usr/share/seqevi/compliance/SOURCE-CORRESPONDENCE.md'
+          docker run --rm --entrypoint sh seqevi-dbcan:ci -c \
+            '! find / -xdev -type f \( -name CAZy.dmnd -o -name dbCAN.hmm -o -name dbCAN-sub.hmm -o -name fam-substrate-mapping.tsv \) -print -quit | grep .'

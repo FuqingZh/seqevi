@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "name": "dbcan-source",
+      "url": "https://codeload.github.com/bcb-unl/run_dbcan/tar.gz/614c93f896939042ae5bd574b9c6b971e80803f6",
+      "sha256": "2084ec3ad2ac50b33087958f2e3155e3e20a6d5e53735776e926b66e82ba3a5f"
+    },
+    {
+      "name": "dbcan-license",
+      "url": "https://raw.githubusercontent.com/bcb-unl/run_dbcan/614c93f896939042ae5bd574b9c6b971e80803f6/LICENSE",
+      "sha256": "589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2"
+    },
+    {
+      "name": "diamond-binary",
+      "url": "https://github.com/bbuchfink/diamond/releases/download/v2.1.15/diamond-linux64.tar.gz",
+      "sha256": "2c1507fbb32164e861857d606fddf4b92d481174e4015cc50682f51c7b2f978a"
+    },
+    {
+      "name": "diamond-source",
+      "url": "https://codeload.github.com/bbuchfink/diamond/tar.gz/5c6b545d2d6eb1b31a5d553f39b3cc65e0aec6ce",
+      "sha256": "0308520f19fac5618da6c150f740615acfdf3342926667a4fcfecaada6cef7e1"
+    },
+    {
+      "name": "diamond-license",
+      "url": "https://raw.githubusercontent.com/bbuchfink/diamond/5c6b545d2d6eb1b31a5d553f39b3cc65e0aec6ce/LICENSE",
+      "sha256": "5220a7ab700b568136ff65182b41e9658f1a980c50fba36425f0ede86ac68652"
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+name: Publish dbCAN runtime image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - containers/dbcan/**
+      - src/**
+      - pyproject.toml
+      - pdm.lock
+      - README.md
+      - LICENSE
+      - .github/workflows/publish-dbcan-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pdm-project/setup-pdm@v4
+        with:
+          version: 2.26.9
+          python-version: "3.13"
+          cache: true
+      - run: pdm build
+      - name: Prepare exact-revision wheel context
+        run: |
+          mkdir -p "${RUNNER_TEMP}/seqevi-wheel"
+          cp dist/seqevi-0.2.0-*.whl "${RUNNER_TEMP}/seqevi-wheel/"
+          cp LICENSE "${RUNNER_TEMP}/seqevi-wheel/LICENSE"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build runtime for pre-publication probes
+        uses: docker/build-push-action@v6
+        with:
+          context: containers/dbcan
+          file: containers/dbcan/Dockerfile
+          build-contexts: |
+            seqevi-wheel=${{ runner.temp }}/seqevi-wheel
+          build-args: |
+            REVISION=${{ github.sha }}
+          platforms: linux/amd64
+          load: true
+          tags: seqevi-dbcan:release-candidate
+          cache-from: type=gha,scope=dbcan-runtime
+          cache-to: type=gha,mode=max,scope=dbcan-runtime
+      - name: Probe release candidate
+        run: |
+          test "$(docker image inspect seqevi-dbcan:release-candidate --format '{{.Architecture}}')" = amd64
+          test "$(docker image inspect seqevi-dbcan:release-candidate --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "${GITHUB_SHA}"
+          docker run --rm --entrypoint /opt/venv/bin/seqevi seqevi-dbcan:release-candidate --version | grep -Fx 0.2.0
+          docker run --rm --entrypoint /opt/dbcan-venv/bin/run_dbcan seqevi-dbcan:release-candidate version | grep -F '5.2.9'
+          docker run --rm --entrypoint diamond seqevi-dbcan:release-candidate version | grep -F '2.1.15'
+          docker run --rm --entrypoint sh seqevi-dbcan:release-candidate -c \
+            '! find / -xdev -type f \( -name CAZy.dmnd -o -name dbCAN.hmm -o -name dbCAN-sub.hmm -o -name fam-substrate-mapping.tsv \) -print -quit | grep .'
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish revision tags, SBOM, and provenance
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: containers/dbcan
+          file: containers/dbcan/Dockerfile
+          build-contexts: |
+            seqevi-wheel=${{ runner.temp }}/seqevi-wheel
+          build-args: |
+            REVISION=${{ github.sha }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/fuqingzh/seqevi-dbcan:0.2.0-rev-${{ github.sha }}
+            ghcr.io/fuqingzh/seqevi-dbcan:rev-${{ github.sha }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=dbcan-runtime
+      - name: Record and verify pushed digest
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          reference="ghcr.io/fuqingzh/seqevi-dbcan@${IMAGE_DIGEST}"
+          printf '%s\n' "${reference}" | tee dbcan-image-digest.txt
+          docker pull "${reference}"
+          test "$(docker image inspect "${reference}" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "${GITHUB_SHA}"
+          docker run --rm --entrypoint /opt/venv/bin/seqevi "${reference}" --version | grep -Fx 0.2.0
+          docker run --rm --entrypoint /opt/dbcan-venv/bin/run_dbcan "${reference}" version | grep -F '5.2.9'
+          docker run --rm --entrypoint diamond "${reference}" version | grep -F '2.1.15'
+          docker run --rm --entrypoint sh "${reference}" -c \
+            '! find / -xdev -type f \( -name CAZy.dmnd -o -name dbCAN.hmm -o -name dbCAN-sub.hmm -o -name fam-substrate-mapping.tsv \) -print -quit | grep .'
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dbcan-image-digest-${{ github.sha }}
+          path: dbcan-image-digest.txt
+          if-no-files-found: error
