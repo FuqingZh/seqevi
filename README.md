@@ -10,10 +10,20 @@ single-file DuckDB result for the current FASTA.
 
 ## Status
 
-The target architecture and v1.1 result contracts are approved. SeqEvi 0.2.0
-uses strict protein sequence identity, the single-host SQLite/POSIX Store, the
-external tool runner, exact cache-miss orchestration, and atomic DuckDB result
-materialization.
+The target architecture and v1.1 result contracts are approved. The SeqEvi
+0.2.0 source tree uses strict protein sequence identity, the single-host
+SQLite/POSIX Store, the external tool runner, exact cache-miss orchestration,
+and atomic DuckDB result materialization.
+
+The managed dbCAN public-user release gate is currently blocked: production
+PyPI has no `seqevi` project or `0.2.0` wheel, and this host did not complete
+the bundled public GHCR digest pull. An explicitly authorized TestPyPI staging
+wheel passed clean installation and negative-path checks, but staging and the
+earlier release-equivalent candidate do not substitute for the public gate. See
+the
+[Slice D gate record](docs/benchmarks/20260806-v1.4-dbcan-public-release-gate.md)
+for the exact boundary. The commands below describe the implemented source
+contract; they are not a claim that the PyPI installation path has passed.
 
 The `interpro-pfam` and eggNOG-mapper 2.x `eggnog` adapters are implemented with
 native-output validation and fixture parity coverage. The eggNOG adapter passes
