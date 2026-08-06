@@ -17,9 +17,14 @@ from .adapters import AdapterName
 from .errors import ProfileConfigurationError
 
 PROFILE_VERSION = 1
+MANAGED_PROFILE_VERSION = 2
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_ROOT_KEYS = {
+_KIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_OCI_IMAGE_REFERENCE = re.compile(
+    r"[a-z0-9][a-z0-9./_-]*(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}\Z"
+)
+_V1_ROOT_KEYS = {
     "version",
     "adapter",
     "executable",
@@ -30,6 +35,26 @@ _ROOT_KEYS = {
     "path_prepend",
     "environment",
 }
+_V2_ROOT_KEYS = {
+    "version",
+    "adapter",
+    "resource",
+    "store",
+    "threads",
+    "timeout_seconds",
+    "runtime",
+}
+_RUNTIME_KEYS = {"kind", "kit_id", "engine", "image"}
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedRuntime:
+    """Immutable runtime identity recorded by a managed profile."""
+
+    kind: str
+    kit_id: str
+    engine: str
+    image: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,12 +63,14 @@ class ExecutionProfile:
 
     source: Path
     adapter: AdapterName
-    executable: Path
+    executable: Path | None
     resource: Path
     store: str | None = None
     threads: int | None = None
     timeout_seconds: float | None = None
     environment: tuple[tuple[str, str], ...] = ()
+    version: int = PROFILE_VERSION
+    runtime: ManagedRuntime | None = None
 
     @property
     def environment_overlay(self) -> dict[str, str]:
@@ -149,8 +176,9 @@ def redacted_effective_configuration(profile: ExecutionProfile) -> str:
     store = _redacted_store(profile.store)
     lines = [
         f"source: {profile.source}",
+        f"version: {profile.version}",
         f"adapter: {profile.adapter.value}",
-        f"executable: {profile.executable}",
+        f"executable: {profile.executable if profile.executable is not None else '(managed runtime)'}",
         f"resource: {profile.resource}",
         f"store: {store if store is not None else '(default)'}",
         f"threads: {profile.threads if profile.threads is not None else '(default)'}",
@@ -164,6 +192,12 @@ def redacted_effective_configuration(profile: ExecutionProfile) -> str:
         "environment_names: "
         + (", ".join(environment_names) if environment_names else "(none)")
     )
+    if profile.runtime is not None:
+        lines.append(
+            "runtime: "
+            f"{profile.runtime.kind}/{profile.runtime.engine} "
+            f"{profile.runtime.kit_id} {profile.runtime.image}"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -183,16 +217,22 @@ def load_execution_profile(path: Path) -> ExecutionProfile:
             f"cannot read execution profile {source}: {error}"
         ) from error
 
-    unknown = sorted(set(document) - _ROOT_KEYS)
+    version = _required_integer(document, "version")
+    if version == PROFILE_VERSION:
+        allowed_root_keys = _V1_ROOT_KEYS
+    elif version == MANAGED_PROFILE_VERSION:
+        allowed_root_keys = _V2_ROOT_KEYS
+    else:
+        allowed_root_keys = _V1_ROOT_KEYS | _V2_ROOT_KEYS
+    unknown = sorted(set(document) - allowed_root_keys)
     if unknown:
         raise ProfileConfigurationError(
             f"execution profile contains unknown keys: {', '.join(unknown)}"
         )
-    version = _required_integer(document, "version")
-    if version != PROFILE_VERSION:
+    if version not in (PROFILE_VERSION, MANAGED_PROFILE_VERSION):
         raise ProfileConfigurationError(
             f"unsupported execution profile version {version}; "
-            f"expected {PROFILE_VERSION}"
+            f"expected {PROFILE_VERSION} or {MANAGED_PROFILE_VERSION}"
         )
 
     adapter_text = _required_string(document, "adapter")
@@ -203,6 +243,9 @@ def load_execution_profile(path: Path) -> ExecutionProfile:
         raise ProfileConfigurationError(
             f"unknown adapter {adapter_text!r}; expected one of: {accepted}"
         ) from error
+
+    if version == MANAGED_PROFILE_VERSION:
+        return _load_managed_profile(document, source=source, adapter=adapter)
 
     environment = _environment(document.get("environment"))
     path_prepend = _path_prepend(document.get("path_prepend"), source=source)
@@ -252,6 +295,77 @@ def load_execution_profile(path: Path) -> ExecutionProfile:
         threads=threads,
         timeout_seconds=timeout_seconds,
         environment=tuple(sorted(environment.items())),
+        version=PROFILE_VERSION,
+    )
+
+
+def _load_managed_profile(
+    document: Mapping[str, Any], *, source: Path, adapter: AdapterName
+) -> ExecutionProfile:
+    """Load a strict v2.1 OCI profile without launching its runtime."""
+
+    if adapter is not AdapterName.DBCAN_CAZYME:
+        raise ProfileConfigurationError(
+            "managed profile version 2 currently supports only adapter 'dbcan-cazyme'"
+        )
+    runtime_value = document.get("runtime")
+    if not isinstance(runtime_value, dict) or set(runtime_value) != _RUNTIME_KEYS:
+        raise ProfileConfigurationError(
+            "managed profile runtime must contain only kind, kit_id, engine and image"
+        )
+    kind = _required_string(runtime_value, "kind")
+    kit_id = _required_string(runtime_value, "kit_id")
+    engine = _required_string(runtime_value, "engine")
+    image = _required_string(runtime_value, "image")
+    if kind != "oci":
+        raise ProfileConfigurationError("managed profile runtime kind must be 'oci'")
+    if engine != "docker":
+        raise ProfileConfigurationError(
+            "managed profile runtime engine must be 'docker'"
+        )
+    if _KIT_ID.fullmatch(kit_id) is None:
+        raise ProfileConfigurationError(
+            "managed profile runtime kit_id contains unsafe characters"
+        )
+    if _OCI_IMAGE_REFERENCE.fullmatch(image) is None:
+        raise ProfileConfigurationError(
+            "managed profile runtime image must contain an immutable sha256 digest"
+        )
+
+    resource = _profile_path(_required_string(document, "resource"), source=source)
+    if not resource.is_dir() or not os.access(resource, os.R_OK):
+        raise ProfileConfigurationError(
+            f"profile resource is not a readable directory: {resource}"
+        )
+    store = _optional_string(document, "store")
+    if store is not None and "://" not in store:
+        store = str(_profile_path(store, source=source))
+    threads = _optional_integer(document, "threads")
+    if threads is not None and threads < 1:
+        raise ProfileConfigurationError("profile threads must be at least 1")
+    timeout_seconds = _optional_number(document, "timeout_seconds")
+    if timeout_seconds is not None and (
+        not math.isfinite(timeout_seconds) or timeout_seconds <= 0
+    ):
+        raise ProfileConfigurationError(
+            "profile timeout_seconds must be finite and greater than zero"
+        )
+
+    return ExecutionProfile(
+        source=source,
+        adapter=adapter,
+        executable=None,
+        resource=resource,
+        store=store,
+        threads=threads,
+        timeout_seconds=timeout_seconds,
+        version=MANAGED_PROFILE_VERSION,
+        runtime=ManagedRuntime(
+            kind=kind,
+            kit_id=kit_id,
+            engine=engine,
+            image=image,
+        ),
     )
 
 

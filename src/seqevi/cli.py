@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import typer
 
@@ -16,7 +17,8 @@ from .adapters import (
     create_adapter,
 )
 from .api import _run_annotation_application
-from .errors import AnnotationError, FastaValidationError, StoreError
+from .distribution import SetupPlan, build_setup_plan
+from .errors import AnnotationError, FastaValidationError, SetupError, StoreError
 from .execution_profile import (
     initialize_named_profile,
     list_named_profiles,
@@ -251,6 +253,138 @@ def annotate_command(
         f"({summary.cache_hits} cached, {summary.computed} computed); "
         f"output: {summary.output_dir}"
     )
+
+
+@app.command("setup")
+def setup_command(
+    kit: Annotated[
+        str,
+        typer.Argument(help="Managed kit to plan (currently dbcan-cazyme)."),
+    ],
+    resource: Annotated[
+        Path | None,
+        typer.Option(
+            "--resource",
+            metavar="PATH",
+            help="Caller-owned database root; required on first non-interactive setup.",
+        ),
+    ] = None,
+    profile_name: Annotated[
+        str | None,
+        typer.Option(
+            "--profile-name",
+            help="Named v2 profile to inspect or publish later (default: kit name).",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Build and display a read-only setup plan; never mutate state.",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Reserved for setup apply; Slice A never mutates state.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Emit the same setup plan as one JSON document.",
+        ),
+    ] = False,
+) -> None:
+    """Plan managed adapter setup without installing tools or databases."""
+
+    del yes
+    if resource is None and not json_output and sys.stdin.isatty():
+        resource_text = typer.prompt("Caller-owned dbCAN resource directory")
+        resource = Path(resource_text)
+    try:
+        plan = build_setup_plan(
+            kit,
+            resource=resource,
+            profile_name=profile_name,
+            stdin_isatty=sys.stdin.isatty(),
+        )
+    except (AnnotationError, SetupError) as error:
+        _emit_setup_error(error, json_output=json_output)
+
+    if json_output:
+        typer.echo(json.dumps(plan.as_dict(), sort_keys=True))
+    else:
+        typer.echo(_render_setup_plan(plan), nl=False)
+
+    if not dry_run:
+        typer.echo(
+            "Error: setup apply is not implemented yet; rerun with --dry-run "
+            "for a read-only plan.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if not plan.ready_for_apply:
+        raise typer.Exit(code=1)
+
+
+def _emit_setup_error(error: AnnotationError, *, json_output: bool) -> NoReturn:
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                },
+                sort_keys=True,
+            ),
+            err=True,
+        )
+    else:
+        typer.echo(f"Error: {error}", err=True)
+    raise typer.Exit(code=1) from error
+
+
+def _render_setup_plan(plan: SetupPlan) -> str:
+    """Render the typed plan without progress output or secret material."""
+
+    lines = [
+        "Setup plan (read-only; Slice A)",
+        f"status: {plan.status}",
+        f"adapter: {plan.adapter}",
+        f"kit_id: {plan.kit_id}",
+        "runtime:",
+        f"  platform: {plan.runtime.platform}",
+        f"  engine: {plan.runtime.engine}",
+        f"  image: {plan.runtime.image}",
+        f"  image_status: {plan.runtime.image_status}",
+        f"  dbCAN: {plan.runtime.dbcan_version}",
+        f"  DIAMOND: {plan.runtime.diamond_version}",
+        "resource:",
+        f"  path: {plan.resource.path if plan.resource.path is not None else '(unresolved)'}",
+        f"  status: {plan.resource.status}",
+        f"  lock: {plan.resource.lock_path if plan.resource.lock_path is not None else '(none)'}",
+        "profile:",
+        f"  name: {plan.profile.name}",
+        f"  path: {plan.profile.path}",
+        f"  status: {plan.profile.status}",
+        "actions:",
+    ]
+    lines.extend(f"  - {action}" for action in plan.actions)
+    lines.extend(
+        (
+            f"smoke: {plan.smoke_status} ({plan.smoke_reason})",
+            f"next_command: {plan.next_command or '(setup apply is not available in this release)'}",
+        )
+    )
+    if plan.issues:
+        lines.append("issues:")
+        lines.extend(f"  - {issue}" for issue in plan.issues)
+    return "\n".join(lines) + "\n"
 
 
 @profile_app.command("example")
