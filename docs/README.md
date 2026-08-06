@@ -63,11 +63,13 @@ managed-v2 scientific parity remains pending.
 30. [Superseded dbCAN redistribution review](architecture/20260805-v1.0-dbcan-redistribution-license-review.md)
 31. [dbCAN runtime image release review](architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 32. [dbCAN runtime image publication](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md)
+33. [Managed dbCAN next-gate validation](benchmarks/20260806-v1.2-dbcan-managed-next-gate-validation.md)
 
 ## Managed Boundary Contracts
 
-These documents preserve the accepted managed-onboarding boundary. Slice B has
-activated setup apply and smoke; OCI execution is not yet current behavior:
+These documents preserve the accepted managed-onboarding boundary. Slice B
+setup apply and smoke and the Slice C OCI dispatcher are implemented; real
+local-v1 versus managed-v2 parity remains pending:
 
 - [Managed adapter distribution architecture v1.1](architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)
 - [Execution profile v2.1 contract](architecture/20260805-v2.1-execution-profile-contract.md)
