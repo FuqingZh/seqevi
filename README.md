@@ -104,7 +104,11 @@ seqevi annotate \
 ```
 
 The dispatcher and cleanup boundary are covered by fixture tests. The real
-local-v1 versus managed-v2 scientific equality run remains a release gate.
+direct-candidate versus managed-v2 scientific equality and later-process replay
+remain a release gate. A validation harness may use an immutable local image ID
+built from the exact published inputs when site GHCR transport is unavailable;
+the public setup/profile surface remains pinned to the bundled GHCR digest and
+exposes no image override.
 
 The real local/shared Store acceptance for eggNOG and InterPro/Pfam is recorded
 in the [result-consumption runtime report](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md).

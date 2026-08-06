@@ -27,7 +27,7 @@ managed-v2 scientific parity remains pending.
 | eggNOG and InterPro/Pfam | official-runtime parity accepted | [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
 | dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; managed onboarding remains separate | [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [dbCAN plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
 | execution profiles | profile v1 only; users supply host executables and resources | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md) |
-| managed onboarding | Slice B setup plus Slice C ephemeral Docker delegation are implemented; real local-v1/managed-v2 dbCAN parity and public release acceptance remain pending | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [OCI dispatcher validation](benchmarks/20260806-v1.1-dbcan-oci-dispatch-validation.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
+| managed onboarding | Distribution publication remains accepted; Slice B setup plus Slice C delegation are implemented; the release-equivalent candidate gate is blocked on exact-input transport | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
 
 ## Start Here
 
@@ -64,6 +64,7 @@ managed-v2 scientific parity remains pending.
 31. [dbCAN runtime image release review](architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 32. [dbCAN runtime image publication](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md)
 33. [Managed dbCAN next-gate validation](benchmarks/20260806-v1.2-dbcan-managed-next-gate-validation.md)
+34. [Managed dbCAN release-equivalent candidate gate](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md)
 
 ## Managed Boundary Contracts
 
