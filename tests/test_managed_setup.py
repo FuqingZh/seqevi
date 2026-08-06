@@ -22,7 +22,7 @@ from seqevi.distribution.manifest import (
 )
 from seqevi.distribution.setup import apply_setup, build_setup_plan
 from seqevi.api import resolve_annotation_inputs
-from seqevi.errors import AnnotationError, ProfileConfigurationError, SetupError
+from seqevi.errors import ProfileConfigurationError, SetupError
 from seqevi.execution_profile import load_execution_profile
 
 runner = CliRunner()
@@ -113,23 +113,26 @@ def test_profile_v2_loads_without_reinterpreting_v1_fields(tmp_path: Path) -> No
         load_execution_profile(profile)
 
 
-def test_annotation_path_keeps_v2_read_only_until_oci_slice(tmp_path: Path) -> None:
+def test_annotation_path_resolves_v2_for_oci_dispatch(tmp_path: Path) -> None:
     resource = tmp_path / "resource"
     resource.mkdir()
     profile = tmp_path / "managed.toml"
     _write_v2_profile(profile, resource)
 
-    with pytest.raises(AnnotationError, match="managed execution profile v2"):
-        resolve_annotation_inputs(
-            profile=None,
-            config=profile,
-            adapter=None,
-            executable=None,
-            resource=None,
-            store=None,
-            threads=None,
-            timeout_seconds=None,
-        )
+    resolved = resolve_annotation_inputs(
+        profile=None,
+        config=profile,
+        adapter=None,
+        executable=None,
+        resource=None,
+        store=None,
+        threads=None,
+        timeout_seconds=None,
+    )
+
+    assert resolved.executable is None
+    assert resolved.profile is not None
+    assert resolved.profile.version == 2
 
 
 def test_setup_json_dry_run_is_read_only_and_does_not_pull(

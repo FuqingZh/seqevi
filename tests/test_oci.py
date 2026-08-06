@@ -1,0 +1,260 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import duckdb
+import pytest
+
+import seqevi.distribution.oci as oci
+from seqevi.adapters import AdapterName
+from seqevi.errors import AnnotationError
+from seqevi.execution_profile import ExecutionProfile, ManagedRuntime
+from seqevi.distribution.manifest import KitComponent, KitManifest
+
+
+def _manifest(files: tuple[tuple[str, str, bytes], ...]) -> KitManifest:
+    return KitManifest(
+        schema_version=1,
+        kit_id="dbcan-cazyme-test",
+        adapter=AdapterName.DBCAN_CAZYME,
+        platform="linux/amd64",
+        dbcan_version="5.2.9",
+        diamond_version="2.1.15",
+        image="ghcr.io/fuqingzh/seqevi-dbcan@sha256:" + "a" * 64,
+        resource_name="dbcan",
+        resource_version="test-resource",
+        components=tuple(
+            KitComponent(name, path, len(content), hashlib.sha256(content).hexdigest())
+            for name, path, content in files
+        ),
+    )
+
+
+def _resource(tmp_path: Path, manifest: KitManifest) -> Path:
+    resource = tmp_path / "resource"
+    resource.mkdir()
+    for component in manifest.components:
+        (resource / component.path).write_bytes(
+            {
+                "CAZy.dmnd": b"diamond",
+                "dbCAN.hmm": b"hmm",
+                "dbCAN-sub.hmm": b"sub",
+                "fam-substrate-mapping.tsv": b"mapping",
+            }[component.path]
+        )
+    from seqevi.resource_lock import ResourceComponent, resolve_resource_lock
+
+    resolve_resource_lock(
+        database=resource,
+        resource_name=manifest.resource_name,
+        resource_version=manifest.resource_version,
+        components=tuple(
+            ResourceComponent(component.name, component.path)
+            for component in manifest.components
+        ),
+    )
+    return resource
+
+
+def _profile(tmp_path: Path, manifest: KitManifest, resource: Path) -> ExecutionProfile:
+    return ExecutionProfile(
+        source=tmp_path / "profile.toml",
+        adapter=AdapterName.DBCAN_CAZYME,
+        executable=None,
+        resource=resource,
+        store=str(tmp_path / "store"),
+        version=2,
+        runtime=ManagedRuntime(
+            kind="oci",
+            kit_id=manifest.kit_id,
+            engine="docker",
+            image=manifest.image,
+        ),
+    )
+
+
+def _inputs(tmp_path: Path) -> tuple[KitManifest, Path, ExecutionProfile, Path, Path]:
+    files = (
+        ("CAZy-diamond", "CAZy.dmnd", b"diamond"),
+        ("dbCAN-HMM", "dbCAN.hmm", b"hmm"),
+        ("dbCAN-sub-HMM", "dbCAN-sub.hmm", b"sub"),
+        ("fam-substrate-mapping", "fam-substrate-mapping.tsv", b"mapping"),
+    )
+    manifest = _manifest(files)
+    resource = _resource(tmp_path, manifest)
+    profile = _profile(tmp_path, manifest, resource)
+    fasta = tmp_path / "proteins with space.faa"
+    fasta.write_text(">p\nMPEPTIDE\n", encoding="utf-8")
+    return manifest, resource, profile, fasta, tmp_path / "result.duckdb"
+
+
+def _write_result(path: Path, resource_id: str) -> None:
+    with duckdb.connect(str(path)) as connection:
+        connection.execute("CREATE SCHEMA _seqevi")
+        connection.execute(
+            """
+            CREATE TABLE _seqevi.metadata AS SELECT * FROM (VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) AS t(
+                ResultFormatVersion, ResultSchemaID, SeqEviVersion, Adapter,
+                AdapterContractVersion, UpstreamTool, UpstreamToolVersion,
+                ToolRuntimeDigest, ResourceID, InputDigest, CreatedAt
+            )
+            """,
+            [
+                "seqevi-duckdb/1",
+                "dbcan-cazyme/5",
+                "0.2.0",
+                "dbcan-cazyme",
+                "dbcan-cazyme/1",
+                "dbCAN",
+                "5.2.9",
+                "sha256:" + "b" * 64,
+                resource_id,
+                "input",
+                "now",
+            ],
+        )
+
+
+def test_managed_annotation_mounts_are_narrow_and_ephemeral(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, resource, profile, fasta, output = _inputs(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_docker(
+        _docker: str,
+        arguments: tuple[str, ...],
+        *,
+        timeout_seconds: float | None,
+        action: str,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds, action
+        calls.append(arguments)
+        if arguments[0] == "create":
+            return subprocess.CompletedProcess(arguments, 0, "container", "")
+        if arguments[:2] == ("start", "--attach"):
+            create = next(call for call in calls if call[0] == "create")
+            mount_values = [
+                create[index + 1]
+                for index, value in enumerate(create[:-1])
+                if value == "--mount"
+            ]
+            output_mount = next(
+                value for value in mount_values if "target=/mnt/seqevi/output" in value
+            )
+            source = output_mount.split("source=", 1)[1].split(",target=", 1)[0]
+            staged = Path(source) / "result.duckdb"
+            _write_result(staged, oci._resource_id_from_lock(resource, manifest))
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "adapter": "dbcan-cazyme",
+                        "result_schema": "dbcan-cazyme/5",
+                        "counts": {
+                            "input_records": 1,
+                            "unique_sequences": 1,
+                            "cache_hits": 0,
+                            "computed": 1,
+                            "hits": 1,
+                            "no_hits": 0,
+                        },
+                        "metrics": {
+                            "elapsed_seconds": 1.0,
+                            "package_seconds": 0.1,
+                            "configured_threads": 1,
+                        },
+                    }
+                ),
+                "",
+            )
+        if arguments[:2] == ("rm", "--force"):
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        if arguments[:2] == ("image", "inspect"):
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(oci.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(oci, "load_kit_manifest", lambda _name: manifest)
+    monkeypatch.setattr(oci, "_docker_call", fake_docker)
+
+    result = oci.run_oci_annotation(
+        fasta=fasta,
+        output=output,
+        profile=profile,
+        store=tmp_path / "store",
+        threads=1,
+        timeout_seconds=None,
+    )
+
+    assert output.is_file()
+    assert result.summary.output_dir == output
+    create = next(call for call in calls if call[0] == "create")
+    assert create[create.index("--network") + 1] == "none"
+    assert create[create.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
+    mounts = [
+        create[index + 1]
+        for index, value in enumerate(create[:-1])
+        if value == "--mount"
+    ]
+    assert sum("readonly" in mount for mount in mounts) == 2
+    assert any("target=/mnt/seqevi/output" in mount for mount in mounts)
+    assert any("target=/mnt/seqevi/store" in mount for mount in mounts)
+    assert "docker.sock" not in " ".join(create)
+    assert any(call[:2] == ("rm", "--force") for call in calls)
+
+
+def test_managed_annotation_failure_removes_container_and_keeps_output_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, resource, profile, fasta, output = _inputs(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def fake_docker(
+        _docker: str,
+        arguments: tuple[str, ...],
+        *,
+        timeout_seconds: float | None,
+        action: str,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds, action
+        calls.append(arguments)
+        if arguments[0] == "create":
+            return subprocess.CompletedProcess(arguments, 0, "container", "")
+        if arguments[:2] == ("start", "--attach"):
+            return subprocess.CompletedProcess(arguments, 17, "", "dbCAN failed")
+        if arguments[:2] == ("rm", "--force"):
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        if arguments[:2] == ("image", "inspect"):
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(oci.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(oci, "load_kit_manifest", lambda _name: manifest)
+    monkeypatch.setattr(oci, "_docker_call", fake_docker)
+
+    with pytest.raises(AnnotationError, match="container failed"):
+        oci.run_oci_annotation(
+            fasta=fasta,
+            output=output,
+            profile=profile,
+            store=tmp_path / "store",
+            threads=1,
+            timeout_seconds=None,
+        )
+
+    assert not output.exists()
+    assert any(call[:2] == ("rm", "--force") for call in calls)
+
+
+def test_managed_shared_store_rejects_embedded_credentials() -> None:
+    with pytest.raises(AnnotationError, match="must not embed credentials"):
+        oci._resolve_store("https://user:secret@example.org/store?token=x")

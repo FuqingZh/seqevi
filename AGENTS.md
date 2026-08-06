@@ -12,9 +12,11 @@
 - SeqEvi is an independent protein sequence evidence cache. Do not couple its
   domain model to Proteomics projects, WDL, Cromwell, CephFS, Docker, or
   Kubernetes.
-- External annotation tools and their databases remain external. SeqEvi calls
-  configured executables and records their identities; it does not install,
-  schedule, or distribute them.
+- Caller-owned annotation databases and resources remain external: SeqEvi
+  validates and mounts them, but never downloads, copies, or redistributes them.
+  At the distribution edge, SeqEvi may invoke its digest-pinned first-party OCI
+  runtime ephemerally; it does not install host packages, schedule workflows,
+  expose a container engine, or couple Docker to the domain model.
 - Keep official adapters explicit. Do not add a plugin framework in v1.
 - Preserve adapter-native result schemas. Do not merge eggNOG and Pfam output
   into a universal annotation table.
@@ -38,9 +40,10 @@
 
 ## AO Delivery
 
-- Keep AO task branches scoped to one tracked issue, and use a ready-for-review
-  pull request with the issue key in its body for delivery.
-- Merge readiness requires platform-native review completion against the exact
-  current head SHA, followed by confirmation that zero review threads remain
-  unresolved. Only then may native auto-merge be enabled; do not merge a task
-  branch directly.
+- For tracked-issue work, keep each AO task branch scoped to one issue and use a
+  ready-for-review pull request with the issue key in its body for delivery.
+  Merge readiness requires platform-native review completion against the exact
+  current head SHA and zero unresolved review threads before native auto-merge
+  is enabled; do not merge a task branch directly.
+- For freeform tasks, follow the requested delivery boundary without inventing
+  an issue or pull request.

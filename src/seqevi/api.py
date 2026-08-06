@@ -17,6 +17,7 @@ from .adapters import (
     create_adapter,
 )
 from .annotate import AnnotationSummary, run_annotation
+from .distribution.oci import run_oci_annotation
 from .errors import AnnotationError
 from .execution_profile import (
     ExecutionProfile,
@@ -29,15 +30,21 @@ from .store import open_evidence_store
 
 @dataclass(frozen=True, slots=True)
 class ResolvedAnnotationInputs:
-    """Concrete adapter inputs after profile/config resolution."""
+    """Concrete inputs after profile/config resolution.
+
+    For a managed v2 profile, ``executable`` is ``None`` and ``profile`` holds
+    the immutable OCI runtime. The application boundary dispatches that case
+    without exposing Docker branches to scientific adapters.
+    """
 
     adapter: AdapterName
-    executable: Path
+    executable: Path | None
     resource: Path
     store: str | Path | None
     threads: int
     timeout_seconds: float | None
     environment: tuple[tuple[str, str], ...] = ()
+    profile: ExecutionProfile | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +173,23 @@ def _run_annotation_application(
         threads=threads,
         timeout_seconds=timeout_seconds,
     )
+    if inputs.profile is not None and inputs.profile.version == 2:
+        managed = run_oci_annotation(
+            fasta=fasta.expanduser().resolve(),
+            output=output.expanduser().resolve(),
+            profile=inputs.profile,
+            store=inputs.store,
+            threads=inputs.threads,
+            timeout_seconds=inputs.timeout_seconds,
+        )
+        return AnnotationInvocation(
+            relation=_scan_annotations(managed.output),
+            summary=managed.summary,
+            adapter=managed.adapter,
+            result_schema_id=managed.result_schema_id,
+        )
+    if inputs.executable is None:
+        raise AnnotationError("local annotation requires an executable")
     factory = create_adapter if adapter_factory is None else adapter_factory
     configured_adapter = factory(
         AdapterConfiguration(
@@ -255,6 +279,7 @@ def resolve_annotation_inputs(
         store=store,
         threads=threads if threads is not None else 1,
         timeout_seconds=timeout_seconds,
+        profile=None,
     )
 
 
@@ -265,11 +290,28 @@ def _resolved_from_profile(
     threads: int | None,
     timeout_seconds: float | None,
 ) -> ResolvedAnnotationInputs:
-    if profile.version != 1 or profile.executable is None:
-        raise AnnotationError(
-            "managed execution profile v2 is not available in this release; "
-            "use a v1 local profile or explicit local mode"
+    if profile.version == 2:
+        return ResolvedAnnotationInputs(
+            adapter=profile.adapter,
+            executable=None,
+            resource=profile.resource,
+            store=store if store is not None else profile.store,
+            threads=(
+                threads
+                if threads is not None
+                else profile.threads
+                if profile.threads is not None
+                else 1
+            ),
+            timeout_seconds=(
+                timeout_seconds
+                if timeout_seconds is not None
+                else profile.timeout_seconds
+            ),
+            profile=profile,
         )
+    if profile.executable is None:
+        raise AnnotationError("local execution profile has no executable")
     return ResolvedAnnotationInputs(
         adapter=profile.adapter,
         executable=profile.executable,
@@ -286,6 +328,7 @@ def _resolved_from_profile(
             timeout_seconds if timeout_seconds is not None else profile.timeout_seconds
         ),
         environment=profile.environment,
+        profile=profile,
     )
 
 

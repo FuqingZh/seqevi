@@ -90,10 +90,21 @@ seqevi setup dbcan-cazyme \
 `--dry-run` never mutates state. `--yes` pulls the immutable image only when
 needed, verifies the caller-owned four-file resource, creates `seqevi.lock`
 when the resource permits it, runs an ephemeral read-only smoke, and publishes
-the v2 profile atomically. It never downloads or copies the database. Managed
-OCI annotation remains Slice C; until that delegation ships, the direct dbCAN
-annotation path still uses the official host `run_dbcan` runtime and a v1
-profile.
+the v2 profile atomically. It never downloads or copies the database. Slice C
+now dispatches a managed dbCAN annotation through an ephemeral Docker
+container with the same caller UID/GID, read-only FASTA/resource mounts and a
+local-Store `--network none` boundary:
+
+```bash
+seqevi annotate \
+  --profile dbcan-cazyme \
+  --store /data/seqevi-store \
+  --fasta proteins.fasta \
+  --output results/dbcan.duckdb
+```
+
+The dispatcher and cleanup boundary are covered by fixture tests. The real
+local-v1 versus managed-v2 scientific equality run remains a release gate.
 
 The real local/shared Store acceptance for eggNOG and InterPro/Pfam is recorded
 in the [result-consumption runtime report](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md).
