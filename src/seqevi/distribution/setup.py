@@ -2,24 +2,36 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from seqevi.errors import ProfileConfigurationError, ResourceLockError
+from seqevi.errors import ProfileConfigurationError, ResourceLockError, SetupError
 from seqevi.execution_profile import (
     ExecutionProfile,
     load_execution_profile,
     named_profile_path,
 )
-from seqevi.resource_lock import ResourceLock, read_resource_lock
+from seqevi.resource_lock import (
+    ResourceComponent,
+    ResourceLock,
+    read_resource_lock,
+    resolve_resource_lock,
+)
 
 from .manifest import KitManifest, load_kit_manifest
+
+_SMOKE_RESOURCE_ROOT = "/mnt/seqevi-dbcan-resource"
+_SMOKE_TIMEOUT_SECONDS = 120
+_PULL_TIMEOUT_SECONDS = 900
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,7 +220,11 @@ def build_setup_plan(
         kit_id=manifest.kit_id,
         dbcan_version=manifest.dbcan_version,
         diamond_version=manifest.diamond_version,
-        image_status=_inspect_image(manifest.image),
+        image_status=(
+            _inspect_image(manifest.image)
+            if selected_resource is not None
+            else "not-checked"
+        ),
     )
     profile = SetupProfilePlan(
         name=selected_name,
@@ -229,9 +245,56 @@ def build_setup_plan(
         profile=profile,
         actions=actions,
         smoke_status="deferred",
-        smoke_reason="setup apply and ephemeral runtime smoke are Slice B",
+        smoke_reason="setup apply will run the ephemeral runtime smoke",
         next_command=None,
         issues=tuple(issues),
+    )
+
+
+def apply_setup(plan: SetupPlan) -> SetupPlan:
+    """Apply one previously inspected plan and publish its profile atomically."""
+
+    if not plan.ready_for_apply:
+        detail = "; ".join(plan.issues) or f"setup plan is {plan.status}"
+        raise SetupError(f"setup plan is not ready to apply: {detail}")
+    manifest = load_kit_manifest(plan.adapter)
+    if manifest.kit_id != plan.kit_id or manifest.image != plan.runtime.image:
+        raise SetupError("setup plan no longer matches the bundled managed kit")
+    resource = plan.resource.path
+    if resource is None:
+        raise SetupError("setup plan has no caller-owned resource path")
+
+    docker = shutil.which("docker")
+    if docker is None:
+        raise SetupError("Docker executable is not available on PATH")
+    _ensure_image(docker, manifest, image=plan.runtime.image)
+    lock = _verify_resource(resource, manifest, full=plan.resource.status != "ready")
+    _run_smoke(docker, manifest, resource)
+    profile_published = _publish_profile(plan, manifest)
+
+    locked_by_path = {
+        component.relative_path: component for component in lock.components
+    }
+    components = tuple(
+        replace(
+            component,
+            actual_sha256=locked_by_path[component.path].sha256,
+            status="ready",
+        )
+        for component in plan.resource.components
+    )
+    resource_plan = replace(plan.resource, status="ready", components=components)
+    profile_plan = replace(
+        plan.profile,
+        status="published" if profile_published else "equal",
+    )
+    return replace(
+        plan,
+        status="applied",
+        resource=resource_plan,
+        profile=profile_plan,
+        smoke_status="passed",
+        smoke_reason="dbCAN runtime and caller-mounted read-only resource passed",
     )
 
 
@@ -384,6 +447,281 @@ def _inspect_image(image: str) -> str:
     except (OSError, subprocess.TimeoutExpired):
         return "docker-unavailable"
     return "present" if result.returncode == 0 else "missing"
+
+
+def _ensure_image(docker: str, manifest: KitManifest, *, image: str) -> None:
+    inspected = _docker_run(
+        docker,
+        ("image", "inspect", image),
+        timeout_seconds=30,
+        action="inspect the managed runtime image",
+    )
+    if inspected.returncode != 0:
+        pulled = _docker_run(
+            docker,
+            ("pull", "--platform", manifest.platform, image),
+            timeout_seconds=_PULL_TIMEOUT_SECONDS,
+            action="pull the managed runtime image",
+        )
+        if pulled.returncode != 0:
+            raise SetupError(
+                "Docker could not pull the exact managed runtime image: "
+                + _process_detail(pulled)
+            )
+    verified = _docker_run(
+        docker,
+        ("image", "inspect", image),
+        timeout_seconds=30,
+        action="verify the managed runtime image",
+    )
+    if verified.returncode != 0:
+        raise SetupError(
+            "Docker did not retain the exact digest-pinned managed runtime image: "
+            + _process_detail(verified)
+        )
+
+
+def _verify_resource(
+    resource: Path, manifest: KitManifest, *, full: bool
+) -> ResourceLock:
+    declarations = tuple(
+        ResourceComponent(component.name, component.path)
+        for component in manifest.components
+    )
+    try:
+        return resolve_resource_lock(
+            database=resource,
+            resource_name=manifest.resource_name,
+            resource_version=manifest.resource_version,
+            components=declarations,
+            verify=full,
+        )
+    except ResourceLockError as error:
+        raise SetupError(
+            f"caller-owned dbCAN resource verification failed: {error}"
+        ) from error
+
+
+def _run_smoke(docker: str, manifest: KitManifest, resource: Path) -> None:
+    expected = {component.path: component.size for component in manifest.components}
+    script = "\n".join(
+        (
+            "from pathlib import Path",
+            "import subprocess",
+            f"root = Path({_SMOKE_RESOURCE_ROOT!r})",
+            f"expected = {expected!r}",
+            "version = subprocess.run(",
+            "    ['/opt/dbcan-venv/bin/run_dbcan', 'version'], check=False",
+            ")",
+            "if version.returncode != 0:",
+            "    raise SystemExit('dbCAN version probe failed')",
+            "for name, size in expected.items():",
+            "    path = root / name",
+            "    if not path.is_file() or path.stat().st_size != size:",
+            "        raise SystemExit(f'resource component failed: {name}')",
+            "probe = root / '.seqevi-smoke-write-test'",
+            "try:",
+            "    probe.write_text('unexpected', encoding='utf-8')",
+            "except OSError:",
+            "    pass",
+            "else:",
+            "    probe.unlink(missing_ok=True)",
+            "    raise SystemExit('resource mount is writable')",
+            "print('seqevi dbCAN setup smoke passed')",
+        )
+    )
+    _run_ephemeral_container(
+        docker,
+        image=manifest.image,
+        resource=resource,
+        command=("-c", script),
+        entrypoint="/opt/venv/bin/python",
+    )
+
+
+def _run_ephemeral_container(
+    docker: str,
+    *,
+    image: str,
+    resource: Path,
+    command: tuple[str, ...],
+    entrypoint: str,
+) -> None:
+    container_name = f"seqevi-setup-smoke-{uuid.uuid4().hex[:16]}"
+    uid = getattr(os, "getuid", lambda: 0)()
+    gid = getattr(os, "getgid", lambda: 0)()
+    mount = f"type=bind,source={resource},target={_SMOKE_RESOURCE_ROOT},readonly"
+    created = _docker_run(
+        docker,
+        (
+            "create",
+            "--name",
+            container_name,
+            "--user",
+            f"{uid}:{gid}",
+            "--network",
+            "none",
+            "--mount",
+            mount,
+            "--entrypoint",
+            entrypoint,
+            image,
+            *command,
+        ),
+        timeout_seconds=30,
+        action="create the setup smoke container",
+    )
+    if created.returncode != 0:
+        raise SetupError(
+            "Docker could not create the setup smoke container: "
+            + _process_detail(created)
+        )
+
+    failure: SetupError | None = None
+    try:
+        started = _docker_run(
+            docker,
+            ("start", "--attach", container_name),
+            timeout_seconds=_SMOKE_TIMEOUT_SECONDS,
+            action="run the setup smoke container",
+        )
+        if started.returncode != 0:
+            failure = SetupError(
+                "managed dbCAN setup smoke failed: " + _process_detail(started)
+            )
+    except SetupError as error:
+        failure = error
+    finally:
+        try:
+            removed = _docker_run(
+                docker,
+                ("rm", "--force", container_name),
+                timeout_seconds=30,
+                action="remove the setup smoke container",
+            )
+        except SetupError as error:
+            removed = None
+            if failure is None:
+                failure = error
+        if removed is not None and removed.returncode != 0 and failure is None:
+            failure = SetupError(
+                "Docker could not remove the setup smoke container: "
+                + _process_detail(removed)
+            )
+    if failure is not None:
+        raise failure
+
+
+def _publish_profile(plan: SetupPlan, manifest: KitManifest) -> bool:
+    destination = plan.profile.path
+    resource = plan.resource.path
+    if resource is None:
+        raise SetupError("cannot publish a managed profile without a resource")
+    if destination.exists():
+        try:
+            existing = load_execution_profile(destination)
+        except ProfileConfigurationError as error:
+            raise SetupError(f"existing profile cannot be read: {error}") from error
+        if (
+            not _profile_matches_manifest(existing, manifest)
+            or existing.resource != resource
+        ):
+            raise SetupError(
+                "existing profile conflicts with the selected managed kit; "
+                "choose another --profile-name"
+            )
+        return False
+
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise SetupError(f"cannot create profile directory: {error}") from error
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.stem}.",
+            suffix=".tmp",
+            dir=destination.parent,
+            text=True,
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(_profile_document(manifest, resource))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        try:
+            os.link(temporary, destination)
+        except FileExistsError as error:
+            raise SetupError(
+                "managed profile appeared during setup; rerun to inspect the conflict"
+            ) from error
+        _fsync_directory(destination.parent)
+        return True
+    except OSError as error:
+        raise SetupError(
+            f"cannot publish managed profile {destination}: {error}"
+        ) from error
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _profile_document(manifest: KitManifest, resource: Path) -> str:
+    return (
+        "version = 2\n"
+        f"adapter = {_toml_string(manifest.adapter.value)}\n"
+        f"resource = {_toml_string(str(resource))}\n\n"
+        "[runtime]\n"
+        'kind = "oci"\n'
+        f"kit_id = {_toml_string(manifest.kit_id)}\n"
+        'engine = "docker"\n'
+        f"image = {_toml_string(manifest.image)}\n"
+    )
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _fsync_directory(directory: Path) -> None:
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _docker_run(
+    docker: str,
+    arguments: tuple[str, ...],
+    *,
+    timeout_seconds: float,
+    action: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [docker, *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise SetupError(f"timed out while trying to {action}") from error
+    except OSError as error:
+        raise SetupError(f"could not {action}: {error}") from error
+
+
+def _process_detail(result: subprocess.CompletedProcess[str]) -> str:
+    detail = (result.stderr or result.stdout or "no diagnostic output").strip()
+    return detail[-2000:]
 
 
 def _actions(

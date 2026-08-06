@@ -70,8 +70,8 @@ environment variable names, never their values. The original complete
 templates remain available through `profile example --adapter ADAPTER`.
 
 These profile commands configure SeqEvi; they do not install annotation
-software or databases. The managed dbCAN runtime image is published by SeqEvi,
-but the current Slice A setup surface is intentionally read-only:
+software or databases. The managed dbCAN runtime image is published by SeqEvi.
+Slice B now supports a read-only preview and an explicit apply:
 
 ```bash
 seqevi setup dbcan-cazyme \
@@ -81,13 +81,19 @@ seqevi setup dbcan-cazyme \
 seqevi setup dbcan-cazyme \
   --resource /data/dbcan/db_v5-2-9_5-5-2026/raw \
   --dry-run --json
+
+seqevi setup dbcan-cazyme \
+  --resource /data/dbcan/db_v5-2-9_5-5-2026/raw \
+  --yes
 ```
 
-The plan validates the exact kit and caller-owned resource metadata without
-pulling an image, creating `seqevi.lock`, writing a profile or starting a
-container. Setup apply and managed OCI annotation are later slices. Until they
-ship, the direct dbCAN path still requires the user to install the official
-`run_dbcan` Python runtime and DIAMOND and configure a v1 profile.
+`--dry-run` never mutates state. `--yes` pulls the immutable image only when
+needed, verifies the caller-owned four-file resource, creates `seqevi.lock`
+when the resource permits it, runs an ephemeral read-only smoke, and publishes
+the v2 profile atomically. It never downloads or copies the database. Managed
+OCI annotation remains Slice C; until that delegation ships, the direct dbCAN
+annotation path still uses the official host `run_dbcan` runtime and a v1
+profile.
 
 The real local/shared Store acceptance for eggNOG and InterPro/Pfam is recorded
 in the [result-consumption runtime report](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md).
@@ -202,8 +208,8 @@ Start with [the documentation index](docs/README.md).
 - [DuckDB result-consumption runtime acceptance](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md)
 - [dbCAN runtime image release review](docs/architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 
-Accepted managed-boundary documents; Slice A implements only strict reading and
-read-only planning, not setup apply or OCI execution:
+Accepted managed-boundary documents; Slice B implements setup apply and smoke,
+while OCI execution remains a later slice:
 
 - [Managed adapter onboarding roadmap v1.1](docs/implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md)
 - [Proposed managed-distribution architecture v1.1](docs/architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)
