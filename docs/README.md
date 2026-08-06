@@ -7,8 +7,8 @@ SeqEvi has implemented the v1 local and shared Store paths. The current tree
 also contains the DuckDB result surface, fixture-backed contracts for the three
 initial adapters, the public dbCAN runtime-image publication record, the Slice
 B managed-setup apply path and the Slice C OCI application dispatcher. The
-real local-v1 versus managed-v2 dbCAN scientific parity gate remains separate
-from the fixture-backed dispatcher tests.
+real direct-candidate versus managed-v2 dbCAN scientific parity gate has
+passed in addition to the fixture-backed dispatcher tests.
 
 The active optimization sequence delivered one self-describing DuckDB result
 with a native Python relation API and the local `dbcan-cazyme` scientific
@@ -17,7 +17,7 @@ the real eggNOG/InterPro result-consumption matrix are accepted. Managed
 onboarding is being delivered as a separate vertical slice: runtime-image
 publication, strict planning, resource verification, smoke, atomic profile
 publication and the application-boundary OCI dispatcher are current; real
-managed-v2 scientific parity remains pending.
+managed-v2 scientific parity and later-process replay are accepted.
 
 ## Capability Status
 
@@ -26,8 +26,8 @@ managed-v2 scientific parity remains pending.
 | result consumption | single-file DuckDB and native Python relation; real local/shared runtime acceptance passed | [result contract v1.1](architecture/20260804-v1.1-result-consumption-contract.md), [acceptance](benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md) |
 | eggNOG and InterPro/Pfam | official-runtime parity accepted | [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
 | dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; managed onboarding remains separate | [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [dbCAN plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
-| execution profiles | profile v1 only; users supply host executables and resources | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md) |
-| managed onboarding | Slice B setup plus Slice C ephemeral Docker delegation are implemented; real local-v1/managed-v2 dbCAN parity and public release acceptance remain pending | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [OCI dispatcher validation](benchmarks/20260806-v1.1-dbcan-oci-dispatch-validation.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
+| execution profiles | v1 host profiles remain compatible; managed v2.2 setup and OCI execution are implemented and accepted | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md), [managed profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
+| managed onboarding | Distribution publication remains accepted separately; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
 
 ## Start Here
 
@@ -64,15 +64,16 @@ managed-v2 scientific parity remains pending.
 31. [dbCAN runtime image release review](architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 32. [dbCAN runtime image publication](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md)
 33. [Managed dbCAN next-gate validation](benchmarks/20260806-v1.2-dbcan-managed-next-gate-validation.md)
+34. [Managed dbCAN release-equivalent candidate gate](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md)
 
 ## Managed Boundary Contracts
 
 These documents preserve the accepted managed-onboarding boundary. Slice B
-setup apply and smoke and the Slice C OCI dispatcher are implemented; real
-local-v1 versus managed-v2 parity remains pending:
+setup apply and smoke, the Slice C OCI dispatcher, and real candidate parity
+with later-process replay are accepted:
 
-- [Managed adapter distribution architecture v1.1](architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)
-- [Execution profile v2.1 contract](architecture/20260805-v2.1-execution-profile-contract.md)
+- [Managed adapter distribution architecture v1.2](architecture/20260806-v1.2-managed-adapter-distribution-architecture.md)
+- [Execution profile v2.2 contract](architecture/20260806-v2.2-execution-profile-contract.md)
 - [Managed adapter onboarding and distribution roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md)
 - [dbCAN runtime image release review v1.1](architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 

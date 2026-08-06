@@ -103,8 +103,12 @@ seqevi annotate \
   --output results/dbcan.duckdb
 ```
 
-The dispatcher and cleanup boundary are covered by fixture tests. The real
-local-v1 versus managed-v2 scientific equality run remains a release gate.
+The dispatcher and cleanup boundary are covered by fixture tests. Real
+direct-candidate versus managed-v2 scientific equality and later-process replay
+passed the release gate. A validation harness used an immutable local image ID
+built from the exact published inputs when site GHCR transport is unavailable;
+the public setup/profile surface remains pinned to the bundled GHCR digest and
+exposes no image override.
 
 The real local/shared Store acceptance for eggNOG and InterPro/Pfam is recorded
 in the [result-consumption runtime report](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md).
@@ -219,12 +223,13 @@ Start with [the documentation index](docs/README.md).
 - [DuckDB result-consumption runtime acceptance](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md)
 - [dbCAN runtime image release review](docs/architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
 
-Accepted managed-boundary documents; Slice B implements setup apply and smoke,
-while OCI execution remains a later slice:
+Accepted managed-boundary documents; Slice B setup and smoke plus Slice C OCI
+execution and real candidate acceptance are implemented, while v1 profiles
+remain compatible:
 
 - [Managed adapter onboarding roadmap v1.1](docs/implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md)
-- [Proposed managed-distribution architecture v1.1](docs/architecture/20260805-v1.1-managed-adapter-distribution-architecture.md)
-- [Proposed execution profile v2.1 contract](docs/architecture/20260805-v2.1-execution-profile-contract.md)
+- [Managed-distribution architecture v1.2](docs/architecture/20260806-v1.2-managed-adapter-distribution-architecture.md)
+- [Execution profile v2.2 contract](docs/architecture/20260806-v2.2-execution-profile-contract.md)
 
 ## Python And Result Discovery
 
