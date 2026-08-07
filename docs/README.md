@@ -38,6 +38,7 @@ later feature work.
 | dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; managed onboarding remains separate | [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [dbCAN plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
 | execution profiles | v1 host profiles remain compatible; managed v2.2 setup and OCI execution are implemented and accepted | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md), [managed profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
 | managed onboarding | dbCAN only for 0.2.0; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
+| shared Store cache seeding | approved staged execution plan; execution not started | [cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
 
 ## Start Here
 
@@ -76,6 +77,7 @@ later feature work.
 33. [Managed dbCAN next-gate validation](benchmarks/20260806-v1.2-dbcan-managed-next-gate-validation.md)
 34. [Managed dbCAN release-equivalent candidate gate](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md)
 35. [Managed dbCAN Slice D public release gate](benchmarks/20260806-v1.4-dbcan-public-release-gate.md)
+36. [Shared Store cache-seeding implementation plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md)
 
 ## Managed Boundary Contracts
 
