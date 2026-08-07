@@ -15,15 +15,13 @@ The target architecture and v1.1 result contracts are approved. The SeqEvi
 SQLite/POSIX Store, the external tool runner, exact cache-miss orchestration,
 and atomic DuckDB result materialization.
 
-The managed dbCAN public-user release gate is currently blocked: production
-PyPI has no `seqevi` project or `0.2.0` wheel, and this host did not complete
-the bundled public GHCR digest pull. An explicitly authorized TestPyPI staging
-wheel passed clean installation and negative-path checks, but staging and the
-earlier release-equivalent candidate do not substitute for the public gate. See
-the
+SeqEvi 0.2.0 provides managed setup for dbCAN only. The `eggnog` and
+`interpro-pfam` adapters remain supported through explicit runtimes and named
+host profiles; managed setup for them is later feature work. The
 [Slice D gate record](docs/benchmarks/20260806-v1.4-dbcan-public-release-gate.md)
-for the exact boundary. The commands below describe the implemented source
-contract; they are not a claim that the PyPI installation path has passed.
+preserves the incomplete original public-user run and its subsequent acceptance
+decision. In particular, a repeat pull from that run's site is a deferred
+transport check rather than a 0.2.0 release blocker.
 
 The `interpro-pfam` and eggNOG-mapper 2.x `eggnog` adapters are implemented with
 native-output validation and fixture parity coverage. The eggNOG adapter passes
@@ -80,8 +78,9 @@ environment variable names, never their values. The original complete
 templates remain available through `profile example --adapter ADAPTER`.
 
 These profile commands configure SeqEvi; they do not install annotation
-software or databases. The managed dbCAN runtime image is published by SeqEvi.
-Slice B now supports a read-only preview and an explicit apply:
+software or databases. Managed setup is available only for dbCAN and uses a
+runtime image published by SeqEvi. It supports a read-only preview and an
+explicit apply:
 
 ```bash
 seqevi setup dbcan-cazyme \
