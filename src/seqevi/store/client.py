@@ -9,9 +9,10 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from queue import Queue
 from typing import Any
 
 import httpx
@@ -661,13 +662,28 @@ class HttpEvidenceStore:
                 key=lambda item: min(claim.expires_at for claim in item[1]),
             )
             renewed_by_index: dict[int, tuple[EvidenceClaim, ...]] = {}
-            futures = {
-                self._renewal_executor.submit(self._renew_indexed_claim_chunk, item)
-                for item in scheduled
-            }
+            completed: Queue[Future[tuple[int, tuple[EvidenceClaim, ...]]]] = Queue()
+            futures: set[Future[tuple[int, tuple[EvidenceClaim, ...]]]] = set()
             try:
-                for future in as_completed(futures):
-                    index, renewed_chunk = future.result()
+                for item in scheduled:
+                    future = self._renewal_executor.submit(
+                        self._renew_indexed_claim_chunk, item
+                    )
+                    future.add_done_callback(completed.put)
+                    futures.add(future)
+            except RuntimeError as error:
+                for future in futures:
+                    future.cancel()
+                raise StoreError("shared Store closed during claim renewal") from error
+            try:
+                for _completed_count in range(len(futures)):
+                    future = completed.get()
+                    try:
+                        index, renewed_chunk = future.result()
+                    except CancelledError as error:
+                        raise StoreError(
+                            "shared Store closed during claim renewal"
+                        ) from error
                     renewed_by_index[index] = renewed_chunk
             except BaseException:
                 for future in futures:

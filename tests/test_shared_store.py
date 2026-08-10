@@ -1250,6 +1250,7 @@ def test_http_store_close_cancels_pending_renewal_then_drains_active_transport(
     )
     monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 1)
     active_started = threading.Event()
+    active_finished = threading.Event()
     release_active = threading.Event()
     request_count = 0
     request_lock = threading.Lock()
@@ -1280,6 +1281,7 @@ def test_http_store_close_cancels_pending_renewal_then_drains_active_transport(
             datetime.now(UTC) + timedelta(seconds=60),
             returned.renewal_after_seconds,
         )
+        active_finished.set()
         return httpx.Response(
             200,
             json={
@@ -1290,17 +1292,31 @@ def test_http_store_close_cancels_pending_renewal_then_drains_active_transport(
         )
 
     owned_client = _claim_mock_client(httpx.MockTransport(handler))
+    transport_closed_after_active: list[bool] = []
+    original_close = owned_client.close
+
+    def tracking_close() -> None:
+        transport_closed_after_active.append(active_finished.is_set())
+        original_close()
+
+    monkeypatch.setattr(owned_client, "close", tracking_close)
     monkeypatch.setattr(client_module.httpx, "Client", lambda **_kwargs: owned_client)
     store = HttpEvidenceStore("http://testserver")
-    active_future = store._renewal_executor.submit(  # pyright: ignore[reportPrivateUsage]
-        store._renew_claim_chunk,  # pyright: ignore[reportPrivateUsage]
-        (claims[0],),
-    )
+    renewal_errors: list[BaseException] = []
+
+    def renew() -> None:
+        try:
+            store.renew_many(claims)
+        except BaseException as error:
+            renewal_errors.append(error)
+
+    renewal_thread = threading.Thread(target=renew)
+    renewal_thread.start()
     assert active_started.wait(timeout=2)
-    pending_future = store._renewal_executor.submit(  # pyright: ignore[reportPrivateUsage]
-        store._renew_claim_chunk,  # pyright: ignore[reportPrivateUsage]
-        (claims[1],),
-    )
+    pending_deadline = time.monotonic() + 2
+    while store._renewal_executor._work_queue.qsize() != 1:  # pyright: ignore[reportPrivateUsage]
+        assert time.monotonic() < pending_deadline
+        time.sleep(0.001)
     close_thread = threading.Thread(target=store.close)
     close_thread.start()
     deadline = time.monotonic() + 2
@@ -1311,12 +1327,16 @@ def test_http_store_close_cancels_pending_renewal_then_drains_active_transport(
     assert not owned_client.is_closed
 
     release_active.set()
+    renewal_thread.join(timeout=3)
     close_thread.join(timeout=3)
 
+    assert not renewal_thread.is_alive()
     assert not close_thread.is_alive()
-    assert active_future.result(timeout=1)[0].key == claims[0].key
-    assert pending_future.cancelled()
     assert request_count == 1
+    assert len(renewal_errors) == 1
+    assert isinstance(renewal_errors[0], StoreError)
+    assert "closed during claim renewal" in str(renewal_errors[0])
+    assert transport_closed_after_active == [True]
     assert owned_client.is_closed
     assert not any(
         thread.name.startswith("seqevi-claim-renewal") and thread.is_alive()
