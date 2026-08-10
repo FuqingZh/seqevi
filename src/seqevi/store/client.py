@@ -61,6 +61,9 @@ from .transport import (
     LookupResponse,
 )
 
+_CLAIM_RUNWAY_SECONDS = 5.0
+_HANDOFF_SCHEDULING_SECONDS = 1.0
+
 
 class _ChunkAcquireRenewer:
     """Keep early HTTP acquisition chunks alive until the whole call returns."""
@@ -84,7 +87,7 @@ class _ChunkAcquireRenewer:
         with self._lock:
             self._claims[claim.key] = claim
             self._queries[claim.key] = query
-            self._deadlines[claim.key] = time.monotonic() + claim.renewal_after_seconds
+            self._deadlines[claim.key] = time.monotonic() + _claim_renewal_delay(claim)
         self._changed.set()
 
     def stop(self) -> None:
@@ -112,6 +115,42 @@ class _ChunkAcquireRenewer:
             self._store.release_many(claims)
         except Exception:
             pass
+
+    def flush_unsafe(self) -> None:
+        """Synchronously refresh claims too close to expiry for safe handoff."""
+
+        with self._lock:
+            pending = tuple(
+                claim
+                for claim in self._claims.values()
+                if (claim.expires_at - datetime.now(UTC)).total_seconds()
+                <= _CLAIM_RUNWAY_SECONDS + _HANDOFF_SCHEDULING_SECONDS
+            )
+        while pending:
+            try:
+                renewed = self._store.renew_many(pending)
+            except EvidenceClaimLostError:
+                with self._lock:
+                    queries = tuple(self._queries[claim.key] for claim in pending)
+                terminal = self._store.lookup_many(queries)
+                if not terminal:
+                    raise
+                with self._lock:
+                    for key, record in terminal.items():
+                        self._claims.pop(key, None)
+                        self._queries.pop(key, None)
+                        self._deadlines.pop(key, None)
+                        self._terminal[key] = record
+                pending = tuple(claim for claim in pending if claim.key not in terminal)
+            else:
+                with self._lock:
+                    renewed_at = time.monotonic()
+                    for claim in renewed:
+                        self._claims[claim.key] = claim
+                        self._deadlines[claim.key] = renewed_at + _claim_renewal_delay(
+                            claim
+                        )
+                return
 
     def _run(self) -> None:
         while not self._stopped.is_set():
@@ -161,16 +200,16 @@ class _ChunkAcquireRenewer:
             with self._lock:
                 renewed_at = time.monotonic()
                 for claim in renewed:
-                    if claim.expires_at <= datetime.now(UTC):
+                    if not _claim_has_runway(claim):
                         self._failure = EvidenceClaimLostError(
-                            "claim renewal returned expired authority"
+                            "claim renewal returned insufficient authority runway"
                         )
                         self._stopped.set()
                         return
                     if claim.key in self._claims:
                         self._claims[claim.key] = claim
-                        self._deadlines[claim.key] = (
-                            renewed_at + claim.renewal_after_seconds
+                        self._deadlines[claim.key] = renewed_at + _claim_renewal_delay(
+                            claim
                         )
 
 
@@ -389,16 +428,20 @@ class HttpEvidenceStore:
         renewer.stop()
         try:
             renewer.raise_if_failed()
+            renewer.flush_unsafe()
         except BaseException:
             renewer.release_best_effort()
             raise
         current = renewer.claims()
         terminal = renewer.terminal_records()
         completion_time = datetime.now(UTC)
-        if any(claim.expires_at <= completion_time for claim in current.values()):
+        if any(
+            (claim.expires_at - completion_time).total_seconds() < _CLAIM_RUNWAY_SECONDS
+            for claim in current.values()
+        ):
             renewer.release_best_effort()
             raise EvidenceClaimLostError(
-                "claim acquisition completed with expired authority"
+                "claim acquisition completed without a safe authority runway"
             )
         return tuple(
             ClaimAcquireResult(
@@ -586,9 +629,9 @@ class HttpEvidenceStore:
             with ThreadPoolExecutor(max_workers=min(len(chunks), 32)) as executor:
                 renewed_chunks = tuple(executor.map(self._renew_claim_chunk, chunks))
             renewed = tuple(claim for chunk in renewed_chunks for claim in chunk)
-            if any(claim.expires_at <= datetime.now(UTC) for claim in renewed):
+            if any(not _claim_has_runway(claim) for claim in renewed):
                 raise EvidenceClaimLostError(
-                    "claim renewal completed with expired authority"
+                    "claim renewal completed without a safe authority runway"
                 )
             return renewed
         for offset in range(0, len(claims), maximum):
@@ -703,6 +746,20 @@ class HttpEvidenceStore:
 def _validate_owner_token(owner_token: str) -> None:
     if not owner_token or len(owner_token) > 255:
         raise ValueError("owner_token must contain 1 to 255 characters")
+
+
+def _claim_renewal_delay(claim: EvidenceClaim) -> float:
+    remaining = (claim.expires_at - datetime.now(UTC)).total_seconds()
+    return max(
+        0.0,
+        min(claim.renewal_after_seconds, remaining - _CLAIM_RUNWAY_SECONDS),
+    )
+
+
+def _claim_has_runway(claim: EvidenceClaim) -> bool:
+    return (
+        claim.expires_at - datetime.now(UTC)
+    ).total_seconds() >= _CLAIM_RUNWAY_SECONDS
 
 
 def _file_chunks(path: Path) -> Iterator[bytes]:

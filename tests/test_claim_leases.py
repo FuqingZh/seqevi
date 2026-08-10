@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import time
 from typing import cast
 
 import pytest
@@ -250,6 +251,66 @@ def test_sqlite_refreshes_renewal_expiry_after_later_item_delay(
 
     assert delay_finished is not None
     assert all(claim.expires_at > delay_finished for claim in renewed)
+
+
+@pytest.mark.parametrize("operation", ["acquire", "renew"])
+def test_sqlite_tail_refresh_uses_one_shared_deadline_after_update_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    monkeypatch.setattr("seqevi.store.local._CLAIM_LEASE_SECONDS", 0.2)
+    commits = (
+        make_hit_commit("MTAILFIRST", artifact_dir=tmp_path / "first"),
+        make_hit_commit("MTAILSECOND", artifact_dir=tmp_path / "second"),
+    )
+    queries = tuple(EvidenceQuery(commit.identity, commit.key) for commit in commits)
+    with LocalStore.open(tmp_path / "store") as store:
+        initial = None
+        if operation == "renew":
+            initial = store.acquire_many(queries, owner_token="owner")
+        delay_finished: datetime | None = None
+
+        def delay_after_shared_refresh(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: object,
+        ) -> None:
+            nonlocal delay_finished
+            if (
+                delay_finished is None
+                and statement.lstrip().startswith("UPDATE evidence_claim")
+                and " OR " in statement
+            ):
+                time.sleep(0.1)
+                delay_finished = datetime.now(UTC)
+
+        event.listen(store.engine, "after_cursor_execute", delay_after_shared_refresh)
+        try:
+            if initial is None:
+                decisions = store.acquire_many(queries, owner_token="owner")
+                refreshed = tuple(
+                    decision.claim
+                    for decision in decisions
+                    if decision.claim is not None
+                )
+            else:
+                refreshed = store.renew_many(
+                    tuple(
+                        decision.claim
+                        for decision in initial
+                        if decision.claim is not None
+                    )
+                )
+        finally:
+            event.remove(
+                store.engine, "after_cursor_execute", delay_after_shared_refresh
+            )
+
+    assert delay_finished is not None
+    assert len({claim.expires_at for claim in refreshed}) == 1
+    assert all(claim.expires_at > delay_finished for claim in refreshed)
 
 
 def test_sqlite_renew_release_expiry_and_same_owner_takeover(tmp_path: Path) -> None:

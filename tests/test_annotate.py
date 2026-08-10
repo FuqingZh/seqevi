@@ -525,14 +525,17 @@ def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
     claims = tuple(
         EvidenceClaim(query.key, "owner", 1, expiry, 0.01) for query in queries
     )
-    first_chunk = {claim.key for claim in claims[:1_000]}
+    terminal_key = claims[0].key
+    first_chunk = {terminal_key}
     renewal_started = threading.Event()
     allow_renewal = threading.Event()
     remaining_renewed = threading.Event()
+    renewal_sizes: list[int] = []
 
     class RacingStore:
         def renew_many(self, requested):
             batch = tuple(requested)
+            renewal_sizes.append(len(batch))
             if any(claim.key in first_chunk for claim in batch):
                 renewal_started.set()
                 assert allow_renewal.wait(10)
@@ -562,16 +565,67 @@ def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
     )
     renewer.__enter__()
     assert renewal_started.wait(10)
+    assert remaining_renewed.wait(10)
     renewer.complete(first_chunk)
     allow_renewal.set()
-    assert remaining_renewed.wait(10)
     renewer.mark_finalized()
     renewer.__exit__(None, None, None)
 
     assert {claim.key for claim in renewer.active_claims()} == {
-        claim.key for claim in claims[1_000:]
+        claim.key for claim in claims[1:]
     }
-    assert set(renewer.queries_by_key) == {claim.key for claim in claims[1_000:]}
+    assert set(renewer.queries_by_key) == {claim.key for claim in claims[1:]}
+    assert sorted(renewal_sizes) == [500, 999, 1_000]
+
+
+def test_invocation_renewer_uses_near_expiry_before_long_cadence(
+    tmp_path: Path,
+) -> None:
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    identity = identify_protein_sequence("MNEAREXPIRY")
+    query = EvidenceQuery(identity, adapter.contract.evidence_key(identity))
+    claim = EvidenceClaim(
+        query.key,
+        "owner",
+        1,
+        datetime.now(UTC) + timedelta(seconds=0.05),
+        20.0,
+    )
+    renewed = threading.Event()
+
+    class RecordingStore:
+        def renew_many(self, requested):
+            current = tuple(requested)
+            renewed.set()
+            return tuple(
+                EvidenceClaim(
+                    item.key,
+                    item.owner_token,
+                    item.generation,
+                    datetime.now(UTC) + timedelta(seconds=60),
+                    20.0,
+                )
+                for item in current
+            )
+
+        def lookup_many(self, _requested):
+            return {}
+
+    renewer = annotate_module._LeaseRenewer(
+        RecordingStore(),  # type: ignore[arg-type]
+        (claim,),
+        {query.key: query},
+    )
+    renewer.__enter__()
+    assert renewed.wait(timeout=1)
+    renewer.mark_finalized()
+    renewer.__exit__(None, None, None)
+
+    refreshed = renewer.active_claims()[0]
+    assert refreshed.expires_at > datetime.now(UTC) + timedelta(seconds=30)
 
 
 def test_1500_annotation_renews_only_remaining_finalize_chunk(tmp_path: Path) -> None:
@@ -925,6 +979,8 @@ def test_claim_capable_10001_misses_use_two_tool_batches_and_drop_claims(
             self.claims: dict[EvidenceKey, EvidenceClaim] = {}
             self.finalized_keys: list[EvidenceKey] = []
             self.released_keys: list[EvidenceKey] = []
+            self.acquire_sizes: list[int] = []
+            self.finalize_sizes: list[int] = []
 
         def lookup_many(self, queries):
             return {
@@ -943,6 +999,8 @@ def test_claim_capable_10001_misses_use_two_tool_batches_and_drop_claims(
             return self.records.get(key)
 
         def acquire_many(self, queries, *, owner_token: str):
+            queries = tuple(queries)
+            self.acquire_sizes.append(len(queries))
             results = []
             for query in queries:
                 claim = EvidenceClaim(
@@ -969,6 +1027,7 @@ def test_claim_capable_10001_misses_use_two_tool_batches_and_drop_claims(
 
         def finalize_many(self, proposed):
             requested = tuple(proposed)
+            self.finalize_sizes.append(len(requested))
             self.finalized_keys.extend(item.commit.key for item in requested)
             for item in requested:
                 commit = item.commit
@@ -1006,6 +1065,10 @@ def test_claim_capable_10001_misses_use_two_tool_batches_and_drop_claims(
     assert len(set(store.finalized_keys)) == 10_001
     assert store.released_keys == []
     assert store.claims == {}
+    assert sum(store.acquire_sizes) == 10_001
+    assert sum(store.finalize_sizes) == 10_001
+    assert max(store.acquire_sizes) <= 1_000
+    assert max(store.finalize_sizes) <= 1_000
 
 
 def test_completed_batch_is_reused_after_later_tool_batch_fails(

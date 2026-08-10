@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import and_, create_engine, delete, event, select, update
+from sqlalchemy import and_, create_engine, delete, event, or_, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping, URL
 
@@ -389,20 +389,37 @@ class LocalStore:
                                 ),
                             )
                         )
-                for index, result in enumerate(results):
-                    if result.claim is None:
-                        continue
+                authoritative = tuple(
+                    (index, result.claim)
+                    for index, result in enumerate(results)
+                    if result.claim is not None
+                )
+                expiry: datetime | None = None
+                if authoritative:
                     now = datetime.now(UTC)
                     expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
-                    connection.execute(
+                    refreshed = connection.execute(
                         update(evidence_claims)
-                        .where(_claim_exact_clause(result.claim))
+                        .where(
+                            or_(
+                                *(
+                                    _claim_exact_clause(claim)
+                                    for _index, claim in authoritative
+                                )
+                            )
+                        )
                         .values(expires_at=expiry, updated_at=now)
                     )
+                    if refreshed.rowcount != len(authoritative):
+                        raise EvidenceClaimLostError(
+                            "claim ownership changed during acquire refresh"
+                        )
+                for index, claim in authoritative:
+                    assert expiry is not None
                     results[index] = _acquired_result(
-                        result.claim.key,
-                        result.claim.owner_token,
-                        result.claim.generation,
+                        claim.key,
+                        claim.owner_token,
+                        claim.generation,
                         expiry,
                     )
                 connection.commit()
@@ -450,14 +467,21 @@ class LocalStore:
                             _CLAIM_RENEWAL_SECONDS,
                         )
                     )
-                for index, claim in enumerate(renewed):
+                expiry = None
+                if renewed:
                     now = datetime.now(UTC)
                     expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
-                    connection.execute(
+                    refreshed = connection.execute(
                         update(evidence_claims)
-                        .where(_claim_exact_clause(claim))
+                        .where(or_(*(_claim_exact_clause(claim) for claim in renewed)))
                         .values(expires_at=expiry, updated_at=now)
                     )
+                    if refreshed.rowcount != len(renewed):
+                        raise EvidenceClaimLostError(
+                            "claim ownership changed during renewal refresh"
+                        )
+                for index, claim in enumerate(renewed):
+                    assert expiry is not None
                     renewed[index] = EvidenceClaim(
                         claim.key,
                         claim.owner_token,

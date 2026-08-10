@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import and_, create_engine, delete, select, text, update
+from sqlalchemy import and_, create_engine, delete, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
@@ -356,19 +356,30 @@ class PostgresEvidencePersistence:
                         ClaimDisposition.CACHED, record=_record_from_row(terminal)
                     )
                     continue
+            authoritative = tuple(
+                result.claim for result in results.values() if result.claim is not None
+            )
+            if authoritative:
                 now = datetime.now(UTC)
                 expiry = now + timedelta(seconds=CLAIM_LEASE_SECONDS)
-                connection.execute(
+                refreshed = connection.execute(
                     update(evidence_claims)
-                    .where(_claim_exact_clause(result.claim))
+                    .where(
+                        or_(*(_claim_exact_clause(claim) for claim in authoritative))
+                    )
                     .values(expires_at=expiry, updated_at=now)
                 )
-                results[query.key] = _acquired_result(
-                    query.key,
-                    result.claim.owner_token,
-                    result.claim.generation,
-                    expiry,
-                )
+                if refreshed.rowcount != len(authoritative):
+                    raise EvidenceClaimLostError(
+                        "claim ownership changed during acquire refresh"
+                    )
+                for claim in authoritative:
+                    results[claim.key] = _acquired_result(
+                        claim.key,
+                        claim.owner_token,
+                        claim.generation,
+                        expiry,
+                    )
         return tuple(results[query.key] for query in requested)
 
     def renew_many(self, claims: Iterable[EvidenceClaim]) -> tuple[EvidenceClaim, ...]:
@@ -411,16 +422,23 @@ class PostgresEvidencePersistence:
                     expiry,
                     CLAIM_RENEWAL_SECONDS,
                 )
-            for claim in sorted(
-                renewed.values(), key=lambda item: _key_sort_value(item.key)
-            ):
+            expiry: datetime | None = None
+            if renewed:
                 now = datetime.now(UTC)
                 expiry = now + timedelta(seconds=CLAIM_LEASE_SECONDS)
-                connection.execute(
+                refreshed = connection.execute(
                     update(evidence_claims)
-                    .where(_claim_exact_clause(claim))
+                    .where(
+                        or_(*(_claim_exact_clause(claim) for claim in renewed.values()))
+                    )
                     .values(expires_at=expiry, updated_at=now)
                 )
+                if refreshed.rowcount != len(renewed):
+                    raise EvidenceClaimLostError(
+                        "claim ownership changed during renewal refresh"
+                    )
+            for claim in tuple(renewed.values()):
+                assert expiry is not None
                 renewed[claim.key] = EvidenceClaim(
                     claim.key,
                     claim.owner_token,

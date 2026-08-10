@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import batched
@@ -45,6 +46,7 @@ from .store.contract import (
 
 _STORE_BATCH_SIZE = 1_000
 _ANNOTATION_BATCH_SIZE = 10_000
+_CLAIM_RUNWAY_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -620,7 +622,12 @@ class _LeaseRenewer:
         self.store = store
         self.claims = {claim.key: claim for claim in claims}
         self.queries_by_key = dict(queries_by_key)
+        self.deadlines = {
+            claim.key: time.monotonic() + _claim_renewal_delay(claim)
+            for claim in claims
+        }
         self.stop = threading.Event()
+        self.changed = threading.Event()
         self.error: BaseException | None = None
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
@@ -639,6 +646,7 @@ class _LeaseRenewer:
         """Stop renewal without replacing an in-flight annotation failure."""
 
         self.stop.set()
+        self.changed.set()
         if self.thread is not None:
             self.thread.join()
 
@@ -654,6 +662,8 @@ class _LeaseRenewer:
         with self.lock:
             self.claims[claim.key] = claim
             self.queries_by_key[claim.key] = query
+            self.deadlines[claim.key] = time.monotonic() + _claim_renewal_delay(claim)
+        self.changed.set()
         self._start_if_needed()
 
     def complete(self, keys: Iterable[EvidenceKey]) -> None:
@@ -661,6 +671,7 @@ class _LeaseRenewer:
             for key in keys:
                 self.claims.pop(key, None)
                 self.queries_by_key.pop(key, None)
+                self.deadlines.pop(key, None)
 
     def active_claims(self) -> tuple[EvidenceClaim, ...]:
         with self.lock:
@@ -683,26 +694,28 @@ class _LeaseRenewer:
 
     def _run(self) -> None:
         while not self.stop.is_set():
+            self.changed.clear()
             with self.lock:
-                snapshot = tuple(self.claims.values())
-            cadence = (
-                min(claim.renewal_after_seconds for claim in snapshot)
-                if snapshot
-                else 1.0
-            )
-            if self.stop.wait(cadence):
-                return
+                now = time.monotonic()
+                due_keys = tuple(
+                    key
+                    for key, deadline in self.deadlines.items()
+                    if deadline <= now + 0.01
+                )
+                snapshot = tuple(
+                    (self.claims[key], self.queries_by_key[key]) for key in due_keys
+                )
+                next_deadline = min(self.deadlines.values(), default=now + 1.0)
+            if not snapshot:
+                self.changed.wait(max(0.0, next_deadline - time.monotonic()))
+                continue
             try:
-                with self.lock:
-                    snapshot = tuple(
-                        (claim, self.queries_by_key[key])
-                        for key, claim in self.claims.items()
-                    )
-                if not snapshot:
-                    continue
                 assert self.store is not None
-                for pair_batch in batched(snapshot, _STORE_BATCH_SIZE):
-                    self._renew_batch(pair_batch)
+                pair_batches = tuple(batched(snapshot, _STORE_BATCH_SIZE))
+                with ThreadPoolExecutor(
+                    max_workers=min(len(pair_batches), 32)
+                ) as executor:
+                    tuple(executor.map(self._renew_batch, pair_batches))
             except BaseException as error:
                 self.error = error
                 self.stop.set()
@@ -712,39 +725,52 @@ class _LeaseRenewer:
         self, pairs: tuple[tuple[EvidenceClaim, EvidenceQuery], ...]
     ) -> None:
         assert self.store is not None
-        claims = tuple(claim for claim, _query in pairs)
-        try:
-            renewed = self.store.renew_many(claims)
-        except EvidenceClaimLostError:
-            terminal: set[EvidenceKey] = set()
-            queries = tuple(query for _claim, query in pairs)
-            for query_batch in batched(queries, _STORE_BATCH_SIZE):
-                terminal.update(self.store.lookup_many(query_batch))
-            with self.lock:
-                for key in terminal:
-                    self.claims.pop(key, None)
-                    self.queries_by_key.pop(key, None)
-            remaining = tuple(pair for pair in pairs if pair[0].key not in terminal)
-            for claim, query in remaining:
-                try:
-                    renewed_one = self.store.renew_many((claim,))
-                except EvidenceClaimLostError:
-                    record = self.store.lookup_many((query,))
-                    if claim.key in record:
-                        with self.lock:
-                            self.claims.pop(claim.key, None)
-                            self.queries_by_key.pop(claim.key, None)
-                        continue
+        pending = pairs
+        while pending:
+            claims = tuple(claim for claim, _query in pending)
+            try:
+                renewed = self.store.renew_many(claims)
+            except EvidenceClaimLostError:
+                terminal: set[EvidenceKey] = set()
+                queries = tuple(query for _claim, query in pending)
+                for query_batch in batched(queries, _STORE_BATCH_SIZE):
+                    terminal.update(self.store.lookup_many(query_batch))
+                if not terminal:
                     raise
-                self._replace_renewed(renewed_one)
-        else:
-            self._replace_renewed(renewed)
+                with self.lock:
+                    for key in terminal:
+                        self.claims.pop(key, None)
+                        self.queries_by_key.pop(key, None)
+                        self.deadlines.pop(key, None)
+                pending = tuple(pair for pair in pending if pair[0].key not in terminal)
+            else:
+                self._replace_renewed(renewed)
+                return
 
     def _replace_renewed(self, renewed: tuple[EvidenceClaim, ...]) -> None:
+        if any(
+            (claim.expires_at - datetime.now(UTC)).total_seconds()
+            < _CLAIM_RUNWAY_SECONDS
+            for claim in renewed
+        ):
+            raise EvidenceClaimLostError(
+                "claim renewal completed without a safe authority runway"
+            )
         with self.lock:
             for claim in renewed:
                 if claim.key in self.claims:
                     self.claims[claim.key] = claim
+                    self.deadlines[claim.key] = time.monotonic() + _claim_renewal_delay(
+                        claim
+                    )
+
+
+def _claim_renewal_delay(claim: EvidenceClaim) -> float:
+    remaining = (claim.expires_at - datetime.now(UTC)).total_seconds()
+    return max(
+        0.0,
+        min(claim.renewal_after_seconds, remaining - _CLAIM_RUNWAY_SECONDS),
+    )
 
 
 def _release_active_claims(
