@@ -301,11 +301,12 @@ class LocalStore:
         if len({query.key for query in queries}) != len(queries):
             raise ValueError("acquire batch contains a duplicate evidence key")
         _validate_owner_token(owner_token)
-        results: list[ClaimAcquireResult] = []
+        ordered_queries = sorted(queries, key=lambda query: _key_sort_value(query.key))
+        results: dict[EvidenceKey, ClaimAcquireResult] = {}
         with self.engine.connect() as connection:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             try:
-                for query in queries:
+                for query in ordered_queries:
                     now = datetime.now(UTC)
                     expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
                     self._insert_sequence(connection, query.identity)
@@ -320,11 +321,9 @@ class LocalStore:
                         connection.execute(
                             delete(evidence_claims).where(_claim_key_clause(query.key))
                         )
-                        results.append(
-                            ClaimAcquireResult(
-                                ClaimDisposition.CACHED,
-                                record=self._record_from_row(terminal),
-                            )
+                        results[query.key] = ClaimAcquireResult(
+                            ClaimDisposition.CACHED,
+                            record=self._record_from_row(terminal),
                         )
                         continue
                     row = (
@@ -347,8 +346,8 @@ class LocalStore:
                                 updated_at=now,
                             )
                         )
-                        results.append(
-                            _acquired_result(query.key, owner_token, generation, expiry)
+                        results[query.key] = _acquired_result(
+                            query.key, owner_token, generation, expiry
                         )
                     elif (
                         row["owner_token"] == owner_token
@@ -360,8 +359,8 @@ class LocalStore:
                             .where(_claim_key_clause(query.key))
                             .values(expires_at=expiry, updated_at=now)
                         )
-                        results.append(
-                            _acquired_result(query.key, owner_token, generation, expiry)
+                        results[query.key] = _acquired_result(
+                            query.key, owner_token, generation, expiry
                         )
                     elif _as_utc(row["expires_at"]) <= now:
                         generation = row["generation"] + 1
@@ -375,23 +374,21 @@ class LocalStore:
                                 updated_at=now,
                             )
                         )
-                        results.append(
-                            _acquired_result(query.key, owner_token, generation, expiry)
+                        results[query.key] = _acquired_result(
+                            query.key, owner_token, generation, expiry
                         )
                     else:
-                        results.append(
-                            ClaimAcquireResult(
-                                ClaimDisposition.BUSY,
-                                busy=BusyEvidenceClaim(
-                                    query.key,
-                                    _as_utc(row["expires_at"]),
-                                    _CLAIM_RETRY_SECONDS,
-                                ),
-                            )
+                        results[query.key] = ClaimAcquireResult(
+                            ClaimDisposition.BUSY,
+                            busy=BusyEvidenceClaim(
+                                query.key,
+                                _as_utc(row["expires_at"]),
+                                _CLAIM_RETRY_SECONDS,
+                            ),
                         )
                 authoritative = tuple(
-                    (index, result.claim)
-                    for index, result in enumerate(results)
+                    result.claim
+                    for result in results.values()
                     if result.claim is not None
                 )
                 expiry: datetime | None = None
@@ -404,7 +401,7 @@ class LocalStore:
                             _claim_identity_tuple().in_(
                                 [
                                     _claim_identity_values(claim)
-                                    for _index, claim in authoritative
+                                    for claim in authoritative
                                 ]
                             )
                         )
@@ -414,9 +411,9 @@ class LocalStore:
                         raise EvidenceClaimLostError(
                             "claim ownership changed during acquire refresh"
                         )
-                for index, claim in authoritative:
+                for claim in authoritative:
                     assert expiry is not None
-                    results[index] = _acquired_result(
+                    results[claim.key] = _acquired_result(
                         claim.key,
                         claim.owner_token,
                         claim.generation,
@@ -426,7 +423,7 @@ class LocalStore:
             except Exception:
                 connection.rollback()
                 raise
-        return tuple(results)
+        return tuple(results[query.key] for query in queries)
 
     def renew_many(self, claims: Iterable[EvidenceClaim]) -> tuple[EvidenceClaim, ...]:
         """Renew exact current claim generations or reject stale ownership.
@@ -442,11 +439,12 @@ class LocalStore:
         requested = tuple(claims)
         if len({claim.key for claim in requested}) != len(requested):
             raise ValueError("claim renewal contains a duplicate evidence key")
-        renewed = []
+        ordered = sorted(requested, key=lambda claim: _key_sort_value(claim.key))
+        renewed: dict[EvidenceKey, EvidenceClaim] = {}
         with self.engine.connect() as connection:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             try:
-                for claim in requested:
+                for claim in ordered:
                     now = datetime.now(UTC)
                     expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
                     result = connection.execute(
@@ -458,14 +456,12 @@ class LocalStore:
                         raise EvidenceClaimLostError(
                             f"claim ownership was lost: {claim.key.sequence_id}"
                         )
-                    renewed.append(
-                        EvidenceClaim(
-                            claim.key,
-                            claim.owner_token,
-                            claim.generation,
-                            expiry,
-                            _CLAIM_RENEWAL_SECONDS,
-                        )
+                    renewed[claim.key] = EvidenceClaim(
+                        claim.key,
+                        claim.owner_token,
+                        claim.generation,
+                        expiry,
+                        _CLAIM_RENEWAL_SECONDS,
                     )
                 expiry = None
                 if renewed:
@@ -475,7 +471,10 @@ class LocalStore:
                         update(evidence_claims)
                         .where(
                             _claim_identity_tuple().in_(
-                                [_claim_identity_values(claim) for claim in renewed]
+                                [
+                                    _claim_identity_values(claim)
+                                    for claim in renewed.values()
+                                ]
                             )
                         )
                         .values(expires_at=expiry, updated_at=now)
@@ -484,9 +483,9 @@ class LocalStore:
                         raise EvidenceClaimLostError(
                             "claim ownership changed during renewal refresh"
                         )
-                for index, claim in enumerate(renewed):
+                for claim in tuple(renewed.values()):
                     assert expiry is not None
-                    renewed[index] = EvidenceClaim(
+                    renewed[claim.key] = EvidenceClaim(
                         claim.key,
                         claim.owner_token,
                         claim.generation,
@@ -497,7 +496,7 @@ class LocalStore:
             except Exception:
                 connection.rollback()
                 raise
-        return tuple(renewed)
+        return tuple(renewed[claim.key] for claim in requested)
 
     def release_many(self, claims: Iterable[EvidenceClaim]) -> None:
         """Release exact current claim generations and reject stale owners.
@@ -514,7 +513,9 @@ class LocalStore:
         with self.engine.connect() as connection:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             try:
-                for claim in requested:
+                for claim in sorted(
+                    requested, key=lambda item: _key_sort_value(item.key)
+                ):
                     now = datetime.now(UTC)
                     result = connection.execute(
                         update(evidence_claims)

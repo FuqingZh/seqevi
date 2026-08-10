@@ -776,12 +776,7 @@ def _claim_renewal_delay(claim: EvidenceClaim) -> float:
 def _release_active_claims(
     store: ClaimCapableEvidenceStore, claims: tuple[EvidenceClaim, ...]
 ) -> None:
-    for claim_batch in batched(claims, _STORE_BATCH_SIZE):
-        try:
-            store.release_many(claim_batch)
-        except Exception:
-            for claim in claim_batch:
-                try:
-                    store.release_many((claim,))
-                except Exception:
-                    continue
+    try:
+        store.release_many(claims)
+    except Exception:
+        pass

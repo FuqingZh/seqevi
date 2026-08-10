@@ -1087,6 +1087,59 @@ def test_http_renew_chunks_execute_concurrently_and_preserve_order() -> None:
     assert tuple(claim.key for claim in renewed) == tuple(claim.key for claim in claims)
 
 
+def test_http_renew_starts_every_due_chunk_without_executor_queue() -> None:
+    claims = tuple(
+        EvidenceClaim(
+            key,
+            "owner",
+            1,
+            datetime.now(UTC) + timedelta(seconds=60),
+            20.0,
+        )
+        for _identity, key in (
+            _key("MQUEUE" + "A" * (index + 1)) for index in range(33)
+        )
+    )
+    all_chunks_started = threading.Barrier(len(claims))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "maximum_batch_size": 1,
+                    "lease_seconds": 60.0,
+                    "renewal_after_seconds": 20.0,
+                },
+            )
+        body = json.loads(request.content)
+        all_chunks_started.wait(timeout=3)
+        returned = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
+        renewed = EvidenceClaim(
+            returned.key,
+            returned.owner_token,
+            returned.generation,
+            datetime.now(UTC) + timedelta(seconds=60),
+            returned.renewal_after_seconds,
+        )
+        return httpx.Response(
+            200,
+            json={
+                "claims": [
+                    EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
+                ]
+            },
+        )
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        renewed = store.renew_many(claims)
+
+    assert tuple(claim.key for claim in renewed) == tuple(claim.key for claim in claims)
+
+
 def test_http_renew_many_fails_instead_of_returning_stale_handles() -> None:
     _identity, key = _key("MSTALERENEW")
     claim = EvidenceClaim(

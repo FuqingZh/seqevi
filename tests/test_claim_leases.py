@@ -17,6 +17,7 @@ from seqevi.evidence import (
     ClaimDisposition,
     ClaimedEvidenceCommit,
     CommitOutcome,
+    EvidenceClaim,
     EvidenceQuery,
     EvidenceKey,
 )
@@ -119,6 +120,61 @@ def test_legacy_lookup_many_deduplicates_queries(tmp_path: Path) -> None:
         found = store.lookup_many((query, query))
 
     assert found == {query.key: found[query.key]}
+
+
+def test_local_claim_mutations_use_canonical_order_and_restore_caller_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commits = (
+        make_hit_commit("MORDERZ", artifact_dir=tmp_path / "sources-z"),
+        make_hit_commit("MORDERA", artifact_dir=tmp_path / "sources-a"),
+    )
+    queries = tuple(EvidenceQuery(commit.identity, commit.key) for commit in commits)
+    caller_queries = tuple(reversed(queries))
+    expected_keys = tuple(
+        sorted(
+            (query.key for query in queries),
+            key=local_module._key_sort_value,  # pyright: ignore[reportPrivateUsage]
+        )
+    )
+
+    with LocalStore.open(tmp_path / "store") as store:
+        inserted: list[EvidenceKey] = []
+        original_insert = store._insert_sequence  # pyright: ignore[reportPrivateUsage]
+
+        def recording_insert(connection, identity):
+            inserted.append(
+                next(query.key for query in queries if query.identity == identity)
+            )
+            return original_insert(connection, identity)
+
+        monkeypatch.setattr(store, "_insert_sequence", recording_insert)
+        acquired = store.acquire_many(caller_queries, owner_token="owner")
+        claims = tuple(result.claim for result in acquired)
+        assert all(claim is not None for claim in claims)
+        authoritative = cast(tuple[EvidenceClaim, ...], claims)
+        assert tuple(claim.key for claim in authoritative) == tuple(
+            query.key for query in caller_queries
+        )
+        assert tuple(inserted) == expected_keys
+
+        observed_owner_clauses: list[EvidenceKey] = []
+        original_owner_clause = local_module._claim_owner_clause  # pyright: ignore[reportPrivateUsage]
+
+        def recording_owner_clause(claim, now):
+            observed_owner_clauses.append(claim.key)
+            return original_owner_clause(claim, now)
+
+        monkeypatch.setattr(local_module, "_claim_owner_clause", recording_owner_clause)
+        renewed = store.renew_many(authoritative)
+        assert tuple(claim.key for claim in renewed) == tuple(
+            claim.key for claim in authoritative
+        )
+        assert tuple(observed_owner_clauses) == expected_keys
+
+        observed_owner_clauses.clear()
+        store.release_many(renewed)
+        assert tuple(observed_owner_clauses) == expected_keys
 
 
 def test_legacy_commit_retires_active_local_claim(tmp_path: Path) -> None:

@@ -648,7 +648,9 @@ class HttpEvidenceStore:
             )
             if not chunks:
                 return ()
-            with ThreadPoolExecutor(max_workers=min(len(chunks), 32)) as executor:
+            # Every service chunk is already due. Give each one a worker so a
+            # local executor queue cannot consume the remaining lease runway.
+            with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
                 renewed_chunks = tuple(executor.map(self._renew_claim_chunk, chunks))
             renewed = tuple(claim for chunk in renewed_chunks for claim in chunk)
             if any(not _claim_has_runway(claim) for claim in renewed):

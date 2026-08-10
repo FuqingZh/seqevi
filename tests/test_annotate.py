@@ -180,6 +180,39 @@ def write_input(path: Path) -> Path:
     return path
 
 
+def test_failed_cleanup_makes_one_bounded_logical_release_attempt() -> None:
+    identity = identify_protein_sequence("MBOUNDEDCLEANUP")
+    key = EvidenceKey.from_parameters(
+        sequence_id=identity.sequence_id,
+        adapter_contract_version="fixture/v1",
+        tool_runtime_digest="sha256:" + "a" * 64,
+        resource_id="fixture-resource",
+        semantic_parameters={},
+    )
+    claim = EvidenceClaim(
+        key,
+        "owner",
+        1,
+        datetime.now(UTC) + timedelta(seconds=60),
+        20.0,
+    )
+
+    class FailingReleaseStore:
+        calls: list[int] = []
+
+        def release_many(self, claims):
+            self.calls.append(len(tuple(claims)))
+            raise EvidenceClaimLostError("cleanup unavailable")
+
+    store = FailingReleaseStore()
+    annotate_module._release_active_claims(  # pyright: ignore[reportPrivateUsage]
+        store,  # type: ignore[arg-type]
+        (claim,) * 10_000,
+    )
+
+    assert store.calls == [10_000]
+
+
 def test_annotation_materializes_complete_result_and_reuses_cache(
     tmp_path: Path,
 ) -> None:
