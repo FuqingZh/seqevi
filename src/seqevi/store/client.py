@@ -126,6 +126,10 @@ class _ChunkAcquireRenewer:
                 if (claim.expires_at - datetime.now(UTC)).total_seconds()
                 <= _CLAIM_RUNWAY_SECONDS + _HANDOFF_SCHEDULING_SECONDS
             )
+        if any(claim.expires_at <= datetime.now(UTC) for claim in pending):
+            raise EvidenceClaimLostError(
+                "claim acquisition received an expired authority runway"
+            )
         while pending:
             try:
                 renewed = self._store.renew_many(pending)
