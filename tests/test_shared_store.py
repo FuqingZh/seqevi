@@ -746,7 +746,7 @@ def test_http_claim_chunks_renew_early_authority_while_acquisition_blocks() -> N
                 200,
                 json={
                     "maximum_batch_size": 1,
-                    "lease_seconds": 1.0,
+                    "lease_seconds": 60.0,
                     "renewal_after_seconds": 20.0,
                 },
             )
@@ -871,6 +871,120 @@ def test_http_single_final_chunk_flushes_near_expiry_without_daemon_race(
     assert result.claim.expires_at > datetime.now(UTC) + timedelta(seconds=30)
 
 
+def test_http_final_flush_reconciles_expired_terminal_and_renews_live_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal_identity, terminal_key = _key("MFLUSHTERMINAL")
+    live_identity, live_key = _key("MFLUSHLIVE")
+    terminal = EvidenceRecord(
+        terminal_key,
+        EvidenceStatus.NO_HIT,
+        sha256_digest(b"flush-terminal"),
+        None,
+        None,
+        datetime.now(UTC),
+    )
+    renewed_keys: list[EvidenceKey] = []
+    monkeypatch.setattr(
+        client_module._ChunkAcquireRenewer,  # pyright: ignore[reportPrivateUsage]
+        "_run",
+        lambda self: self._stopped.wait(),  # pyright: ignore[reportPrivateUsage]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        body = json.loads(request.content)
+        if request.url.path.endswith("/lookup"):
+            requested = tuple(
+                EvidenceQueryModel.model_validate(data).to_domain()
+                for data in body["queries"]
+            )
+            assert tuple(query.key for query in requested) == (terminal_key,)
+            return httpx.Response(
+                200,
+                json={
+                    "records": [
+                        EvidenceRecordModel.from_domain(terminal).model_dump(
+                            mode="json"
+                        )
+                    ]
+                },
+            )
+        if request.url.path.endswith("/renew"):
+            claims = tuple(
+                EvidenceClaimModel.model_validate(data).to_domain()
+                for data in body["claims"]
+            )
+            renewed_keys.extend(claim.key for claim in claims)
+            refreshed = tuple(
+                EvidenceClaim(
+                    claim.key,
+                    claim.owner_token,
+                    claim.generation,
+                    datetime.now(UTC) + timedelta(seconds=60),
+                    20.0,
+                )
+                for claim in claims
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "claims": [
+                        EvidenceClaimModel.from_domain(claim).model_dump(mode="json")
+                        for claim in refreshed
+                    ]
+                },
+            )
+        queries = tuple(
+            EvidenceQueryModel.model_validate(data).to_domain()
+            for data in body["queries"]
+        )
+        expires = (
+            datetime.now(UTC) - timedelta(milliseconds=1),
+            datetime.now(UTC) + timedelta(seconds=1),
+        )
+        results = tuple(
+            ClaimAcquireResult(
+                ClaimDisposition.ACQUIRED,
+                claim=EvidenceClaim(
+                    query.key,
+                    body["owner_token"],
+                    1,
+                    expiry,
+                    20.0,
+                ),
+            )
+            for query, expiry in zip(queries, expires, strict=True)
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    ClaimAcquireResultModel.from_domain(result).model_dump(mode="json")
+                    for result in results
+                ]
+            },
+        )
+
+    queries = (
+        EvidenceQuery(terminal_identity, terminal_key),
+        EvidenceQuery(live_identity, live_key),
+    )
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        results = store.acquire_many(queries, owner_token="owner")
+
+    assert results[0].disposition is ClaimDisposition.CACHED
+    assert results[0].record == terminal
+    assert results[1].disposition is ClaimDisposition.ACQUIRED
+    assert results[1].claim is not None
+    assert results[1].claim.expires_at > datetime.now(UTC) + timedelta(seconds=30)
+    assert renewed_keys == [live_key]
+
+
 def test_http_claim_chunk_additions_cannot_postpone_due_renewal() -> None:
     queries = tuple(
         EvidenceQuery(identity, key)
@@ -888,7 +1002,7 @@ def test_http_claim_chunk_additions_cannot_postpone_due_renewal() -> None:
                 200,
                 json={
                     "maximum_batch_size": 1,
-                    "lease_seconds": 1.0,
+                    "lease_seconds": 60.0,
                     "renewal_after_seconds": 0.01,
                 },
             )
@@ -1039,7 +1153,7 @@ def test_http_chunk_acquire_reconciles_terminal_winner_during_renewal() -> None:
                 200,
                 json={
                     "maximum_batch_size": 1,
-                    "lease_seconds": 1.0,
+                    "lease_seconds": 60.0,
                     "renewal_after_seconds": 0.01,
                 },
             )
@@ -1132,7 +1246,7 @@ def test_http_chunk_acquire_propagates_lookup_failure_and_releases_claim() -> No
                 200,
                 json={
                     "maximum_batch_size": 1,
-                    "lease_seconds": 1.0,
+                    "lease_seconds": 60.0,
                     "renewal_after_seconds": 0.01,
                 },
             )
@@ -1262,7 +1376,7 @@ def test_http_background_renew_failure_releases_acquired_chunks() -> None:
                 200,
                 json={
                     "maximum_batch_size": 1,
-                    "lease_seconds": 1.0,
+                    "lease_seconds": 60.0,
                     "renewal_after_seconds": 0.01,
                 },
             )

@@ -122,17 +122,32 @@ class _ChunkAcquireRenewer:
     def flush_unsafe(self) -> None:
         """Synchronously refresh claims too close to expiry for safe handoff."""
 
+        now = datetime.now(UTC)
         with self._lock:
             pending = tuple(
                 claim
                 for claim in self._claims.values()
-                if (claim.expires_at - datetime.now(UTC)).total_seconds()
+                if (claim.expires_at - now).total_seconds()
                 <= _CLAIM_RUNWAY_SECONDS + _HANDOFF_SCHEDULING_SECONDS
             )
-        if any(claim.expires_at <= datetime.now(UTC) for claim in pending):
-            raise EvidenceClaimLostError(
-                "claim acquisition received an expired authority runway"
+            expired = tuple(claim for claim in pending if claim.expires_at <= now)
+            expired_queries = tuple(self._queries[claim.key] for claim in expired)
+        if expired:
+            terminal = self._store.lookup_many(expired_queries)
+            with self._lock:
+                for key, record in terminal.items():
+                    self._claims.pop(key, None)
+                    self._queries.pop(key, None)
+                    self._deadlines.pop(key, None)
+                    self._terminal[key] = record
+            expired_nonterminal = tuple(
+                claim for claim in expired if claim.key not in terminal
             )
+            if expired_nonterminal:
+                raise EvidenceClaimLostError(
+                    "claim acquisition received an expired authority runway"
+                )
+            pending = tuple(claim for claim in pending if claim.key not in terminal)
         while pending:
             try:
                 renewed = self._store.renew_many(pending)
