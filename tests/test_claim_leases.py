@@ -160,6 +160,7 @@ def test_sqlite_refreshes_acquire_expiry_after_later_item_delay(
     queries = tuple(EvidenceQuery(commit.identity, commit.key) for commit in commits)
     with LocalStore.open(tmp_path / "store") as store:
         claim_selects = 0
+        delay_finished: datetime | None = None
 
         def delay_second_claim_select(
             _connection: object,
@@ -169,7 +170,7 @@ def test_sqlite_refreshes_acquire_expiry_after_later_item_delay(
             _context: object,
             _executemany: object,
         ) -> None:
-            nonlocal claim_selects
+            nonlocal claim_selects, delay_finished
             if "FROM evidence_claim" not in statement:
                 return
             claim_selects += 1
@@ -177,6 +178,7 @@ def test_sqlite_refreshes_acquire_expiry_after_later_item_delay(
                 import time
 
                 time.sleep(0.1)
+                delay_finished = datetime.now(UTC)
 
         event.listen(store.engine, "before_cursor_execute", delay_second_claim_select)
         try:
@@ -188,7 +190,8 @@ def test_sqlite_refreshes_acquire_expiry_after_later_item_delay(
 
     claims = tuple(result.claim for result in results)
     assert all(claim is not None for claim in claims)
-    assert all(claim.expires_at > datetime.now(UTC) for claim in claims if claim)
+    assert delay_finished is not None
+    assert all(claim.expires_at > delay_finished for claim in claims if claim)
 
 
 def test_sqlite_refreshes_renewal_expiry_after_later_item_delay(
@@ -205,6 +208,7 @@ def test_sqlite_refreshes_renewal_expiry_after_later_item_delay(
         claims = tuple(result.claim for result in acquired)
         assert all(claim is not None for claim in claims)
         claim_updates = 0
+        delay_finished: datetime | None = None
 
         def delay_second_claim_update(
             _connection: object,
@@ -214,7 +218,7 @@ def test_sqlite_refreshes_renewal_expiry_after_later_item_delay(
             _context: object,
             _executemany: object,
         ) -> None:
-            nonlocal claim_updates
+            nonlocal claim_updates, delay_finished
             if not statement.lstrip().startswith("UPDATE evidence_claim"):
                 return
             claim_updates += 1
@@ -222,6 +226,7 @@ def test_sqlite_refreshes_renewal_expiry_after_later_item_delay(
                 import time
 
                 time.sleep(0.1)
+                delay_finished = datetime.now(UTC)
 
         event.listen(store.engine, "before_cursor_execute", delay_second_claim_update)
         try:
@@ -233,7 +238,8 @@ def test_sqlite_refreshes_renewal_expiry_after_later_item_delay(
                 store.engine, "before_cursor_execute", delay_second_claim_update
             )
 
-    assert all(claim.expires_at > datetime.now(UTC) for claim in renewed)
+    assert delay_finished is not None
+    assert all(claim.expires_at > delay_finished for claim in renewed)
 
 
 def test_sqlite_renew_release_expiry_and_same_owner_takeover(tmp_path: Path) -> None:
