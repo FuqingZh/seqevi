@@ -707,13 +707,17 @@ class HttpEvidenceStore:
     def _renew_claim_chunk(
         self, chunk: tuple[EvidenceClaim, ...]
     ) -> tuple[EvidenceClaim, ...]:
+        remaining = min(
+            (claim.expires_at - datetime.now(UTC)).total_seconds() for claim in chunk
+        )
+        request_budget = (
+            remaining - _CLAIM_RUNWAY_SECONDS
+            if remaining > _CLAIM_RUNWAY_SECONDS
+            else remaining
+        )
         timeout = min(
             self._timeout_seconds,
-            min(
-                (claim.expires_at - datetime.now(UTC)).total_seconds()
-                - _CLAIM_RUNWAY_SECONDS
-                for claim in chunk
-            ),
+            request_budget,
         )
         if timeout <= 0:
             raise EvidenceClaimLostError(
