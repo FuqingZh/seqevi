@@ -1158,6 +1158,83 @@ def test_http_renew_bounded_scheduler_drains_fast_slots_before_blocked_chunk() -
     assert maximum_active <= 32
 
 
+def test_http_renew_shared_executor_bounds_concurrent_logical_calls() -> None:
+    claim_groups = tuple(
+        tuple(
+            EvidenceClaim(
+                key,
+                "owner",
+                1,
+                datetime.now(UTC) + timedelta(seconds=60),
+                20.0,
+            )
+            for _identity, key in (
+                _key("MSHARED" + letter + "A" * (index + 1)) for index in range(20)
+            )
+        )
+        for letter in "ABCD"
+    )
+    active = 0
+    maximum_active = 0
+    active_lock = threading.Lock()
+    callers_ready = threading.Barrier(len(claim_groups))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "maximum_batch_size": 1,
+                    "lease_seconds": 60.0,
+                    "renewal_after_seconds": 20.0,
+                },
+            )
+        body = json.loads(request.content)
+        returned = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
+        with active_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            time.sleep(0.02)
+            renewed = EvidenceClaim(
+                returned.key,
+                returned.owner_token,
+                returned.generation,
+                datetime.now(UTC) + timedelta(seconds=60),
+                returned.renewal_after_seconds,
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "claims": [
+                        EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
+                    ]
+                },
+            )
+        finally:
+            with active_lock:
+                active -= 1
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+
+        def renew_group(group):
+            callers_ready.wait(timeout=2)
+            return store.renew_many(group)
+
+        with ThreadPoolExecutor(max_workers=len(claim_groups)) as callers:
+            results = tuple(callers.map(renew_group, claim_groups))
+
+    assert maximum_active <= 32
+    assert maximum_active > 1
+    assert tuple(tuple(claim.key for claim in group) for group in results) == tuple(
+        tuple(claim.key for claim in group) for group in claim_groups
+    )
+
+
 def test_http_renew_bounded_overload_fails_before_stale_chunk_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -292,6 +292,10 @@ class HttpEvidenceStore:
             self._claim_capabilities = ClaimCapabilitiesResponse.model_validate(
                 capability_response.json()
             )
+        self._renewal_executor = ThreadPoolExecutor(
+            max_workers=_MAX_CONCURRENT_CLAIM_REQUESTS,
+            thread_name_prefix="seqevi-claim-renewal",
+        )
 
     @property
     def supports_claims(self) -> bool:
@@ -308,10 +312,13 @@ class HttpEvidenceStore:
 
     def close(self) -> None:
         try:
-            if self._owns_client:
-                self.client.close()
+            self._renewal_executor.shutdown(wait=True, cancel_futures=True)
         finally:
-            self._download_directory.cleanup()
+            try:
+                if self._owns_client:
+                    self.client.close()
+            finally:
+                self._download_directory.cleanup()
 
     def __enter__(self) -> HttpEvidenceStore:
         return self
@@ -654,21 +661,18 @@ class HttpEvidenceStore:
                 key=lambda item: min(claim.expires_at for claim in item[1]),
             )
             renewed_by_index: dict[int, tuple[EvidenceClaim, ...]] = {}
-            with ThreadPoolExecutor(
-                max_workers=min(len(chunks), _MAX_CONCURRENT_CLAIM_REQUESTS)
-            ) as executor:
-                futures = {
-                    executor.submit(self._renew_indexed_claim_chunk, item)
-                    for item in scheduled
-                }
-                try:
-                    for future in as_completed(futures):
-                        index, renewed_chunk = future.result()
-                        renewed_by_index[index] = renewed_chunk
-                except BaseException:
-                    for future in futures:
-                        future.cancel()
-                    raise
+            futures = {
+                self._renewal_executor.submit(self._renew_indexed_claim_chunk, item)
+                for item in scheduled
+            }
+            try:
+                for future in as_completed(futures):
+                    index, renewed_chunk = future.result()
+                    renewed_by_index[index] = renewed_chunk
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
             renewed_chunks = tuple(
                 renewed_by_index[index] for index in range(len(chunks))
             )
