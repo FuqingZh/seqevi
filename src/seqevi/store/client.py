@@ -707,17 +707,9 @@ class HttpEvidenceStore:
     def _renew_claim_chunk(
         self, chunk: tuple[EvidenceClaim, ...]
     ) -> tuple[EvidenceClaim, ...]:
-        remaining = min(
-            (claim.expires_at - datetime.now(UTC)).total_seconds() for claim in chunk
-        )
-        request_budget = (
-            remaining - _CLAIM_RUNWAY_SECONDS
-            if remaining > _CLAIM_RUNWAY_SECONDS
-            else remaining
-        )
         timeout = min(
             self._timeout_seconds,
-            request_budget,
+            _claim_request_budget(chunk),
         )
         if timeout <= 0:
             raise EvidenceClaimLostError(
@@ -827,6 +819,15 @@ def _claim_has_runway(claim: EvidenceClaim) -> bool:
     return (
         claim.expires_at - datetime.now(UTC)
     ).total_seconds() >= _CLAIM_RUNWAY_SECONDS
+
+
+def _claim_request_budget(claims: tuple[EvidenceClaim, ...]) -> float:
+    remaining = min(
+        (claim.expires_at - datetime.now(UTC)).total_seconds() for claim in claims
+    )
+    if remaining > _CLAIM_RUNWAY_SECONDS:
+        return remaining - _CLAIM_RUNWAY_SECONDS
+    return remaining
 
 
 def _file_chunks(path: Path) -> Iterator[bytes]:

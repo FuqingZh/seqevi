@@ -1158,8 +1158,10 @@ def test_http_renew_bounded_scheduler_drains_fast_slots_before_blocked_chunk() -
     assert maximum_active <= 32
 
 
-def test_http_renew_bounded_overload_fails_before_stale_chunk_starts() -> None:
-    expiry = datetime.now(UTC) + timedelta(seconds=6)
+def test_http_renew_bounded_overload_fails_before_stale_chunk_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expiry = datetime.now(UTC) + timedelta(seconds=60)
     claims = tuple(
         EvidenceClaim(key, "owner", 1, expiry, 20.0)
         for _identity, key in (
@@ -1171,6 +1173,14 @@ def test_http_renew_bounded_overload_fails_before_stale_chunk_starts() -> None:
     maximum_active = 0
     request_count = 0
     active_lock = threading.Lock()
+    original_budget = client_module._claim_request_budget  # pyright: ignore[reportPrivateUsage]
+
+    def controlled_budget(chunk):
+        if chunk[0].key == claims[-1].key:
+            return -1.0
+        return original_budget(chunk)
+
+    monkeypatch.setattr(client_module, "_claim_request_budget", controlled_budget)
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal active, maximum_active, request_count
@@ -1193,7 +1203,6 @@ def test_http_renew_bounded_overload_fails_before_stale_chunk_starts() -> None:
             maximum_active = max(maximum_active, active)
         try:
             first_wave.wait(timeout=3)
-            time.sleep(1.1)
             renewed = EvidenceClaim(
                 returned.key,
                 returned.owner_token,
