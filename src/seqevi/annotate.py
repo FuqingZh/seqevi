@@ -9,7 +9,6 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import batched
@@ -716,21 +715,7 @@ class _LeaseRenewer:
                 continue
             try:
                 assert self.store is not None
-                pair_batches = tuple(batched(snapshot, _STORE_BATCH_SIZE))
-                with ThreadPoolExecutor(
-                    max_workers=min(len(pair_batches), 32)
-                ) as executor:
-                    futures = {
-                        executor.submit(self._renew_batch, pair_batch)
-                        for pair_batch in pair_batches
-                    }
-                    try:
-                        for future in as_completed(futures):
-                            future.result()
-                    except BaseException:
-                        for future in futures:
-                            future.cancel()
-                        raise
+                self._renew_batch(snapshot)
             except BaseException as error:
                 self.error = error
                 self.stop.set()

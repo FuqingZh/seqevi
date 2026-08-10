@@ -573,7 +573,7 @@ def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
                 renewal_started.set()
                 assert allow_renewal.wait(10)
                 raise EvidenceClaimLostError("finalized chunk")
-            if len(batch) == 500:
+            if len(batch) == 1_499:
                 remaining_renewed.set()
             return batch
 
@@ -598,9 +598,9 @@ def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
     )
     renewer.__enter__()
     assert renewal_started.wait(10)
-    assert remaining_renewed.wait(10)
     renewer.complete(first_chunk)
     allow_renewal.set()
+    assert remaining_renewed.wait(10)
     renewer.mark_finalized()
     renewer.__exit__(None, None, None)
 
@@ -608,10 +608,10 @@ def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
         claim.key for claim in claims[1:]
     }
     assert set(renewer.queries_by_key) == {claim.key for claim in claims[1:]}
-    assert sorted(renewal_sizes) == [500, 999, 1_000]
+    assert renewal_sizes == [1_500, 1_499]
 
 
-def test_invocation_renewer_submits_outer_batches_by_absolute_deadline(
+def test_invocation_renewer_submits_full_snapshot_by_absolute_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(annotate_module, "_STORE_BATCH_SIZE", 2)
@@ -644,23 +644,14 @@ def test_invocation_renewer_submits_outer_batches_by_absolute_deadline(
         for key in keys
     )
     urgent_key = keys[-1]
-    urgent_started = threading.Event()
-    both_batches = threading.Event()
-    call_count = 0
-    call_lock = threading.Lock()
+    renewal_observed = threading.Event()
+    requested_keys: list[EvidenceKey] = []
 
     class RecordingStore:
         def renew_many(self, requested):
-            nonlocal call_count
             batch = tuple(requested)
-            if any(claim.key == urgent_key for claim in batch):
-                urgent_started.set()
-            else:
-                assert urgent_started.wait(timeout=1)
-            with call_lock:
-                call_count += 1
-                if call_count == 2:
-                    both_batches.set()
+            requested_keys.extend(claim.key for claim in batch)
+            renewal_observed.set()
             return batch
 
         def lookup_many(self, _requested):
@@ -677,12 +668,12 @@ def test_invocation_renewer_submits_outer_batches_by_absolute_deadline(
         renewer.deadlines[keys[1]] = now - 1.0
         renewer.deadlines[urgent_key] = now - 2.0
     renewer.__enter__()
-    assert both_batches.wait(timeout=2)
+    assert renewal_observed.wait(timeout=2)
     renewer.complete(keys)
     renewer.mark_finalized()
     renewer.__exit__(None, None, None)
 
-    assert call_count == 2
+    assert requested_keys == [urgent_key, keys[0], keys[1]]
 
 
 def test_invocation_renewer_uses_near_expiry_before_long_cadence(
