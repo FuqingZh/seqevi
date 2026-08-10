@@ -1235,6 +1235,95 @@ def test_http_renew_shared_executor_bounds_concurrent_logical_calls() -> None:
     )
 
 
+def test_http_store_close_cancels_pending_renewal_then_drains_active_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claims = tuple(
+        EvidenceClaim(
+            key,
+            "owner",
+            1,
+            datetime.now(UTC) + timedelta(seconds=60),
+            20.0,
+        )
+        for _identity, key in (_key(sequence) for sequence in ("MCLOSEA", "MCLOSEB"))
+    )
+    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 1)
+    active_started = threading.Event()
+    release_active = threading.Event()
+    request_count = 0
+    request_lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "maximum_batch_size": 1,
+                    "lease_seconds": 60.0,
+                    "renewal_after_seconds": 20.0,
+                },
+            )
+        body = json.loads(request.content)
+        returned = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
+        with request_lock:
+            request_count += 1
+        active_started.set()
+        assert release_active.wait(timeout=3)
+        renewed = EvidenceClaim(
+            returned.key,
+            returned.owner_token,
+            returned.generation,
+            datetime.now(UTC) + timedelta(seconds=60),
+            returned.renewal_after_seconds,
+        )
+        return httpx.Response(
+            200,
+            json={
+                "claims": [
+                    EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
+                ]
+            },
+        )
+
+    owned_client = _claim_mock_client(httpx.MockTransport(handler))
+    monkeypatch.setattr(client_module.httpx, "Client", lambda **_kwargs: owned_client)
+    store = HttpEvidenceStore("http://testserver")
+    active_future = store._renewal_executor.submit(  # pyright: ignore[reportPrivateUsage]
+        store._renew_claim_chunk,  # pyright: ignore[reportPrivateUsage]
+        (claims[0],),
+    )
+    assert active_started.wait(timeout=2)
+    pending_future = store._renewal_executor.submit(  # pyright: ignore[reportPrivateUsage]
+        store._renew_claim_chunk,  # pyright: ignore[reportPrivateUsage]
+        (claims[1],),
+    )
+    close_thread = threading.Thread(target=store.close)
+    close_thread.start()
+    deadline = time.monotonic() + 2
+    while not store._renewal_executor._shutdown:  # pyright: ignore[reportPrivateUsage]
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    assert close_thread.is_alive()
+    assert not owned_client.is_closed
+
+    release_active.set()
+    close_thread.join(timeout=3)
+
+    assert not close_thread.is_alive()
+    assert active_future.result(timeout=1)[0].key == claims[0].key
+    assert pending_future.cancelled()
+    assert request_count == 1
+    assert owned_client.is_closed
+    assert not any(
+        thread.name.startswith("seqevi-claim-renewal") and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
 def test_http_renew_bounded_overload_fails_before_stale_chunk_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
