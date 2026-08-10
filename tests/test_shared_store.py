@@ -1442,6 +1442,8 @@ def test_http_acquire_rejects_and_releases_expired_returned_authority() -> None:
         if request.url.path.endswith("/capabilities"):
             return httpx.Response(200, json=_claim_capabilities())
         body = json.loads(request.content)
+        if request.url.path.endswith("/lookup"):
+            return httpx.Response(200, json={"records": []})
         if request.url.path.endswith("/release"):
             claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
             released.set()
@@ -1499,6 +1501,8 @@ def test_http_expired_handoff_releases_only_other_live_claims() -> None:
         if request.url.path.endswith("/capabilities"):
             return httpx.Response(200, json=_claim_capabilities())
         body = json.loads(request.content)
+        if request.url.path.endswith("/lookup"):
+            return httpx.Response(200, json={"records": []})
         if request.url.path.endswith("/release"):
             claims = tuple(
                 EvidenceClaimModel.model_validate(data).to_domain()
