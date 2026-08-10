@@ -64,6 +64,7 @@ from seqevi.store.transport import (
     ClaimedCommitModel,
     CommitModel,
     EvidenceClaimModel,
+    EvidenceRecordModel,
     EvidenceQueryModel,
 )
 
@@ -826,6 +827,233 @@ def test_http_claim_chunk_additions_cannot_postpone_due_renewal() -> None:
 
     assert renew_at_acquire_count
     assert min(renew_at_acquire_count) < len(queries)
+
+
+def test_http_renew_chunks_execute_concurrently_and_preserve_order() -> None:
+    claims = tuple(
+        EvidenceClaim(
+            key,
+            "owner",
+            1,
+            datetime.now(UTC) + timedelta(seconds=60),
+            20.0,
+        )
+        for _identity, key in (
+            _key(sequence) for sequence in ("MPARALLELA", "MPARALLELB")
+        )
+    )
+    barrier = threading.Barrier(2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        body = json.loads(request.content)
+        barrier.wait(timeout=1)
+        return httpx.Response(200, json={"claims": body["claims"]})
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        renewed = store.renew_many(claims)
+
+    assert tuple(claim.key for claim in renewed) == tuple(claim.key for claim in claims)
+
+
+def test_http_renew_many_fails_instead_of_returning_stale_handles() -> None:
+    _identity, key = _key("MSTALERENEW")
+    claim = EvidenceClaim(
+        key,
+        "owner",
+        1,
+        datetime.now(UTC) + timedelta(seconds=60),
+        20.0,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        body = json.loads(request.content)
+        stale = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
+        returned = EvidenceClaim(
+            stale.key,
+            stale.owner_token,
+            stale.generation,
+            datetime.now(UTC) - timedelta(seconds=1),
+            stale.renewal_after_seconds,
+        )
+        return httpx.Response(
+            200,
+            json={
+                "claims": [
+                    EvidenceClaimModel.from_domain(returned).model_dump(mode="json")
+                ]
+            },
+        )
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        with pytest.raises(EvidenceClaimLostError, match="expired authority"):
+            store.renew_many((claim,))
+
+
+def test_http_chunk_acquire_reconciles_terminal_winner_during_renewal() -> None:
+    first_identity, first_key = _key("MCHUNKTERMINAL")
+    second_identity, second_key = _key("MCHUNKREMAINDER")
+    queries = (
+        EvidenceQuery(first_identity, first_key),
+        EvidenceQuery(second_identity, second_key),
+    )
+    terminal = EvidenceRecord(
+        first_key,
+        EvidenceStatus.NO_HIT,
+        sha256_digest(b"terminal"),
+        None,
+        None,
+        datetime.now(UTC),
+    )
+    renewal_lost = threading.Event()
+    acquire_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal acquire_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "maximum_batch_size": 1,
+                    "lease_seconds": 1.0,
+                    "renewal_after_seconds": 0.01,
+                },
+            )
+        if request.url.path.endswith("/renew"):
+            renewal_lost.set()
+            return httpx.Response(412, text="terminal won")
+        if request.url.path.endswith("/lookup"):
+            return httpx.Response(
+                200,
+                json={
+                    "records": [
+                        EvidenceRecordModel.from_domain(terminal).model_dump(
+                            mode="json"
+                        )
+                    ]
+                },
+            )
+        body = json.loads(request.content)
+        acquire_calls += 1
+        if acquire_calls == 2:
+            assert renewal_lost.wait(timeout=1)
+        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
+        acquired = ClaimAcquireResult(
+            ClaimDisposition.ACQUIRED,
+            claim=EvidenceClaim(
+                query.key,
+                body["owner_token"],
+                1,
+                datetime.now(UTC) + timedelta(seconds=1),
+                0.01,
+            ),
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
+                        mode="json"
+                    )
+                ]
+            },
+        )
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        results = store.acquire_many(queries, owner_token="owner")
+
+    assert results[0].disposition is ClaimDisposition.CACHED
+    assert results[0].record == terminal
+    assert results[1].disposition is ClaimDisposition.ACQUIRED
+
+
+def test_http_chunk_acquire_propagates_lookup_failure_and_releases_claim() -> None:
+    queries = tuple(
+        EvidenceQuery(identity, key)
+        for identity, key in (
+            _key(sequence) for sequence in ("MLOOKUPFAILA", "MLOOKUPFAILB")
+        )
+    )
+    renewal_lost = threading.Event()
+    released = threading.Event()
+    acquire_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal acquire_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "maximum_batch_size": 1,
+                    "lease_seconds": 1.0,
+                    "renewal_after_seconds": 0.01,
+                },
+            )
+        if request.url.path.endswith("/renew"):
+            renewal_lost.set()
+            return httpx.Response(412, text="claim lost")
+        if request.url.path.endswith("/lookup"):
+            return httpx.Response(500, text="metadata lookup failed")
+        body = json.loads(request.content)
+        if request.url.path.endswith("/release"):
+            released.set()
+            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
+            return httpx.Response(
+                200,
+                json={
+                    "released": [
+                        {
+                            "key": body["claims"][0]["key"],
+                            "generation": claim.generation,
+                        }
+                    ]
+                },
+            )
+        acquire_calls += 1
+        if acquire_calls == 2:
+            assert renewal_lost.wait(timeout=1)
+        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
+        acquired = ClaimAcquireResult(
+            ClaimDisposition.ACQUIRED,
+            claim=EvidenceClaim(
+                query.key,
+                body["owner_token"],
+                1,
+                datetime.now(UTC) + timedelta(seconds=1),
+                0.01,
+            ),
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
+                        mode="json"
+                    )
+                ]
+            },
+        )
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        with pytest.raises(StoreError, match="metadata lookup failed"):
+            store.acquire_many(queries, owner_token="owner")
+
+    assert released.is_set()
 
 
 def test_http_acquire_failure_releases_earlier_chunks_without_masking_error() -> None:

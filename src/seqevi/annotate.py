@@ -360,10 +360,12 @@ def run_annotation(
             },
         )
         package_seconds = time.perf_counter() - package_started
-    except Exception as error:
+    except BaseException as error:
         if invocation_renewer is not None and claim_store is not None:
             invocation_renewer.stop_and_join()
             _release_active_claims(claim_store, invocation_renewer.active_claims())
+        if not isinstance(error, Exception):
+            raise
         raise AnnotationError(
             f"annotation failed; diagnostics retained at {work_dir}: {error}"
         ) from error

@@ -118,6 +118,16 @@ class _FailSecondBatchAdapter:
         return self.delegate.run_batch(**kwargs)  # type: ignore[arg-type]
 
 
+class _CancelAdapter:
+    def __init__(self, delegate: FixtureAdapter, cancellation: BaseException) -> None:
+        self.contract = delegate.contract
+        self.evidence_schema = delegate.evidence_schema
+        self.cancellation = cancellation
+
+    def run_batch(self, **_kwargs: object) -> AdapterBatchResult:
+        raise self.cancellation
+
+
 class _RecordingThreadsAdapter:
     def __init__(self, delegate: FixtureAdapter) -> None:
         self.delegate = delegate
@@ -1031,3 +1041,43 @@ def test_completed_batch_is_reused_after_later_tool_batch_fails(
     assert recovered.cache_hits == 2
     assert recovered.computed == 1
     assert recovered.metrics.tool_batches == 1
+
+
+@pytest.mark.parametrize(
+    "cancellation",
+    [KeyboardInterrupt(), SystemExit(7)],
+    ids=["keyboard", "system-exit"],
+)
+def test_cancellation_stops_renewal_and_releases_active_claims(
+    tmp_path: Path, cancellation: BaseException
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    delegate = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+
+    with LocalStore.open(tmp_path / "store") as store:
+        with pytest.raises(type(cancellation)) as raised:
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=tmp_path / "cancelled-output",
+                adapter=_CancelAdapter(delegate, cancellation),
+                store=store,
+            )
+        assert raised.value is cancellation
+        identity = identify_protein_sequence("MPEPTIDE")
+        key = EvidenceKey.from_parameters(
+            sequence_id=identity.sequence_id,
+            adapter_contract_version=delegate.contract.version,
+            tool_runtime_digest=delegate.contract.tool_runtime_digest,
+            resource_id=delegate.contract.resource_id,
+            semantic_parameters=delegate.contract.semantic_parameters,
+        )
+        reacquired = store.acquire_many(
+            (EvidenceQuery(identity, key),), owner_token="peer"
+        )[0].claim
+
+    assert reacquired is not None
+    assert reacquired.generation == 2

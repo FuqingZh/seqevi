@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from seqevi.evidence import (
     ArtifactFile,
     ArtifactLifetime,
     ClaimAcquireResult,
+    ClaimDisposition,
     ClaimedEvidenceCommit,
     CommitOutcome,
     EvidenceClaim,
@@ -66,6 +68,8 @@ class _ChunkAcquireRenewer:
     def __init__(self, store: HttpEvidenceStore) -> None:
         self._store = store
         self._claims: dict[EvidenceKey, EvidenceClaim] = {}
+        self._queries: dict[EvidenceKey, EvidenceQuery] = {}
+        self._terminal: dict[EvidenceKey, EvidenceRecord] = {}
         self._deadlines: dict[EvidenceKey, float] = {}
         self._lock = threading.Lock()
         self._changed = threading.Event()
@@ -76,9 +80,10 @@ class _ChunkAcquireRenewer:
     def start(self) -> None:
         self._thread.start()
 
-    def add(self, claim: EvidenceClaim) -> None:
+    def add(self, claim: EvidenceClaim, query: EvidenceQuery) -> None:
         with self._lock:
             self._claims[claim.key] = claim
+            self._queries[claim.key] = query
             self._deadlines[claim.key] = time.monotonic() + claim.renewal_after_seconds
         self._changed.set()
 
@@ -90,6 +95,10 @@ class _ChunkAcquireRenewer:
     def claims(self) -> dict[EvidenceKey, EvidenceClaim]:
         with self._lock:
             return dict(self._claims)
+
+    def terminal_records(self) -> dict[EvidenceKey, EvidenceRecord]:
+        with self._lock:
+            return dict(self._terminal)
 
     def raise_if_failed(self) -> None:
         if self._failure is not None:
@@ -117,12 +126,38 @@ class _ChunkAcquireRenewer:
             if not snapshot:
                 self._changed.wait(max(0.0, next_deadline - time.monotonic()))
                 continue
-            try:
-                renewed = self._store.renew_many(snapshot)
-            except BaseException as error:
-                self._failure = error
-                self._stopped.set()
-                return
+            while snapshot:
+                try:
+                    renewed = self._store.renew_many(snapshot)
+                    break
+                except EvidenceClaimLostError as error:
+                    with self._lock:
+                        queries = tuple(self._queries[claim.key] for claim in snapshot)
+                    try:
+                        terminal = self._store.lookup_many(queries)
+                    except BaseException as lookup_error:
+                        self._failure = lookup_error
+                        self._stopped.set()
+                        return
+                    if not terminal:
+                        self._failure = error
+                        self._stopped.set()
+                        return
+                    with self._lock:
+                        for key, record in terminal.items():
+                            self._claims.pop(key, None)
+                            self._queries.pop(key, None)
+                            self._deadlines.pop(key, None)
+                            self._terminal[key] = record
+                    snapshot = tuple(
+                        claim for claim in snapshot if claim.key not in terminal
+                    )
+                except BaseException as error:
+                    self._failure = error
+                    self._stopped.set()
+                    return
+            else:
+                continue
             with self._lock:
                 renewed_at = time.monotonic()
                 for claim in renewed:
@@ -345,7 +380,7 @@ class HttpEvidenceStore:
                         )
                     results.append(result)
                     if result.claim is not None:
-                        renewer.add(result.claim)
+                        renewer.add(result.claim, query)
                 renewer.raise_if_failed()
         except BaseException:
             renewer.stop()
@@ -358,6 +393,7 @@ class HttpEvidenceStore:
             renewer.release_best_effort()
             raise
         current = renewer.claims()
+        terminal = renewer.terminal_records()
         completion_time = datetime.now(UTC)
         if any(claim.expires_at <= completion_time for claim in current.values()):
             renewer.release_best_effort()
@@ -365,7 +401,11 @@ class HttpEvidenceStore:
                 "claim acquisition completed with expired authority"
             )
         return tuple(
-            ClaimAcquireResult(result.disposition, claim=current[result.claim.key])
+            ClaimAcquireResult(
+                ClaimDisposition.CACHED, record=terminal[result.claim.key]
+            )
+            if result.claim is not None and result.claim.key in terminal
+            else ClaimAcquireResult(result.disposition, claim=current[result.claim.key])
             if result.claim is not None
             else result
             for result in results
@@ -536,6 +576,21 @@ class HttpEvidenceStore:
         capabilities = self._require_claims()
         returned: list[EvidenceClaim] = []
         maximum = min(capabilities.maximum_batch_size, self.maximum_batch_size, 1000)
+        if renew:
+            chunks = tuple(
+                claims[offset : offset + maximum]
+                for offset in range(0, len(claims), maximum)
+            )
+            if not chunks:
+                return ()
+            with ThreadPoolExecutor(max_workers=min(len(chunks), 32)) as executor:
+                renewed_chunks = tuple(executor.map(self._renew_claim_chunk, chunks))
+            renewed = tuple(claim for chunk in renewed_chunks for claim in chunk)
+            if any(claim.expires_at <= datetime.now(UTC) for claim in renewed):
+                raise EvidenceClaimLostError(
+                    "claim renewal completed with expired authority"
+                )
+            return renewed
         for offset in range(0, len(claims), maximum):
             chunk = claims[offset : offset + maximum]
             request = ClaimMutationRequest(
@@ -547,32 +602,35 @@ class HttpEvidenceStore:
             response = self._claim_request(
                 "POST", path, json=request.model_dump(mode="json")
             )
-            if renew:
-                payload = ClaimRenewResponse.model_validate(response.json())
-                if len(payload.claims) != len(chunk):
-                    raise StoreIntegrityError(
-                        "shared Store returned incomplete renewed claims"
-                    )
-                renewed = tuple(model.to_domain() for model in payload.claims)
-                if tuple(
-                    (claim.key, claim.owner_token, claim.generation)
-                    for claim in renewed
-                ) != tuple(
-                    (claim.key, claim.owner_token, claim.generation) for claim in chunk
-                ):
-                    raise StoreIntegrityError(
-                        "shared Store returned mismatched renewed claims"
-                    )
-                returned.extend(renewed)
-            else:
-                payload = ClaimReleaseResponse.model_validate(response.json())
-                if tuple(
-                    (ack.key.to_domain(), ack.generation) for ack in payload.released
-                ) != tuple((claim.key, claim.generation) for claim in chunk):
-                    raise StoreIntegrityError(
-                        "shared Store returned mismatched claim release"
-                    )
+            payload = ClaimReleaseResponse.model_validate(response.json())
+            if tuple(
+                (ack.key.to_domain(), ack.generation) for ack in payload.released
+            ) != tuple((claim.key, claim.generation) for claim in chunk):
+                raise StoreIntegrityError(
+                    "shared Store returned mismatched claim release"
+                )
         return tuple(returned)
+
+    def _renew_claim_chunk(
+        self, chunk: tuple[EvidenceClaim, ...]
+    ) -> tuple[EvidenceClaim, ...]:
+        request = ClaimMutationRequest(
+            claims=[EvidenceClaimModel.from_domain(claim) for claim in chunk]
+        )
+        response = self._claim_request(
+            "POST",
+            "/v1/evidence/claims/renew",
+            json=request.model_dump(mode="json"),
+        )
+        payload = ClaimRenewResponse.model_validate(response.json())
+        if len(payload.claims) != len(chunk):
+            raise StoreIntegrityError("shared Store returned incomplete renewed claims")
+        renewed = tuple(model.to_domain() for model in payload.claims)
+        if tuple(
+            (claim.key, claim.owner_token, claim.generation) for claim in renewed
+        ) != tuple((claim.key, claim.owner_token, claim.generation) for claim in chunk):
+            raise StoreIntegrityError("shared Store returned mismatched renewed claims")
+        return renewed
 
     def _claim_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         kwargs.setdefault("timeout", self._timeout_seconds)
