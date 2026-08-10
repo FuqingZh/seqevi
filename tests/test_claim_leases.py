@@ -197,7 +197,7 @@ def test_sqlite_refreshes_acquire_expiry_after_later_item_delay(
 def test_sqlite_refreshes_renewal_expiry_after_later_item_delay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("seqevi.store.local._CLAIM_LEASE_SECONDS", 0.05)
+    monkeypatch.setattr("seqevi.store.local._CLAIM_LEASE_SECONDS", 5.0)
     commits = (
         make_hit_commit("MRENEWFIRST", artifact_dir=tmp_path / "first"),
         make_hit_commit("MRENEWSECOND", artifact_dir=tmp_path / "second"),
@@ -207,6 +207,7 @@ def test_sqlite_refreshes_renewal_expiry_after_later_item_delay(
         acquired = store.acquire_many(queries, owner_token="owner")
         claims = tuple(result.claim for result in acquired)
         assert all(claim is not None for claim in claims)
+        monkeypatch.setattr("seqevi.store.local._CLAIM_LEASE_SECONDS", 0.05)
         claim_updates = 0
         delay_finished: datetime | None = None
 

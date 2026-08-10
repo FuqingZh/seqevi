@@ -1388,7 +1388,7 @@ def test_postgres_refreshes_acquire_expiry_after_later_row_lock_wait(
 def test_postgres_refreshes_renewal_expiry_after_later_row_lock_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("seqevi.service.persistence.CLAIM_LEASE_SECONDS", 0.2)
+    monkeypatch.setattr("seqevi.service.persistence.CLAIM_LEASE_SECONDS", 5.0)
     with _isolated_postgres_url() as database_url:
         commits = (
             _hit_commit(tmp_path / "sources-a", "MRENEWWAITA"),
@@ -1411,6 +1411,7 @@ def test_postgres_refreshes_renewal_expiry_after_later_row_lock_wait(
         decisions = primary.acquire_many(queries, owner_token="calculator")
         claims = tuple(decision.claim for decision in decisions)
         assert all(claim is not None for claim in claims)
+        monkeypatch.setattr("seqevi.service.persistence.CLAIM_LEASE_SECONDS", 0.2)
         with primary.engine.begin() as connection:
             connection.execute(
                 update(evidence_claims)
