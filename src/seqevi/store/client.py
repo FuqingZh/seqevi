@@ -96,11 +96,13 @@ class _ChunkAcquireRenewer:
             raise self._failure
 
     def release_best_effort(self) -> None:
-        for claim in self.claims().values():
-            try:
-                self._store.release_many((claim,))
-            except Exception:
-                pass
+        claims = tuple(self.claims().values())
+        if not claims:
+            return
+        try:
+            self._store.release_many(claims)
+        except Exception:
+            pass
 
     def _run(self) -> None:
         while not self._stopped.is_set():
