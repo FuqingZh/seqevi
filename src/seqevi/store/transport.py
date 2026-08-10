@@ -9,7 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from seqevi.evidence import (
     ArtifactFile,
+    BusyEvidenceClaim,
+    ClaimAcquireResult,
+    ClaimDisposition,
+    ClaimedEvidenceCommit,
     CommitOutcome,
+    EvidenceClaim,
     EvidenceCommit,
     EvidenceKey,
     EvidenceQuery,
@@ -210,6 +215,160 @@ class CommitRequest(TransportModel):
 
 class CommitResponse(TransportModel):
     outcomes: list[CommitOutcome]
+
+
+class ClaimCapabilitiesResponse(TransportModel):
+    maximum_batch_size: Annotated[int, Field(ge=1, le=1000, strict=True)]
+    lease_seconds: Annotated[float, Field(gt=0)]
+    renewal_after_seconds: Annotated[float, Field(gt=0)]
+
+
+class EvidenceClaimModel(TransportModel):
+    key: EvidenceKeyModel
+    owner_token: Annotated[str, Field(min_length=1, max_length=255, repr=False)]
+    generation: Annotated[int, Field(ge=1, strict=True)]
+    expires_at: datetime
+    renewal_after_seconds: Annotated[float, Field(gt=0)]
+
+    @model_validator(mode="after")
+    def validate_domain_claim(self) -> EvidenceClaimModel:
+        self.to_domain()
+        return self
+
+    @classmethod
+    def from_domain(cls, value: EvidenceClaim) -> EvidenceClaimModel:
+        return cls(
+            key=EvidenceKeyModel.from_domain(value.key),
+            owner_token=value.owner_token,
+            generation=value.generation,
+            expires_at=value.expires_at,
+            renewal_after_seconds=value.renewal_after_seconds,
+        )
+
+    def to_domain(self) -> EvidenceClaim:
+        return EvidenceClaim(
+            self.key.to_domain(),
+            self.owner_token,
+            self.generation,
+            self.expires_at,
+            self.renewal_after_seconds,
+        )
+
+
+class BusyEvidenceClaimModel(TransportModel):
+    key: EvidenceKeyModel
+    expires_at: datetime
+    retry_after_seconds: Annotated[float, Field(gt=0)]
+
+    @classmethod
+    def from_domain(cls, value: BusyEvidenceClaim) -> BusyEvidenceClaimModel:
+        return cls(
+            key=EvidenceKeyModel.from_domain(value.key),
+            expires_at=value.expires_at,
+            retry_after_seconds=value.retry_after_seconds,
+        )
+
+    def to_domain(self) -> BusyEvidenceClaim:
+        return BusyEvidenceClaim(
+            self.key.to_domain(), self.expires_at, self.retry_after_seconds
+        )
+
+
+class ClaimAcquireResultModel(TransportModel):
+    disposition: ClaimDisposition
+    record: EvidenceRecordModel | None = None
+    claim: EvidenceClaimModel | None = None
+    busy: BusyEvidenceClaimModel | None = None
+
+    @model_validator(mode="after")
+    def validate_domain_result(self) -> ClaimAcquireResultModel:
+        self.to_domain()
+        return self
+
+    @classmethod
+    def from_domain(cls, value: ClaimAcquireResult) -> ClaimAcquireResultModel:
+        return cls(
+            disposition=value.disposition,
+            record=None
+            if value.record is None
+            else EvidenceRecordModel.from_domain(value.record),
+            claim=None
+            if value.claim is None
+            else EvidenceClaimModel.from_domain(value.claim),
+            busy=None
+            if value.busy is None
+            else BusyEvidenceClaimModel.from_domain(value.busy),
+        )
+
+    def to_domain(self) -> ClaimAcquireResult:
+        return ClaimAcquireResult(
+            self.disposition,
+            record=None if self.record is None else self.record.to_domain(),
+            claim=None if self.claim is None else self.claim.to_domain(),
+            busy=None if self.busy is None else self.busy.to_domain(),
+        )
+
+
+class ClaimAcquireRequest(TransportModel):
+    owner_token: Annotated[str, Field(min_length=1, max_length=255, repr=False)]
+    queries: list[EvidenceQueryModel]
+
+
+class ClaimAcquireResponse(TransportModel):
+    results: list[ClaimAcquireResultModel]
+
+
+class ClaimMutationRequest(TransportModel):
+    claims: list[EvidenceClaimModel]
+
+    @model_validator(mode="after")
+    def validate_unique_keys(self) -> ClaimMutationRequest:
+        if len({claim.key.to_domain() for claim in self.claims}) != len(self.claims):
+            raise ValueError("claim mutation contains a duplicate evidence key")
+        return self
+
+
+class ClaimRenewResponse(TransportModel):
+    claims: list[EvidenceClaimModel]
+
+
+class ClaimReleaseAcknowledgement(TransportModel):
+    key: EvidenceKeyModel
+    generation: Annotated[int, Field(ge=1, strict=True)]
+
+
+class ClaimReleaseResponse(TransportModel):
+    released: list[ClaimReleaseAcknowledgement]
+
+
+class ClaimedCommitModel(TransportModel):
+    commit: CommitModel
+    claim: EvidenceClaimModel
+
+    @model_validator(mode="after")
+    def validate_matching_key(self) -> ClaimedCommitModel:
+        if self.commit.key != self.claim.key:
+            raise ValueError("claim and evidence commit keys do not match")
+        return self
+
+    @classmethod
+    def from_domain(cls, value: ClaimedEvidenceCommit) -> ClaimedCommitModel:
+        return cls(
+            commit=CommitModel.from_domain(value.commit),
+            claim=EvidenceClaimModel.from_domain(value.claim),
+        )
+
+
+class ClaimFinalizeRequest(TransportModel):
+    commits: list[ClaimedCommitModel]
+
+    @model_validator(mode="after")
+    def validate_unique_keys(self) -> ClaimFinalizeRequest:
+        if len({item.claim.key.to_domain() for item in self.commits}) != len(
+            self.commits
+        ):
+            raise ValueError("claim finalization contains a duplicate evidence key")
+        return self
 
 
 class ArtifactUploadResponse(TransportModel):

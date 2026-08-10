@@ -84,3 +84,25 @@ evidence = Table(
         name="ck_evidence_normalized_artifact",
     ),
 )
+
+evidence_claims = Table(
+    "evidence_claim",
+    metadata,
+    Column("sequence_id", String(35), primary_key=True),
+    Column("adapter_contract_version", Text, primary_key=True),
+    Column("tool_runtime_digest", Text, primary_key=True),
+    Column("resource_id", Text, primary_key=True),
+    Column("semantic_parameters_hash", String(64), primary_key=True),
+    Column("semantic_parameters_json", Text, nullable=False),
+    Column("owner_token", String(255), nullable=False),
+    Column("generation", BigInteger, nullable=False),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column(
+        "created_at", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
+    Column(
+        "updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
+    CheckConstraint("generation > 0", name="ck_evidence_claim_generation_positive"),
+)
+Index("ix_evidence_claim_expires_at", evidence_claims.c.expires_at)

@@ -11,11 +11,19 @@ from typing import Any
 
 import httpx
 
-from seqevi.errors import EvidenceConflictError, StoreError, StoreIntegrityError
+from seqevi.errors import (
+    EvidenceClaimLostError,
+    EvidenceConflictError,
+    StoreError,
+    StoreIntegrityError,
+)
 from seqevi.evidence import (
     ArtifactFile,
     ArtifactLifetime,
+    ClaimAcquireResult,
+    ClaimedEvidenceCommit,
     CommitOutcome,
+    EvidenceClaim,
     EvidenceCommit,
     EvidenceKey,
     EvidenceQuery,
@@ -29,6 +37,15 @@ from .transport import (
     CommitModel,
     CommitRequest,
     CommitResponse,
+    ClaimAcquireRequest,
+    ClaimAcquireResponse,
+    ClaimCapabilitiesResponse,
+    ClaimFinalizeRequest,
+    ClaimedCommitModel,
+    ClaimMutationRequest,
+    ClaimReleaseResponse,
+    ClaimRenewResponse,
+    EvidenceClaimModel,
     EvidenceKeyModel,
     EvidenceQueryModel,
     FetchManyRequest,
@@ -78,6 +95,32 @@ class HttpEvidenceStore:
             raise ValueError("maximum_batch_size must be positive")
         self.maximum_artifact_bytes = maximum_artifact_bytes
         self.maximum_batch_size = maximum_batch_size
+        try:
+            capability_response = self.client.request(
+                "GET", "/v1/evidence/claims/capabilities"
+            )
+        except httpx.HTTPError as error:
+            raise StoreError(f"shared Store request failed: {error}") from error
+        if capability_response.status_code == 404:
+            self._claim_capabilities = None
+        else:
+            _raise_for_store_status(capability_response)
+            self._claim_capabilities = ClaimCapabilitiesResponse.model_validate(
+                capability_response.json()
+            )
+
+    @property
+    def supports_claims(self) -> bool:
+        """Return whether the service exposes atomic claim endpoints.
+
+        Examples:
+            A 404 capability probe selects legacy Store behavior:
+
+            >>> store.supports_claims
+            False
+        """
+
+        return self._claim_capabilities is not None
 
     def close(self) -> None:
         try:
@@ -153,6 +196,133 @@ class HttpEvidenceStore:
                     "shared Store returned incomplete commit outcomes"
                 )
             outcomes.extend(chunk_outcomes)
+        return tuple(outcomes)
+
+    def acquire_many(
+        self, requested_queries: Iterable[EvidenceQuery], *, owner_token: str
+    ) -> tuple[ClaimAcquireResult, ...]:
+        """Acquire exact work in service-bounded chunks.
+
+        Examples:
+            Busy results contain wait metadata but no owner credential:
+
+            >>> results = store.acquire_many(queries, owner_token="worker")
+        """
+
+        requested = tuple(requested_queries)
+        if len(set(requested)) != len(requested):
+            raise ValueError("acquire batch contains a duplicate evidence query")
+        capabilities = self._require_claims()
+        results = []
+        maximum = min(capabilities.maximum_batch_size, self.maximum_batch_size, 1000)
+        for offset in range(0, len(requested), maximum):
+            chunk = requested[offset : offset + maximum]
+            request = ClaimAcquireRequest(
+                owner_token=owner_token,
+                queries=[EvidenceQueryModel.from_domain(query) for query in chunk],
+            )
+            response = self._claim_request(
+                "POST",
+                "/v1/evidence/claims/acquire",
+                json=request.model_dump(mode="json"),
+            )
+            payload = ClaimAcquireResponse.model_validate(response.json())
+            if len(payload.results) != len(chunk):
+                raise StoreIntegrityError(
+                    "shared Store returned incomplete claim results"
+                )
+            for query, model in zip(chunk, payload.results, strict=True):
+                result = model.to_domain()
+                if result.record is not None:
+                    key = result.record.key
+                elif result.claim is not None:
+                    key = result.claim.key
+                else:
+                    assert result.busy is not None
+                    key = result.busy.key
+                if key != query.key:
+                    raise StoreIntegrityError(
+                        "shared Store returned a mismatched claim result"
+                    )
+                if result.claim is not None and result.claim.owner_token != owner_token:
+                    raise StoreIntegrityError(
+                        "shared Store returned claim credentials for another owner"
+                    )
+                results.append(result)
+        return tuple(results)
+
+    def renew_many(self, claims: Iterable[EvidenceClaim]) -> tuple[EvidenceClaim, ...]:
+        """Renew authoritative claims in service-bounded chunks.
+
+        Examples:
+            Returned leases replace the previous expiry values:
+
+            >>> claims = store.renew_many(claims)
+        """
+
+        return self._mutate_claims(tuple(claims), renew=True)
+
+    def release_many(self, claims: Iterable[EvidenceClaim]) -> None:
+        """Release authoritative claims in service-bounded chunks.
+
+        Examples:
+            Normal failure can release all still-owned work:
+
+            >>> store.release_many(claims)
+        """
+
+        self._mutate_claims(tuple(claims), renew=False)
+
+    def finalize_many(
+        self, proposed: Iterable[ClaimedEvidenceCommit]
+    ) -> tuple[CommitOutcome, ...]:
+        """Upload artifacts then atomically finalize matching claims.
+
+        Examples:
+            Matching generations retire their claim with terminal evidence:
+
+            >>> outcomes = store.finalize_many(proposed)
+        """
+
+        items = tuple(proposed)
+        if len({item.commit.key for item in items}) != len(items):
+            raise ValueError("finalize batch contains a duplicate evidence key")
+        self._require_claims()
+        payloads: dict[str, ArtifactFile] = {}
+        for item in items:
+            for payload in (item.commit.normalized_artifact, item.commit.raw_artifact):
+                if payload is not None:
+                    existing = payloads.setdefault(payload.digest, payload)
+                    if _artifact_identity(existing) != _artifact_identity(payload):
+                        raise StoreIntegrityError(
+                            f"artifact digest has conflicting payloads: {payload.digest}"
+                        )
+        for payload in payloads.values():
+            if payload.digest not in self._uploaded_artifact_digests:
+                self._upload(payload)
+                self._uploaded_artifact_digests.add(payload.digest)
+        outcomes = []
+        maximum = min(
+            self._claim_capabilities.maximum_batch_size,  # type: ignore[union-attr]
+            self.maximum_batch_size,
+            1000,
+        )
+        for offset in range(0, len(items), maximum):
+            chunk = items[offset : offset + maximum]
+            request = ClaimFinalizeRequest(
+                commits=[ClaimedCommitModel.from_domain(item) for item in chunk]
+            )
+            response = self._claim_request(
+                "POST",
+                "/v1/evidence/claims/finalize",
+                json=request.model_dump(mode="json"),
+            )
+            returned = CommitResponse.model_validate(response.json()).outcomes
+            if len(returned) != len(chunk):
+                raise StoreIntegrityError(
+                    "shared Store returned incomplete finalize outcomes"
+                )
+            outcomes.extend(returned)
         return tuple(outcomes)
 
     def fetch(self, key: EvidenceKey) -> FetchedEvidence | None:
@@ -232,6 +402,67 @@ class HttpEvidenceStore:
         )
         if uploaded != expected:
             raise StoreIntegrityError("shared Store returned wrong artifact metadata")
+
+    def _require_claims(self) -> ClaimCapabilitiesResponse:
+        if self._claim_capabilities is None:
+            raise StoreError("shared Store does not support evidence claims")
+        return self._claim_capabilities
+
+    def _mutate_claims(
+        self, claims: tuple[EvidenceClaim, ...], *, renew: bool
+    ) -> tuple[EvidenceClaim, ...]:
+        if len({claim.key for claim in claims}) != len(claims):
+            raise ValueError("claim mutation contains a duplicate evidence key")
+        capabilities = self._require_claims()
+        returned: list[EvidenceClaim] = []
+        maximum = min(capabilities.maximum_batch_size, self.maximum_batch_size, 1000)
+        for offset in range(0, len(claims), maximum):
+            chunk = claims[offset : offset + maximum]
+            request = ClaimMutationRequest(
+                claims=[EvidenceClaimModel.from_domain(claim) for claim in chunk]
+            )
+            path = (
+                "/v1/evidence/claims/renew" if renew else "/v1/evidence/claims/release"
+            )
+            response = self._claim_request(
+                "POST", path, json=request.model_dump(mode="json")
+            )
+            if renew:
+                payload = ClaimRenewResponse.model_validate(response.json())
+                if len(payload.claims) != len(chunk):
+                    raise StoreIntegrityError(
+                        "shared Store returned incomplete renewed claims"
+                    )
+                renewed = tuple(model.to_domain() for model in payload.claims)
+                if tuple(
+                    (claim.key, claim.owner_token, claim.generation)
+                    for claim in renewed
+                ) != tuple(
+                    (claim.key, claim.owner_token, claim.generation) for claim in chunk
+                ):
+                    raise StoreIntegrityError(
+                        "shared Store returned mismatched renewed claims"
+                    )
+                returned.extend(renewed)
+            else:
+                payload = ClaimReleaseResponse.model_validate(response.json())
+                if tuple(
+                    (ack.key.to_domain(), ack.generation) for ack in payload.released
+                ) != tuple((claim.key, claim.generation) for claim in chunk):
+                    raise StoreIntegrityError(
+                        "shared Store returned mismatched claim release"
+                    )
+        return tuple(returned)
+
+    def _claim_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        try:
+            response = self.client.request(method, path, **kwargs)
+        except httpx.HTTPError as error:
+            raise StoreError(f"shared Store request failed: {error}") from error
+        if response.status_code == 412:
+            raise EvidenceClaimLostError(response.text)
+        _raise_for_store_status(response)
+        return response
 
     def _download(self, digest: str) -> ArtifactFile:
         cached = self._downloaded_artifacts.get(digest)

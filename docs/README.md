@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-08-07
+> Last updated: 2026-08-10
 
 SeqEvi has implemented the v1 local and shared Store paths. The current tree
 also contains the DuckDB result surface, fixture-backed contracts for the three
@@ -39,18 +39,19 @@ later feature work.
 | execution profiles | v1 host profiles remain compatible; managed v2.2 setup and OCI execution are implemented and accepted | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md), [managed profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
 | managed onboarding | dbCAN only for 0.2.0; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
 | shared Store cache seeding | approved staged execution plan; execution not started | [cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
+| evidence claim leases | approved per-EvidenceKey duplicate-suppression contract; implementation active | [evidence contract v1.2](architecture/20260810-v1.2-sequence-evidence-contract.md), [claim-lease plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md) |
 
 ## Start Here
 
 1. [Architecture overview](architecture/20260720-v1.0-seqevi-architecture.md)
-2. [Sequence and evidence contract](architecture/20260804-v1.1-sequence-evidence-contract.md)
+2. [Sequence and evidence contract](architecture/20260810-v1.2-sequence-evidence-contract.md)
 3. [Adapter contract](architecture/20260804-v1.1-adapter-contract.md)
 4. [Result consumption contract](architecture/20260804-v1.1-result-consumption-contract.md)
 5. [Execution profile contract](architecture/20260724-v1.0-execution-profile-contract.md)
-6. [Storage and deployment architecture](architecture/20260729-v1.1-storage-deployment-architecture.md)
+6. [Storage and deployment architecture](architecture/20260810-v1.2-storage-deployment-architecture.md)
 7. [MVP implementation plan](implementation-plan/20260720-v1.0-mvp-implementation-plan.md)
 8. [Execution profile implementation plan](implementation-plan/20260724-v1.0-execution-profile-implementation-plan.md)
-9. [Validation strategy](testing/20260720-v1.0-validation-strategy.md)
+9. [Validation strategy](testing/20260810-v1.1-validation-strategy.md)
 10. [Shared Store deployment and acceptance plan](implementation-plan/20260726-v1.0-shared-store-deployment-acceptance-plan.md)
 11. [Shared Store deployment and acceptance](benchmarks/20260726-v1.0-shared-store-deployment-acceptance.md)
 12. [eggNOG runtime validation](benchmarks/20260721-v1.0-eggnog-runtime-validation.md)
@@ -78,6 +79,7 @@ later feature work.
 34. [Managed dbCAN release-equivalent candidate gate](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md)
 35. [Managed dbCAN Slice D public release gate](benchmarks/20260806-v1.4-dbcan-public-release-gate.md)
 36. [Shared Store cache-seeding implementation plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md)
+37. [Evidence claim lease implementation plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md)
 
 ## Managed Boundary Contracts
 

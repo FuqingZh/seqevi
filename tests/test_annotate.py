@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import threading
+import time
 
 import polars as pl
 import pytest
@@ -10,17 +14,30 @@ from polars.testing import assert_frame_equal
 
 from seqevi.adapters import AdapterBatchResult
 from seqevi.annotate import run_annotation
-from seqevi.errors import AdapterError, AnnotationError, FastaValidationError
+from seqevi.errors import (
+    AdapterError,
+    AnnotationError,
+    EvidenceClaimLostError,
+    FastaValidationError,
+)
 from seqevi.evidence import (
+    BusyEvidenceClaim,
+    ClaimDisposition,
+    ClaimAcquireResult,
+    ClaimedEvidenceCommit,
     CommitOutcome,
+    EvidenceClaim,
     EvidenceCommit,
     EvidenceKey,
     EvidenceQuery,
     EvidenceRecord,
+    EvidenceStatus,
     FetchedEvidence,
 )
-from seqevi.sequence import read_fasta, unique_identities
+from seqevi.sequence import identify_protein_sequence, read_fasta, unique_identities
 from seqevi.store import LocalStore
+from seqevi.store.schema import evidence_claims
+from sqlalchemy import func, select
 
 from .support import (
     FixtureAdapter,
@@ -39,6 +56,10 @@ class _CountingStore:
         self.lookup_sizes: list[int] = []
         self.commit_sizes: list[int] = []
         self.fetch_sizes: list[int] = []
+
+    @property
+    def supports_claims(self) -> bool:
+        return False
 
     def lookup_many(
         self, requested_queries: Iterable[EvidenceQuery]
@@ -63,6 +84,22 @@ class _CountingStore:
 
     def fetch(self, key: EvidenceKey) -> FetchedEvidence | None:
         return self.delegate.fetch(key)
+
+    def acquire_many(
+        self, requested_queries: Iterable[EvidenceQuery], *, owner_token: str
+    ) -> tuple[ClaimAcquireResult, ...]:
+        return self.delegate.acquire_many(requested_queries, owner_token=owner_token)
+
+    def renew_many(self, claims: Iterable[EvidenceClaim]) -> tuple[EvidenceClaim, ...]:
+        return self.delegate.renew_many(claims)
+
+    def release_many(self, claims: Iterable[EvidenceClaim]) -> None:
+        self.delegate.release_many(claims)
+
+    def finalize_many(
+        self, proposed: Iterable[ClaimedEvidenceCommit]
+    ) -> tuple[CommitOutcome, ...]:
+        return self.delegate.finalize_many(proposed)
 
 
 class _FailSecondBatchAdapter:
@@ -90,6 +127,34 @@ class _RecordingThreadsAdapter:
         threads = kwargs["threads"]
         assert isinstance(threads, int)
         self.threads.append(threads)
+        return self.delegate.run_batch(**kwargs)  # type: ignore[arg-type]
+
+
+class _ConcurrentRecordingAdapter:
+    def __init__(self, delegate: FixtureAdapter, *, block_first: bool = False) -> None:
+        self.delegate = delegate
+        self.contract = delegate.contract
+        self.evidence_schema = delegate.evidence_schema
+        self.sequence_calls: dict[str, int] = {}
+        self.lock = threading.Lock()
+        self.block_first = block_first
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def run_batch(self, **kwargs: object) -> AdapterBatchResult:
+        identities = kwargs["identities"]
+        assert isinstance(identities, tuple)
+        with self.lock:
+            self.calls += 1
+            first_call = self.calls == 1
+            for identity in identities:
+                self.sequence_calls[identity.sequence_id] = (
+                    self.sequence_calls.get(identity.sequence_id, 0) + 1
+                )
+        if self.block_first and first_call:
+            self.entered.set()
+            assert self.release.wait(10)
         return self.delegate.run_batch(**kwargs)  # type: ignore[arg-type]
 
 
@@ -176,6 +241,395 @@ def test_annotation_materializes_complete_result_and_reuses_cache(
     )
 
 
+def test_concurrent_partial_overlap_computes_overlap_once(tmp_path: Path) -> None:
+    first_fasta = tmp_path / "first.fasta"
+    first_fasta.write_text(">a\nMPEPTIDE\n>shared-a\nMSHARED\n", encoding="utf-8")
+    second_fasta = tmp_path / "second.fasta"
+    second_fasta.write_text(">shared-b\nMSHARED\n>c\nMOTHER\n", encoding="utf-8")
+    adapter = _ConcurrentRecordingAdapter(
+        FixtureAdapter(
+            executable=write_fixture_tool(tmp_path / "fixture-tool"),
+            database=write_fixture_database(tmp_path / "database"),
+        ),
+        block_first=True,
+    )
+    store_path = tmp_path / "store"
+    busy_observed = threading.Event()
+    with LocalStore.open(store_path):
+        pass
+
+    class BusyObservingStore:
+        supports_claims = True
+
+        def __init__(self, delegate: LocalStore) -> None:
+            self.delegate = delegate
+
+        def __getattr__(self, name: str):
+            return getattr(self.delegate, name)
+
+        def lookup_many(self, queries):
+            return self.delegate.lookup_many(queries)
+
+        def commit_many(self, commits):
+            return self.delegate.commit_many(commits)
+
+        def fetch_many(self, keys):
+            return self.delegate.fetch_many(keys)
+
+        def fetch(self, key):
+            return self.delegate.fetch(key)
+
+        def acquire_many(self, queries, *, owner_token: str):
+            results = self.delegate.acquire_many(queries, owner_token=owner_token)
+            if any(result.disposition is ClaimDisposition.BUSY for result in results):
+                busy_observed.set()
+            return results
+
+        def renew_many(self, claims):
+            return self.delegate.renew_many(claims)
+
+        def release_many(self, claims):
+            return self.delegate.release_many(claims)
+
+        def finalize_many(self, proposed):
+            return self.delegate.finalize_many(proposed)
+
+    def annotate(fasta: Path, output: Path):
+        with LocalStore.open(store_path) as store:
+            return run_annotation(
+                fasta_path=fasta,
+                output_dir=output,
+                adapter=adapter,
+                store=BusyObservingStore(store),  # type: ignore[arg-type]
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(annotate, first_fasta, tmp_path / "first.duckdb")
+        assert adapter.entered.wait(10)
+        second = executor.submit(annotate, second_fasta, tmp_path / "second.duckdb")
+        assert busy_observed.wait(10)
+        adapter.release.set()
+        futures = (first, second)
+        summaries = tuple(future.result() for future in futures)
+
+    shared_id = read_fasta(first_fasta)[1].identity.sequence_id
+    assert adapter.sequence_calls[shared_id] == 1
+    assert sum(summary.computed for summary in summaries) == 3
+    assert sum(summary.cache_hits for summary in summaries) == 1
+    first_shared = read_result_table(
+        tmp_path / "first.duckdb", "main.annotations"
+    ).filter(pl.col("SequenceID") == shared_id)
+    second_shared = read_result_table(
+        tmp_path / "second.duckdb", "main.annotations"
+    ).filter(pl.col("SequenceID") == shared_id)
+    assert_frame_equal(
+        first_shared.drop("InputOrder", "InputID", "InputHeader", "EvidenceSource"),
+        second_shared.drop("InputOrder", "InputID", "InputHeader", "EvidenceSource"),
+    )
+    assert first_shared.get_column("EvidenceSource").item() == "computed"
+    assert second_shared.get_column("EvidenceSource").item() == "cache"
+    with LocalStore.open(store_path) as store:
+        with store.engine.connect() as connection:
+            claim_rows = connection.execute(
+                select(func.count()).select_from(evidence_claims)
+            ).scalar_one()
+    assert claim_rows == 0
+
+
+def test_lease_renews_through_slow_finalize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("seqevi.store.local._CLAIM_LEASE_SECONDS", 0.2)
+    monkeypatch.setattr("seqevi.store.local._CLAIM_RENEWAL_SECONDS", 0.05)
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+
+    class SlowFinalizeStore:
+        def __init__(self, delegate: LocalStore) -> None:
+            self.delegate = delegate
+            self.supports_claims = True
+
+        def __getattr__(self, name: str):
+            return getattr(self.delegate, name)
+
+        def finalize_many(self, proposed):
+            time.sleep(0.35)
+            return self.delegate.finalize_many(proposed)
+
+    with LocalStore.open(tmp_path / "store") as store:
+        summary = run_annotation(
+            fasta_path=fasta,
+            output_dir=tmp_path / "result.duckdb",
+            adapter=adapter,
+            store=SlowFinalizeStore(store),  # type: ignore[arg-type]
+        )
+
+    assert summary.computed == 1
+
+
+def test_busy_retry_cadence_is_carried_without_real_sleep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(annotate_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(annotate_module, "is_claim_capable_store", lambda _store: True)
+
+    class BusyThenAvailableStore:
+        supports_claims = True
+
+        def __init__(self, delegate: LocalStore) -> None:
+            self.delegate = delegate
+            self.calls = 0
+            self.blocking_claim: EvidenceClaim | None = None
+
+        def __getattr__(self, name: str):
+            return getattr(self.delegate, name)
+
+        def acquire_many(self, queries, *, owner_token: str):
+            requested = tuple(queries)
+            self.calls += 1
+            if self.calls == 1:
+                blocker = self.delegate.acquire_many(requested, owner_token="blocker")
+                self.blocking_claim = blocker[0].claim
+            results = self.delegate.acquire_many(requested, owner_token=owner_token)
+            if self.calls in (1, 2):
+                result = results[0]
+                assert result.busy is not None
+                retry_after = 7.0 if self.calls == 1 else 5.0
+                busy = BusyEvidenceClaim(
+                    result.busy.key, result.busy.expires_at, retry_after
+                )
+                if self.calls == 2:
+                    assert self.blocking_claim is not None
+                    self.delegate.release_many((self.blocking_claim,))
+                return (ClaimAcquireResult(ClaimDisposition.BUSY, busy=busy),)
+            return results
+
+    with LocalStore.open(tmp_path / "store") as delegate:
+        summary = run_annotation(
+            fasta_path=fasta,
+            output_dir=tmp_path / "result.duckdb",
+            adapter=adapter,
+            store=BusyThenAvailableStore(delegate),  # type: ignore[arg-type]
+        )
+
+    assert sleeps == [7.0, 5.0]
+    assert summary.computed == 1
+    assert summary.metrics.tool_batches == 1
+
+
+def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
+    tmp_path: Path,
+) -> None:
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    alphabet = "ACDEFGHIKLMNPQRSTVWY"
+
+    def sequence(index: int) -> str:
+        residues = []
+        for _position in range(5):
+            index, remainder = divmod(index, len(alphabet))
+            residues.append(alphabet[remainder])
+        return "M" + "".join(residues)
+
+    identities = tuple(
+        identify_protein_sequence(sequence(index)) for index in range(1_500)
+    )
+    queries = tuple(
+        EvidenceQuery(identity, adapter.contract.evidence_key(identity))
+        for identity in identities
+    )
+    expiry = datetime.now(UTC) + timedelta(seconds=60)
+    claims = tuple(
+        EvidenceClaim(query.key, "owner", 1, expiry, 0.01) for query in queries
+    )
+    first_chunk = {claim.key for claim in claims[:1_000]}
+    renewal_started = threading.Event()
+    allow_renewal = threading.Event()
+    remaining_renewed = threading.Event()
+
+    class RacingStore:
+        def renew_many(self, requested):
+            batch = tuple(requested)
+            if any(claim.key in first_chunk for claim in batch):
+                renewal_started.set()
+                assert allow_renewal.wait(10)
+                raise EvidenceClaimLostError("finalized chunk")
+            if len(batch) == 500:
+                remaining_renewed.set()
+            return batch
+
+        def lookup_many(self, requested):
+            return {
+                query.key: EvidenceRecord(
+                    query.key,
+                    EvidenceStatus.NO_HIT,
+                    "sha256:" + "0" * 64,
+                    None,
+                    None,
+                    datetime.now(UTC),
+                )
+                for query in requested
+                if query.key in first_chunk
+            }
+
+    renewer = annotate_module._LeaseRenewer(
+        RacingStore(),  # type: ignore[arg-type]
+        claims,
+        {query.key: query for query in queries},
+    )
+    renewer.__enter__()
+    assert renewal_started.wait(10)
+    renewer.complete(first_chunk)
+    allow_renewal.set()
+    assert remaining_renewed.wait(10)
+    renewer.mark_finalized()
+    renewer.__exit__(None, None, None)
+
+    assert {claim.key for claim in renewer.active_claims()} == {
+        claim.key for claim in claims[1_000:]
+    }
+    assert set(renewer.queries_by_key) == {claim.key for claim in claims[1_000:]}
+
+
+def test_1500_annotation_renews_only_remaining_finalize_chunk(tmp_path: Path) -> None:
+    alphabet = "ACDEFGHIKLMNPQRSTVWY"
+
+    def sequence(value: int) -> str:
+        residues = []
+        for _position in range(5):
+            value, remainder = divmod(value, len(alphabet))
+            residues.append(alphabet[remainder])
+        return "M" + "".join(residues)
+
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(
+        "".join(f">protein-{i}\n{sequence(i)}\n" for i in range(1_500)),
+        encoding="utf-8",
+    )
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+
+    class ChunkRaceStore:
+        supports_claims = True
+
+        def __init__(self) -> None:
+            self.claims: dict[EvidenceKey, EvidenceClaim] = {}
+            self.records: dict[EvidenceKey, FetchedEvidence] = {}
+            self.finalize_sizes: list[int] = []
+            self.release_sizes: list[int] = []
+            self.first_chunk: set[EvidenceKey] = set()
+            self.remaining_renewed = threading.Event()
+            self.mutation_lock = threading.Lock()
+
+        def lookup_many(self, queries):
+            return {
+                query.key: self.records[query.key].record
+                for query in queries
+                if query.key in self.records
+            }
+
+        def commit_many(self, commits):
+            raise AssertionError("claim-capable annotation must finalize")
+
+        def fetch_many(self, keys):
+            return {key: self.records[key] for key in keys if key in self.records}
+
+        def fetch(self, key):
+            return self.records.get(key)
+
+        def acquire_many(self, queries, *, owner_token: str):
+            results = []
+            for query in queries:
+                claim = EvidenceClaim(
+                    query.key,
+                    owner_token,
+                    1,
+                    datetime.now(UTC) + timedelta(seconds=60),
+                    0.01,
+                )
+                self.claims[query.key] = claim
+                results.append(
+                    ClaimAcquireResult(ClaimDisposition.ACQUIRED, claim=claim)
+                )
+            return tuple(results)
+
+        def renew_many(self, claims):
+            requested = tuple(claims)
+            with self.mutation_lock:
+                if any(claim.key not in self.claims for claim in requested):
+                    raise EvidenceClaimLostError("finalized claim in renewal snapshot")
+                if self.first_chunk and not any(
+                    claim.key in self.first_chunk for claim in requested
+                ):
+                    if len(requested) == 500:
+                        self.remaining_renewed.set()
+                return requested
+
+        def release_many(self, claims):
+            requested = tuple(claims)
+            self.release_sizes.append(len(requested))
+            for claim in requested:
+                self.claims.pop(claim.key, None)
+
+        def finalize_many(self, proposed):
+            requested = tuple(proposed)
+            self.finalize_sizes.append(len(requested))
+            if len(self.finalize_sizes) == 2:
+                assert self.remaining_renewed.wait(10)
+            with self.mutation_lock:
+                for item in requested:
+                    commit = item.commit
+                    self.claims.pop(commit.key, None)
+                    self.records[commit.key] = FetchedEvidence(
+                        EvidenceRecord(
+                            commit.key,
+                            commit.status,
+                            commit.payload_digest,
+                            None
+                            if commit.normalized_artifact is None
+                            else commit.normalized_artifact.digest,
+                            None
+                            if commit.raw_artifact is None
+                            else commit.raw_artifact.digest,
+                            datetime.now(UTC),
+                        ),
+                        commit.normalized_artifact,
+                        commit.raw_artifact,
+                    )
+                if len(self.finalize_sizes) == 1:
+                    self.first_chunk = {item.commit.key for item in requested}
+            return (CommitOutcome.CREATED,) * len(requested)
+
+    store = ChunkRaceStore()
+    summary = run_annotation(
+        fasta_path=fasta,
+        output_dir=tmp_path / "result.duckdb",
+        adapter=adapter,
+        store=store,  # type: ignore[arg-type]
+    )
+
+    assert store.finalize_sizes == [1_000, 500]
+    assert store.remaining_renewed.is_set()
+    assert summary.computed == 1_500
+    assert store.release_sizes == []
+    assert store.claims == {}
+
+
 def test_annotation_passes_operational_threads_without_changing_contract(
     tmp_path: Path,
 ) -> None:
@@ -255,6 +709,15 @@ def test_failed_annotation_does_not_cache_evidence(
             for identity in identities
         ]
         assert store.lookup_many(queries) == {}
+        with store.engine.connect() as connection:
+            assert (
+                connection.execute(
+                    select(func.count())
+                    .select_from(evidence_claims)
+                    .where(evidence_claims.c.expires_at > datetime.now(UTC))
+                ).scalar_one()
+                == 0
+            )
 
     assert not (tmp_path / "output").exists()
     assert list(tmp_path.glob(".seqevi-annotate-*"))
@@ -356,6 +819,123 @@ def test_annotation_bounds_store_and_tool_batches(
     assert summary.metrics.store_commit_batches == 3
     assert summary.metrics.tool_batches == 2
     assert summary.metrics.unique_artifact_reads == 4
+
+
+def test_claim_capable_10001_misses_use_two_tool_batches_and_drop_claims(
+    tmp_path: Path,
+) -> None:
+    alphabet = "ACDEFGHIKLMNPQRSTVWY"
+
+    def encoded_sequence(value: int) -> str:
+        residues = []
+        for _position in range(6):
+            value, remainder = divmod(value, len(alphabet))
+            residues.append(alphabet[remainder])
+        return "M" + "".join(residues)
+
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(
+        "".join(
+            f">protein-{index}\n{encoded_sequence(index)}\n" for index in range(10_001)
+        ),
+        encoding="utf-8",
+    )
+    adapter = _ConcurrentRecordingAdapter(
+        FixtureAdapter(
+            executable=write_fixture_tool(tmp_path / "fixture-tool"),
+            database=write_fixture_database(tmp_path / "database"),
+        )
+    )
+
+    class RecordingClaimStore:
+        supports_claims = True
+
+        def __init__(self) -> None:
+            self.records: dict[EvidenceKey, FetchedEvidence] = {}
+            self.claims: dict[EvidenceKey, EvidenceClaim] = {}
+            self.finalized_keys: list[EvidenceKey] = []
+            self.released_keys: list[EvidenceKey] = []
+
+        def lookup_many(self, queries):
+            return {
+                query.key: self.records[query.key].record
+                for query in queries
+                if query.key in self.records
+            }
+
+        def commit_many(self, commits):
+            raise AssertionError("claim-capable annotation must finalize")
+
+        def fetch_many(self, keys):
+            return {key: self.records[key] for key in keys if key in self.records}
+
+        def fetch(self, key):
+            return self.records.get(key)
+
+        def acquire_many(self, queries, *, owner_token: str):
+            results = []
+            for query in queries:
+                claim = EvidenceClaim(
+                    query.key,
+                    owner_token,
+                    1,
+                    datetime.now(UTC) + timedelta(seconds=60),
+                    20.0,
+                )
+                self.claims[query.key] = claim
+                results.append(
+                    ClaimAcquireResult(ClaimDisposition.ACQUIRED, claim=claim)
+                )
+            return tuple(results)
+
+        def renew_many(self, claims):
+            return tuple(claims)
+
+        def release_many(self, claims):
+            requested = tuple(claims)
+            self.released_keys.extend(claim.key for claim in requested)
+            for claim in requested:
+                self.claims.pop(claim.key, None)
+
+        def finalize_many(self, proposed):
+            requested = tuple(proposed)
+            self.finalized_keys.extend(item.commit.key for item in requested)
+            for item in requested:
+                commit = item.commit
+                self.claims.pop(commit.key)
+                self.records[commit.key] = FetchedEvidence(
+                    EvidenceRecord(
+                        commit.key,
+                        commit.status,
+                        commit.payload_digest,
+                        None
+                        if commit.normalized_artifact is None
+                        else commit.normalized_artifact.digest,
+                        None
+                        if commit.raw_artifact is None
+                        else commit.raw_artifact.digest,
+                        datetime.now(UTC),
+                    ),
+                    commit.normalized_artifact,
+                    commit.raw_artifact,
+                )
+            return (CommitOutcome.CREATED,) * len(requested)
+
+    store = RecordingClaimStore()
+    summary = run_annotation(
+        fasta_path=fasta,
+        output_dir=tmp_path / "result.duckdb",
+        adapter=adapter,
+        store=store,  # type: ignore[arg-type]
+    )
+
+    assert adapter.calls == 2
+    assert summary.metrics.tool_batches == 2
+    assert summary.computed == 10_001
+    assert len(store.finalized_keys) == 10_001
+    assert len(set(store.finalized_keys)) == 10_001
+    assert store.released_keys == []
+    assert store.claims == {}
 
 
 def test_completed_batch_is_reused_after_later_tool_batch_fails(
