@@ -222,6 +222,14 @@ class ClaimCapabilitiesResponse(TransportModel):
     lease_seconds: Annotated[float, Field(gt=0)]
     renewal_after_seconds: Annotated[float, Field(gt=0)]
 
+    @model_validator(mode="after")
+    def validate_runway(self) -> ClaimCapabilitiesResponse:
+        if self.lease_seconds <= 5.0:
+            raise ValueError("claim lease_seconds must exceed the 5-second runway")
+        if self.renewal_after_seconds > self.lease_seconds - 5.0:
+            raise ValueError("claim renewal cadence must preserve the 5-second runway")
+        return self
+
 
 class EvidenceClaimModel(TransportModel):
     key: EvidenceKeyModel

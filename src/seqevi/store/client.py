@@ -108,7 +108,10 @@ class _ChunkAcquireRenewer:
             raise self._failure
 
     def release_best_effort(self) -> None:
-        claims = tuple(self.claims().values())
+        now = datetime.now(UTC)
+        claims = tuple(
+            claim for claim in self.claims().values() if claim.expires_at > now
+        )
         if not claims:
             return
         try:

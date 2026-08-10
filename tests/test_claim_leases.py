@@ -18,7 +18,9 @@ from seqevi.evidence import (
     ClaimedEvidenceCommit,
     CommitOutcome,
     EvidenceQuery,
+    EvidenceKey,
 )
+from seqevi.sequence import identify_protein_sequence
 from seqevi.store import LocalStore
 from seqevi.store import local as local_module
 from seqevi.store.schema import evidence_claims
@@ -159,6 +161,47 @@ def test_sqlite_concurrent_acquire_has_one_winner(tmp_path: Path) -> None:
     assert not hasattr(busy, "generation")
 
 
+def test_sqlite_full_1000_key_acquire_and_renew_uses_scalable_tail_refresh(
+    tmp_path: Path,
+) -> None:
+    alphabet = "ACDEFGHIKLMNPQRSTVWY"
+
+    def sequence(value: int) -> str:
+        residues = []
+        for _position in range(4):
+            value, remainder = divmod(value, len(alphabet))
+            residues.append(alphabet[remainder])
+        return "M" + "".join(residues)
+
+    identities = tuple(
+        identify_protein_sequence(sequence(index)) for index in range(1_000)
+    )
+    queries = tuple(
+        EvidenceQuery(
+            identity,
+            EvidenceKey.from_parameters(
+                sequence_id=identity.sequence_id,
+                adapter_contract_version="fixture/1",
+                tool_runtime_digest="sha256:" + "a" * 64,
+                resource_id="fixture/1",
+                semantic_parameters={"threshold": 0.01},
+            ),
+        )
+        for identity in identities
+    )
+
+    with LocalStore.open(tmp_path / "store") as store:
+        decisions = store.acquire_many(queries, owner_token="owner")
+        claims = tuple(
+            decision.claim for decision in decisions if decision.claim is not None
+        )
+        renewed = store.renew_many(claims)
+
+    assert len(claims) == 1_000
+    assert len(renewed) == 1_000
+    assert len({claim.expires_at for claim in renewed}) == 1
+
+
 def test_sqlite_refreshes_acquire_expiry_after_later_item_delay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -281,7 +324,7 @@ def test_sqlite_tail_refresh_uses_one_shared_deadline_after_update_delay(
             if (
                 delay_finished is None
                 and statement.lstrip().startswith("UPDATE evidence_claim")
-                and " OR " in statement
+                and " IN " in statement
             ):
                 time.sleep(0.1)
                 delay_finished = datetime.now(UTC)

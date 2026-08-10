@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import and_, create_engine, delete, event, or_, select, update
+from sqlalchemy import and_, create_engine, delete, event, select, tuple_, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping, URL
 
@@ -401,11 +401,11 @@ class LocalStore:
                     refreshed = connection.execute(
                         update(evidence_claims)
                         .where(
-                            or_(
-                                *(
-                                    _claim_exact_clause(claim)
+                            _claim_identity_tuple().in_(
+                                [
+                                    _claim_identity_values(claim)
                                     for _index, claim in authoritative
-                                )
+                                ]
                             )
                         )
                         .values(expires_at=expiry, updated_at=now)
@@ -473,7 +473,11 @@ class LocalStore:
                     expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
                     refreshed = connection.execute(
                         update(evidence_claims)
-                        .where(or_(*(_claim_exact_clause(claim) for claim in renewed)))
+                        .where(
+                            _claim_identity_tuple().in_(
+                                [_claim_identity_values(claim) for claim in renewed]
+                            )
+                        )
                         .values(expires_at=expiry, updated_at=now)
                     )
                     if refreshed.rowcount != len(renewed):
@@ -830,6 +834,24 @@ def _claim_exact_clause(claim: EvidenceClaim) -> Any:
         evidence_claims.c.owner_token == claim.owner_token,
         evidence_claims.c.generation == claim.generation,
     )
+
+
+def _claim_identity_tuple() -> Any:
+    return tuple_(
+        evidence_claims.c.sequence_id,
+        evidence_claims.c.adapter_contract_version,
+        evidence_claims.c.tool_runtime_digest,
+        evidence_claims.c.resource_id,
+        evidence_claims.c.semantic_parameters_hash,
+        evidence_claims.c.owner_token,
+        evidence_claims.c.generation,
+    )
+
+
+def _claim_identity_values(
+    claim: EvidenceClaim,
+) -> tuple[str, str, str, str, str, str, int]:
+    return (*_key_sort_value(claim.key), claim.owner_token, claim.generation)
 
 
 def _key_sort_value(key: EvidenceKey) -> tuple[str, str, str, str, str]:

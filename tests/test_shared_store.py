@@ -522,6 +522,34 @@ def test_claim_capability_auth_and_server_errors_do_not_fall_back(
         HttpEvidenceStore("http://testserver", client=client)
 
 
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        {
+            "maximum_batch_size": 1000,
+            "lease_seconds": 5.0,
+            "renewal_after_seconds": 1.0,
+        },
+        {
+            "maximum_batch_size": 1000,
+            "lease_seconds": 10.0,
+            "renewal_after_seconds": 6.0,
+        },
+    ],
+)
+def test_http_claim_capabilities_require_fixed_runway(
+    capabilities: dict[str, object],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        return httpx.Response(200, json=capabilities)
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with pytest.raises(ValidationError, match="5-second runway"):
+        HttpEvidenceStore("http://testserver", client=client)
+
+
 def _claim_mock_client(handler: httpx.MockTransport) -> httpx.Client:
     return httpx.Client(transport=handler, base_url="http://testserver")
 
@@ -1339,7 +1367,65 @@ def test_http_acquire_rejects_and_releases_expired_returned_authority() -> None:
         with pytest.raises(EvidenceClaimLostError, match="authority runway"):
             store.acquire_many((EvidenceQuery(identity, key),), owner_token="owner")
 
-    assert released.is_set()
+    assert not released.is_set()
+
+
+def test_http_expired_handoff_releases_only_other_live_claims() -> None:
+    queries = tuple(
+        EvidenceQuery(identity, key)
+        for identity, key in (
+            _key(sequence) for sequence in ("MMIXEXPIRED", "MMIXLIVE")
+        )
+    )
+    released_keys: list[EvidenceKey] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(2))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        body = json.loads(request.content)
+        if request.url.path.endswith("/release"):
+            claims = tuple(
+                EvidenceClaimModel.model_validate(data).to_domain()
+                for data in body["claims"]
+            )
+            if any(claim.expires_at <= datetime.now(UTC) for claim in claims):
+                return httpx.Response(412, text="expired credential")
+            released_keys.extend(claim.key for claim in claims)
+            return httpx.Response(
+                200,
+                json={
+                    "released": [
+                        {"key": data["key"], "generation": claim.generation}
+                        for data, claim in zip(body["claims"], claims, strict=True)
+                    ]
+                },
+            )
+        results = []
+        for index, data in enumerate(body["queries"]):
+            query = EvidenceQueryModel.model_validate(data).to_domain()
+            claim = EvidenceClaim(
+                query.key,
+                body["owner_token"],
+                1,
+                datetime.now(UTC) + timedelta(seconds=-1 if index == 0 else 60),
+                20.0,
+            )
+            results.append(
+                ClaimAcquireResultModel.from_domain(
+                    ClaimAcquireResult(ClaimDisposition.ACQUIRED, claim=claim)
+                ).model_dump(mode="json")
+            )
+        return httpx.Response(200, json={"results": results})
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        with pytest.raises(EvidenceClaimLostError) as raised:
+            store.acquire_many(queries, owner_token="owner")
+
+    assert "expired authority runway" in str(raised.value)
+    assert released_keys == [queries[1].key]
 
 
 def test_http_handoff_rejects_six_second_lease_after_two_second_transport() -> None:
@@ -2519,7 +2605,7 @@ def test_postgres_tail_refresh_uses_one_shared_deadline_after_update_delay(
                 if (
                     delay_finished is None
                     and statement.lstrip().startswith("UPDATE evidence_claim")
-                    and " OR " in statement
+                    and " IN " in statement
                 ):
                     time.sleep(0.1)
                     delay_finished = datetime.now(UTC)
