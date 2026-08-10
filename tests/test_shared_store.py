@@ -60,6 +60,7 @@ from seqevi.store.transport import (
     ClaimAcquireResultModel,
     ClaimedCommitModel,
     CommitModel,
+    EvidenceClaimModel,
     EvidenceQueryModel,
 )
 
@@ -678,6 +679,78 @@ def test_http_claim_chunks_honor_client_and_capability_limits() -> None:
     assert observed_sizes == [2, 2, 1]
 
 
+def test_http_claim_chunks_renew_early_authority_while_acquisition_blocks() -> None:
+    queries = tuple(
+        EvidenceQuery(identity, key)
+        for identity, key in (_key(f"MALIVE{letter}") for letter in "AB")
+    )
+    renew_observed = threading.Event()
+    acquire_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal acquire_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "maximum_batch_size": 1,
+                    "lease_seconds": 1.0,
+                    "renewal_after_seconds": 0.01,
+                },
+            )
+        body = json.loads(request.content)
+        if request.url.path.endswith("/renew"):
+            renewed = []
+            for data in body["claims"]:
+                claim = EvidenceClaimModel.model_validate(data).to_domain()
+                renewed.append(
+                    EvidenceClaimModel.from_domain(
+                        EvidenceClaim(
+                            claim.key,
+                            claim.owner_token,
+                            claim.generation,
+                            datetime.now(UTC) + timedelta(seconds=1),
+                            0.01,
+                        )
+                    ).model_dump(mode="json")
+                )
+            renew_observed.set()
+            return httpx.Response(200, json={"claims": renewed})
+        acquire_calls += 1
+        if acquire_calls == 2:
+            assert renew_observed.wait(timeout=1)
+        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
+        acquired = ClaimAcquireResult(
+            ClaimDisposition.ACQUIRED,
+            claim=EvidenceClaim(
+                query.key,
+                body["owner_token"],
+                1,
+                datetime.now(UTC) + timedelta(seconds=1),
+                0.01,
+            ),
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
+                        mode="json"
+                    )
+                ]
+            },
+        )
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        results = store.acquire_many(queries, owner_token="owner")
+
+    assert renew_observed.is_set()
+    assert len(results) == 2
+
+
 def test_shared_store_configuration_requires_postgres_and_postgres_engine(
     tmp_path: Path,
 ) -> None:
@@ -1196,6 +1269,72 @@ def test_postgres_legacy_commit_retires_active_claim(tmp_path: Path) -> None:
 
 
 @pytest.mark.requires_postgres
+def test_postgres_legacy_commit_serializes_absent_claim_acquire(tmp_path: Path) -> None:
+    with _isolated_postgres_url() as database_url:
+        commit = _hit_commit(tmp_path / "sources", "MABSENTCLAIMRACE")
+        query = EvidenceQuery(commit.identity, commit.key)
+        model = CommitModel.from_domain(commit)
+        references = (model.normalized_artifact, model.raw_artifact)
+        stored = {
+            reference.digest: StoredArtifact(
+                digest=reference.digest,
+                media_type=reference.media_type,
+                byte_size=reference.byte_size,
+                relative_path=f"fixture/{reference.digest}",
+            )
+            for reference in references
+            if reference is not None
+        }
+        writer = PostgresEvidencePersistence.open(database_url)
+        acquirer = PostgresEvidencePersistence.open(database_url)
+        legacy_thread: list[int] = []
+        legacy_has_key_lock = threading.Event()
+        allow_legacy_commit = threading.Event()
+
+        def pause_after_key_lock(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: object,
+        ) -> None:
+            if (
+                legacy_thread
+                and threading.get_ident() == legacy_thread[0]
+                and statement.lstrip().startswith("DELETE FROM evidence_claim")
+            ):
+                legacy_has_key_lock.set()
+                assert allow_legacy_commit.wait(timeout=10)
+
+        event.listen(writer.engine, "before_cursor_execute", pause_after_key_lock)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+
+                def publish_legacy():
+                    legacy_thread.append(threading.get_ident())
+                    return writer.commit_many((model,), stored)
+
+                published = executor.submit(publish_legacy)
+                assert legacy_has_key_lock.wait(timeout=10)
+                acquired = executor.submit(
+                    acquirer.acquire_many, (query,), owner_token="calculator"
+                )
+                assert not acquired.done()
+                allow_legacy_commit.set()
+                assert published.result(timeout=10) == (CommitOutcome.CREATED,)
+                decision = acquired.result(timeout=10)[0]
+        finally:
+            allow_legacy_commit.set()
+            event.remove(writer.engine, "before_cursor_execute", pause_after_key_lock)
+            writer.close()
+            acquirer.close()
+
+    assert decision.disposition is ClaimDisposition.CACHED
+    assert decision.claim is None
+
+
+@pytest.mark.requires_postgres
 def test_postgres_legacy_commit_and_finalize_share_lock_order(tmp_path: Path) -> None:
     with _isolated_postgres_url() as database_url:
         commits = (
@@ -1230,34 +1369,15 @@ def test_postgres_legacy_commit_and_finalize_share_lock_order(tmp_path: Path) ->
             for commit, claim in zip(commits, claims, strict=True)
             if claim is not None
         )
-        delete_barrier = threading.Barrier(2)
-        seen_threads: set[int] = set()
-        seen_lock = threading.Lock()
-
-        def align_claim_deletes(
-            _connection: object,
-            _cursor: object,
-            statement: str,
-            _parameters: object,
-            _context: object,
-            _executemany: object,
-        ) -> None:
-            if not statement.lstrip().startswith("DELETE FROM evidence_claim"):
-                return
-            thread_id = threading.get_ident()
-            with seen_lock:
-                if thread_id in seen_threads:
-                    return
-                seen_threads.add(thread_id)
-            delete_barrier.wait(timeout=10)
-
-        event.listen(persistence.engine, "before_cursor_execute", align_claim_deletes)
+        start = threading.Barrier(2)
         try:
 
             def legacy_commit():
+                start.wait(timeout=10)
                 return persistence.commit_many(models, stored)
 
             def claimed_finalize():
+                start.wait(timeout=10)
                 try:
                     return persistence.finalize_many(claimed, stored)
                 except EvidenceClaimLostError:
@@ -1269,9 +1389,6 @@ def test_postgres_legacy_commit_and_finalize_share_lock_order(tmp_path: Path) ->
                 legacy_result = legacy.result(timeout=15)
                 finalize_result = finalize.result(timeout=15)
         finally:
-            event.remove(
-                persistence.engine, "before_cursor_execute", align_claim_deletes
-            )
             cached = persistence.acquire_many(queries, owner_token="peer")
             persistence.close()
 
@@ -1464,10 +1581,17 @@ def test_postgres_finalize_cannot_beat_expiry_takeover(tmp_path: Path) -> None:
             )
             for reference in (model.normalized_artifact, model.raw_artifact)
         }
-        reached_delete = threading.Event()
-        continue_delete = threading.Event()
+        takeover_store = PostgresEvidencePersistence.open(database_url)
+        with takeover_store.engine.begin() as connection:
+            connection.execute(
+                update(evidence_claims).values(
+                    expires_at=datetime.now(UTC) - timedelta(seconds=1)
+                )
+            )
+        takeover_has_key_lock = threading.Event()
+        continue_takeover = threading.Event()
 
-        def pause_before_claim_delete(
+        def pause_takeover_after_key_lock(
             _connection: object,
             _cursor: object,
             statement: str,
@@ -1479,13 +1603,21 @@ def test_postgres_finalize_cannot_beat_expiry_takeover(tmp_path: Path) -> None:
                 statement.startswith("SELECT evidence_claim")
                 and "FOR UPDATE" in statement
             ):
-                reached_delete.set()
-                assert continue_delete.wait(10)
+                takeover_has_key_lock.set()
+                assert continue_takeover.wait(10)
 
         event.listen(
-            persistence.engine, "before_cursor_execute", pause_before_claim_delete
+            takeover_store.engine,
+            "before_cursor_execute",
+            pause_takeover_after_key_lock,
         )
         finalize_errors: list[BaseException] = []
+        takeover_results: list[ClaimAcquireResult] = []
+
+        def take_over() -> None:
+            takeover_results.extend(
+                takeover_store.acquire_many((query,), owner_token="new-owner")
+            )
 
         def finalize() -> None:
             try:
@@ -1500,31 +1632,30 @@ def test_postgres_finalize_cannot_beat_expiry_takeover(tmp_path: Path) -> None:
             except BaseException as error:
                 finalize_errors.append(error)
 
-        thread = threading.Thread(target=finalize)
-        thread.start()
-        assert reached_delete.wait(10)
-        takeover_store = PostgresEvidencePersistence.open(database_url)
+        takeover_thread = threading.Thread(target=take_over)
+        finalize_thread = threading.Thread(target=finalize)
         try:
-            with takeover_store.engine.begin() as connection:
-                connection.execute(
-                    update(evidence_claims).values(
-                        expires_at=datetime.now(UTC) - timedelta(seconds=1)
-                    )
-                )
-            takeover = takeover_store.acquire_many((query,), owner_token="new-owner")[
-                0
-            ].claim
+            takeover_thread.start()
+            assert takeover_has_key_lock.wait(10)
+            finalize_thread.start()
+            assert finalize_thread.is_alive()
+            continue_takeover.set()
+            takeover_thread.join(10)
+            finalize_thread.join(10)
         finally:
+            continue_takeover.set()
+            event.remove(
+                takeover_store.engine,
+                "before_cursor_execute",
+                pause_takeover_after_key_lock,
+            )
             takeover_store.close()
-        continue_delete.set()
-        thread.join(10)
-        event.remove(
-            persistence.engine, "before_cursor_execute", pause_before_claim_delete
-        )
-        persistence.close()
+            persistence.close()
 
-    assert not thread.is_alive()
+    assert not takeover_thread.is_alive()
+    assert not finalize_thread.is_alive()
     assert len(finalize_errors) == 1
     assert isinstance(finalize_errors[0], StoreError)
+    takeover = takeover_results[0].claim
     assert takeover is not None
     assert takeover.generation == claim.generation + 1

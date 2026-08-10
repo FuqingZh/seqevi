@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from sqlalchemy import and_, create_engine, delete, select, update
+from sqlalchemy import and_, create_engine, delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
 
@@ -116,6 +117,7 @@ class PostgresEvidencePersistence:
         _validate_owner_token(owner_token)
         results: dict[EvidenceKey, ClaimAcquireResult] = {}
         with self.engine.begin() as connection:
+            _lock_evidence_keys(connection, (query.key for query in requested))
             for query in sorted(requested, key=lambda item: _key_sort_value(item.key)):
                 _insert_sequence(connection, query.identity)
                 terminal = (
@@ -375,6 +377,7 @@ class PostgresEvidencePersistence:
             raise ValueError("claim renewal contains a duplicate evidence key")
         renewed: dict[EvidenceKey, EvidenceClaim] = {}
         with self.engine.begin() as connection:
+            _lock_evidence_keys(connection, (claim.key for claim in requested))
             for claim in sorted(requested, key=lambda item: _key_sort_value(item.key)):
                 row = (
                     connection.execute(
@@ -432,6 +435,7 @@ class PostgresEvidencePersistence:
         if len({claim.key for claim in requested}) != len(requested):
             raise ValueError("claim release contains a duplicate evidence key")
         with self.engine.begin() as connection:
+            _lock_evidence_keys(connection, (claim.key for claim in requested))
             for claim in sorted(requested, key=lambda item: _key_sort_value(item.key)):
                 row = (
                     connection.execute(
@@ -472,6 +476,9 @@ class PostgresEvidencePersistence:
             raise ValueError("claim finalization contains a duplicate evidence key")
         outcomes: dict[EvidenceKey, CommitOutcome] = {}
         with self.engine.begin() as connection:
+            _lock_evidence_keys(
+                connection, (item.claim.key.to_domain() for item in proposed)
+            )
             for item in sorted(
                 proposed, key=lambda value: _key_sort_value(value.claim.key.to_domain())
             ):
@@ -581,6 +588,9 @@ class PostgresEvidencePersistence:
         )
         outcomes: dict[EvidenceKey, CommitOutcome] = {}
         with self.engine.begin() as connection:
+            _lock_evidence_keys(
+                connection, (commit.key.to_domain() for commit in proposed)
+            )
             for commit in ordered:
                 connection.execute(
                     delete(evidence_claims).where(
@@ -812,6 +822,17 @@ def _key_clause(key: EvidenceKey) -> Any:
         evidence.c.resource_id == key.resource_id,
         evidence.c.semantic_parameters_hash == key.semantic_parameters_hash,
     )
+
+
+def _lock_evidence_keys(connection: Connection, keys: Iterable[EvidenceKey]) -> None:
+    """Serialize mutations even when neither evidence nor claim rows exist."""
+
+    for key in sorted(set(keys), key=_key_sort_value):
+        digest = hashlib.sha256("\0".join(_key_sort_value(key)).encode()).digest()
+        lock_id = int.from_bytes(digest[:8], byteorder="big", signed=True)
+        connection.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id}
+        )
 
 
 def _claim_key_values(key: EvidenceKey) -> dict[str, str]:

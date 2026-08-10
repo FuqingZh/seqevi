@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import threading
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,62 @@ from .transport import (
     LookupRequest,
     LookupResponse,
 )
+
+
+class _ChunkAcquireRenewer:
+    """Keep early HTTP acquisition chunks alive until the whole call returns."""
+
+    def __init__(self, store: HttpEvidenceStore) -> None:
+        self._store = store
+        self._claims: dict[EvidenceKey, EvidenceClaim] = {}
+        self._lock = threading.Lock()
+        self._changed = threading.Event()
+        self._stopped = threading.Event()
+        self._failure: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def add(self, claim: EvidenceClaim) -> None:
+        with self._lock:
+            self._claims[claim.key] = claim
+        self._changed.set()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        self._changed.set()
+        self._thread.join()
+
+    def claims(self) -> dict[EvidenceKey, EvidenceClaim]:
+        with self._lock:
+            return dict(self._claims)
+
+    def raise_if_failed(self) -> None:
+        if self._failure is not None:
+            raise self._failure
+
+    def _run(self) -> None:
+        while not self._stopped.is_set():
+            self._changed.clear()
+            with self._lock:
+                snapshot = tuple(self._claims.values())
+            cadence = min(
+                (claim.renewal_after_seconds for claim in snapshot), default=1.0
+            )
+            if self._changed.wait(cadence) or self._stopped.is_set():
+                continue
+            try:
+                renewed = self._store.renew_many(snapshot)
+            except BaseException as error:
+                self._failure = error
+                self._stopped.set()
+                return
+            with self._lock:
+                for claim in renewed:
+                    if claim.key in self._claims:
+                        self._claims[claim.key] = claim
+
 
 _TRANSFER_CHUNK_SIZE = 1024 * 1024
 
@@ -214,42 +271,59 @@ class HttpEvidenceStore:
             raise ValueError("acquire batch contains a duplicate evidence query")
         capabilities = self._require_claims()
         results = []
+        renewer = _ChunkAcquireRenewer(self)
         maximum = min(capabilities.maximum_batch_size, self.maximum_batch_size, 1000)
-        for offset in range(0, len(requested), maximum):
-            chunk = requested[offset : offset + maximum]
-            request = ClaimAcquireRequest(
-                owner_token=owner_token,
-                queries=[EvidenceQueryModel.from_domain(query) for query in chunk],
-            )
-            response = self._claim_request(
-                "POST",
-                "/v1/evidence/claims/acquire",
-                json=request.model_dump(mode="json"),
-            )
-            payload = ClaimAcquireResponse.model_validate(response.json())
-            if len(payload.results) != len(chunk):
-                raise StoreIntegrityError(
-                    "shared Store returned incomplete claim results"
+        renewer.start()
+        try:
+            for offset in range(0, len(requested), maximum):
+                chunk = requested[offset : offset + maximum]
+                request = ClaimAcquireRequest(
+                    owner_token=owner_token,
+                    queries=[EvidenceQueryModel.from_domain(query) for query in chunk],
                 )
-            for query, model in zip(chunk, payload.results, strict=True):
-                result = model.to_domain()
-                if result.record is not None:
-                    key = result.record.key
-                elif result.claim is not None:
-                    key = result.claim.key
-                else:
-                    assert result.busy is not None
-                    key = result.busy.key
-                if key != query.key:
+                response = self._claim_request(
+                    "POST",
+                    "/v1/evidence/claims/acquire",
+                    json=request.model_dump(mode="json"),
+                )
+                payload = ClaimAcquireResponse.model_validate(response.json())
+                if len(payload.results) != len(chunk):
                     raise StoreIntegrityError(
-                        "shared Store returned a mismatched claim result"
+                        "shared Store returned incomplete claim results"
                     )
-                if result.claim is not None and result.claim.owner_token != owner_token:
-                    raise StoreIntegrityError(
-                        "shared Store returned claim credentials for another owner"
-                    )
-                results.append(result)
-        return tuple(results)
+                for query, model in zip(chunk, payload.results, strict=True):
+                    result = model.to_domain()
+                    if result.record is not None:
+                        key = result.record.key
+                    elif result.claim is not None:
+                        key = result.claim.key
+                    else:
+                        assert result.busy is not None
+                        key = result.busy.key
+                    if key != query.key:
+                        raise StoreIntegrityError(
+                            "shared Store returned a mismatched claim result"
+                        )
+                    if (
+                        result.claim is not None
+                        and result.claim.owner_token != owner_token
+                    ):
+                        raise StoreIntegrityError(
+                            "shared Store returned claim credentials for another owner"
+                        )
+                    results.append(result)
+                    if result.claim is not None:
+                        renewer.add(result.claim)
+        finally:
+            renewer.stop()
+        renewer.raise_if_failed()
+        current = renewer.claims()
+        return tuple(
+            ClaimAcquireResult(result.disposition, claim=current[result.claim.key])
+            if result.claim is not None
+            else result
+            for result in results
+        )
 
     def renew_many(self, claims: Iterable[EvidenceClaim]) -> tuple[EvidenceClaim, ...]:
         """Renew authoritative claims in service-bounded chunks.
