@@ -33,6 +33,7 @@ from seqevi.evidence import (
     EvidenceRecord,
     EvidenceStatus,
     FetchedEvidence,
+    sha256_digest,
 )
 from seqevi.sequence import identify_protein_sequence, read_fasta, unique_identities
 from seqevi.store import LocalStore
@@ -43,6 +44,7 @@ from .support import (
     FixtureAdapter,
     NeverRunAdapter,
     read_result_table,
+    write_artifact_file,
     write_fixture_database,
     write_fixture_tool,
 )
@@ -369,6 +371,64 @@ def test_lease_renews_through_slow_finalize(
         )
 
     assert summary.computed == 1
+
+
+def test_legacy_terminal_wins_while_claimed_adapter_is_blocked(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = _ConcurrentRecordingAdapter(
+        FixtureAdapter(
+            executable=write_fixture_tool(tmp_path / "fixture-tool"),
+            database=write_fixture_database(tmp_path / "database"),
+        ),
+        block_first=True,
+    )
+    store_path = tmp_path / "store"
+    with LocalStore.open(store_path):
+        pass
+
+    def annotate():
+        with LocalStore.open(store_path) as store:
+            return run_annotation(
+                fasta_path=fasta,
+                output_dir=tmp_path / "result.duckdb",
+                adapter=adapter,
+                store=store,
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(annotate)
+        assert adapter.entered.wait(10)
+        identity = identify_protein_sequence("MPEPTIDE")
+        peer_commit = EvidenceCommit(
+            identity=identity,
+            key=adapter.contract.evidence_key(identity),
+            status=EvidenceStatus.NO_HIT,
+            payload_digest=sha256_digest(b"peer-terminal"),
+            raw_artifact=write_artifact_file(
+                tmp_path / "peer.raw.tsv", b"peer-terminal", "text/plain"
+            ),
+        )
+        with LocalStore.open(store_path) as peer_store:
+            assert peer_store.commit_many((peer_commit,)) == (CommitOutcome.CREATED,)
+        adapter.release.set()
+        summary = future.result(timeout=20)
+
+    with LocalStore.open(store_path) as store:
+        fetched = store.fetch(peer_commit.key)
+        with store.engine.connect() as connection:
+            claim_rows = connection.execute(
+                select(func.count()).select_from(evidence_claims)
+            ).scalar_one()
+
+    assert summary.computed == 0
+    assert summary.cache_hits == 1
+    assert summary.no_hits == 1
+    assert fetched is not None
+    assert fetched.record.payload_digest == peer_commit.payload_digest
+    assert claim_rows == 0
 
 
 def test_busy_retry_cadence_is_carried_without_real_sleep(

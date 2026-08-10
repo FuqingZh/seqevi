@@ -337,6 +337,36 @@ class PostgresEvidencePersistence:
                             query.key, _as_utc(row["expires_at"]), CLAIM_RETRY_SECONDS
                         ),
                     )
+            for query in sorted(requested, key=lambda item: _key_sort_value(item.key)):
+                result = results[query.key]
+                if result.claim is None:
+                    continue
+                terminal = (
+                    connection.execute(select(evidence).where(_key_clause(query.key)))
+                    .mappings()
+                    .one_or_none()
+                )
+                if terminal is not None:
+                    connection.execute(
+                        delete(evidence_claims).where(_claim_key_clause(query.key))
+                    )
+                    results[query.key] = ClaimAcquireResult(
+                        ClaimDisposition.CACHED, record=_record_from_row(terminal)
+                    )
+                    continue
+                now = datetime.now(UTC)
+                expiry = now + timedelta(seconds=CLAIM_LEASE_SECONDS)
+                connection.execute(
+                    update(evidence_claims)
+                    .where(_claim_exact_clause(result.claim))
+                    .values(expires_at=expiry, updated_at=now)
+                )
+                results[query.key] = _acquired_result(
+                    query.key,
+                    result.claim.owner_token,
+                    result.claim.generation,
+                    expiry,
+                )
         return tuple(results[query.key] for query in requested)
 
     def renew_many(self, claims: Iterable[EvidenceClaim]) -> tuple[EvidenceClaim, ...]:
@@ -369,6 +399,23 @@ class PostgresEvidencePersistence:
                 connection.execute(
                     update(evidence_claims)
                     .where(_claim_key_clause(claim.key))
+                    .values(expires_at=expiry, updated_at=now)
+                )
+                renewed[claim.key] = EvidenceClaim(
+                    claim.key,
+                    claim.owner_token,
+                    claim.generation,
+                    expiry,
+                    CLAIM_RENEWAL_SECONDS,
+                )
+            for claim in sorted(
+                renewed.values(), key=lambda item: _key_sort_value(item.key)
+            ):
+                now = datetime.now(UTC)
+                expiry = now + timedelta(seconds=CLAIM_LEASE_SECONDS)
+                connection.execute(
+                    update(evidence_claims)
+                    .where(_claim_exact_clause(claim))
                     .values(expires_at=expiry, updated_at=now)
                 )
                 renewed[claim.key] = EvidenceClaim(
@@ -793,6 +840,14 @@ def _claim_owner_clause(claim: EvidenceClaim, now: datetime) -> Any:
         evidence_claims.c.owner_token == claim.owner_token,
         evidence_claims.c.generation == claim.generation,
         evidence_claims.c.expires_at > now,
+    )
+
+
+def _claim_exact_clause(claim: EvidenceClaim) -> Any:
+    return and_(
+        _claim_key_clause(claim.key),
+        evidence_claims.c.owner_token == claim.owner_token,
+        evidence_claims.c.generation == claim.generation,
     )
 
 

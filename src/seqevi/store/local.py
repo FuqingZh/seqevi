@@ -389,6 +389,22 @@ class LocalStore:
                                 ),
                             )
                         )
+                for index, result in enumerate(results):
+                    if result.claim is None:
+                        continue
+                    now = datetime.now(UTC)
+                    expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
+                    connection.execute(
+                        update(evidence_claims)
+                        .where(_claim_exact_clause(result.claim))
+                        .values(expires_at=expiry, updated_at=now)
+                    )
+                    results[index] = _acquired_result(
+                        result.claim.key,
+                        result.claim.owner_token,
+                        result.claim.generation,
+                        expiry,
+                    )
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -433,6 +449,21 @@ class LocalStore:
                             expiry,
                             _CLAIM_RENEWAL_SECONDS,
                         )
+                    )
+                for index, claim in enumerate(renewed):
+                    now = datetime.now(UTC)
+                    expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
+                    connection.execute(
+                        update(evidence_claims)
+                        .where(_claim_exact_clause(claim))
+                        .values(expires_at=expiry, updated_at=now)
+                    )
+                    renewed[index] = EvidenceClaim(
+                        claim.key,
+                        claim.owner_token,
+                        claim.generation,
+                        expiry,
+                        _CLAIM_RENEWAL_SECONDS,
                     )
                 connection.commit()
             except Exception:
@@ -762,6 +793,14 @@ def _claim_owner_clause(claim: EvidenceClaim, now: datetime) -> Any:
         evidence_claims.c.owner_token == claim.owner_token,
         evidence_claims.c.generation == claim.generation,
         evidence_claims.c.expires_at > now,
+    )
+
+
+def _claim_exact_clause(claim: EvidenceClaim) -> Any:
+    return and_(
+        _claim_key_clause(claim.key),
+        evidence_claims.c.owner_token == claim.owner_token,
+        evidence_claims.c.generation == claim.generation,
     )
 
 

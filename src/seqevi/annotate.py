@@ -87,6 +87,7 @@ class _BatchMetrics:
     commit_batches: int
     adapter_seconds: float
     store_commit_seconds: float
+    peer_completed_sequence_ids: frozenset[str] = frozenset()
 
 
 class _MeasuringToolRunner(ToolRunner):
@@ -228,6 +229,9 @@ def run_annotation(
                 commit_batches += batch_metrics.commit_batches
                 adapter_seconds += batch_metrics.adapter_seconds
                 store_commit_seconds += batch_metrics.store_commit_seconds
+                computed_ids.difference_update(
+                    batch_metrics.peer_completed_sequence_ids
+                )
 
         if pending_misses:
             computed_ids.update(identity.sequence_id for identity in pending_misses)
@@ -247,6 +251,7 @@ def run_annotation(
             commit_batches += batch_metrics.commit_batches
             adapter_seconds += batch_metrics.adapter_seconds
             store_commit_seconds += batch_metrics.store_commit_seconds
+            computed_ids.difference_update(batch_metrics.peer_completed_sequence_ids)
 
         while busy_queries:
             time.sleep(busy_retry_after or 1.0)
@@ -296,6 +301,9 @@ def run_annotation(
                 commit_batches += batch_metrics.commit_batches
                 adapter_seconds += batch_metrics.adapter_seconds
                 store_commit_seconds += batch_metrics.store_commit_seconds
+                computed_ids.difference_update(
+                    batch_metrics.peer_completed_sequence_ids
+                )
             busy_queries = next_busy
             busy_retry_after = next_retry_after
 
@@ -474,25 +482,88 @@ def _run_annotation_batch(
     adapter_seconds = time.perf_counter() - adapter_started
     commits = _build_commits(batch=batch, identities=identities, adapter=adapter)
     batches = 0
+    peer_completed_sequence_ids: set[str] = set()
     commit_started = time.perf_counter()
     for commit_batch in batched(commits, _STORE_BATCH_SIZE):
         if claim_store is None:
             store.commit_many(commit_batch)
+            batches += 1
         else:
             assert renewer is not None
             renewer.raise_if_failed()
-            proposed = tuple(
-                ClaimedEvidenceCommit(commit, renewer.claim_for(commit.key))
-                for commit in commit_batch
+            finalize_batches, peer_completed = _finalize_current_claims(
+                commits=commit_batch,
+                store=claim_store,
+                renewer=renewer,
             )
-            claim_store.finalize_many(proposed)
-            renewer.complete(item.commit.key for item in proposed)
-        batches += 1
+            batches += finalize_batches
+            peer_completed_sequence_ids.update(peer_completed)
     return _BatchMetrics(
         commit_batches=batches,
         adapter_seconds=adapter_seconds,
         store_commit_seconds=time.perf_counter() - commit_started,
+        peer_completed_sequence_ids=frozenset(peer_completed_sequence_ids),
     )
+
+
+def _finalize_current_claims(
+    *,
+    commits: tuple[EvidenceCommit, ...],
+    store: ClaimCapableEvidenceStore,
+    renewer: _LeaseRenewer,
+) -> tuple[int, set[str]]:
+    """Finalize current authority and classify concurrent terminal winners."""
+
+    remaining = list(commits)
+    peer_completed: set[str] = set()
+    requests = 0
+    while remaining:
+        claims = renewer.claims_for(commit.key for commit in remaining)
+        missing = tuple(commit for commit in remaining if commit.key not in claims)
+        if missing:
+            terminal = store.lookup_many(
+                EvidenceQuery(commit.identity, commit.key) for commit in missing
+            )
+            terminal_keys = set(terminal)
+            nonterminal = [
+                commit for commit in missing if commit.key not in terminal_keys
+            ]
+            if nonterminal:
+                raise EvidenceClaimLostError(
+                    "claim ownership was lost before terminal evidence publication"
+                )
+            renewer.complete(terminal_keys)
+            peer_completed.update(key.sequence_id for key in terminal_keys)
+            remaining = [
+                commit for commit in remaining if commit.key not in terminal_keys
+            ]
+            if not remaining:
+                break
+            claims = renewer.claims_for(commit.key for commit in remaining)
+
+        proposed = tuple(
+            ClaimedEvidenceCommit(commit, claims[commit.key]) for commit in remaining
+        )
+        try:
+            requests += 1
+            store.finalize_many(proposed)
+        except EvidenceClaimLostError:
+            terminal = store.lookup_many(
+                EvidenceQuery(item.commit.identity, item.commit.key)
+                for item in proposed
+            )
+            terminal_keys = set(terminal)
+            if not terminal_keys:
+                raise
+            renewer.complete(terminal_keys)
+            peer_completed.update(key.sequence_id for key in terminal_keys)
+            remaining = [
+                item.commit for item in proposed if item.commit.key not in terminal_keys
+            ]
+        else:
+            renewer.complete(item.commit.key for item in proposed)
+            break
+    return requests, peer_completed
 
 
 def _build_commits(
@@ -569,9 +640,11 @@ class _LeaseRenewer:
         if self.thread is not None:
             self.thread.join()
 
-    def claim_for(self, key: EvidenceKey) -> EvidenceClaim:
+    def claims_for(
+        self, keys: Iterable[EvidenceKey]
+    ) -> dict[EvidenceKey, EvidenceClaim]:
         with self.lock:
-            return self.claims[key]
+            return {key: self.claims[key] for key in keys if key in self.claims}
 
     def add(self, claim: EvidenceClaim, query: EvidenceQuery) -> None:
         """Begin renewing one newly acquired claim until it is completed."""

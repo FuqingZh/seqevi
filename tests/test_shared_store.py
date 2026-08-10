@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import threading
+import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -1197,14 +1198,24 @@ def test_postgres_legacy_commit_retires_active_claim(tmp_path: Path) -> None:
 @pytest.mark.requires_postgres
 def test_postgres_legacy_commit_and_finalize_share_lock_order(tmp_path: Path) -> None:
     with _isolated_postgres_url() as database_url:
-        commit = _hit_commit(tmp_path / "sources", "MCOMMITFINALIZEORDER")
-        query = EvidenceQuery(commit.identity, commit.key)
+        commits = (
+            _hit_commit(tmp_path / "sources-a", "MCOMMITFINALIZEORDERA"),
+            _hit_commit(tmp_path / "sources-b", "MCOMMITFINALIZEORDERB"),
+        )
+        queries = tuple(
+            EvidenceQuery(commit.identity, commit.key) for commit in commits
+        )
         persistence = PostgresEvidencePersistence.open(database_url)
-        claim = persistence.acquire_many((query,), owner_token="calculator")[0].claim
-        assert claim is not None
-        model = CommitModel.from_domain(commit)
-        assert model.normalized_artifact is not None
-        assert model.raw_artifact is not None
+        decisions = persistence.acquire_many(queries, owner_token="calculator")
+        claims = tuple(decision.claim for decision in decisions)
+        assert all(claim is not None for claim in claims)
+        models = tuple(CommitModel.from_domain(commit) for commit in commits)
+        references = {
+            reference.digest: reference
+            for model in models
+            for reference in (model.normalized_artifact, model.raw_artifact)
+            if reference is not None
+        }
         stored = {
             reference.digest: StoredArtifact(
                 digest=reference.digest,
@@ -1212,9 +1223,13 @@ def test_postgres_legacy_commit_and_finalize_share_lock_order(tmp_path: Path) ->
                 byte_size=reference.byte_size,
                 relative_path=f"fixture/{reference.digest}",
             )
-            for reference in (model.normalized_artifact, model.raw_artifact)
+            for reference in references.values()
         }
-        claimed = ClaimedCommitModel.from_domain(ClaimedEvidenceCommit(commit, claim))
+        claimed = tuple(
+            ClaimedCommitModel.from_domain(ClaimedEvidenceCommit(commit, claim))
+            for commit, claim in zip(commits, claims, strict=True)
+            if claim is not None
+        )
         delete_barrier = threading.Barrier(2)
         seen_threads: set[int] = set()
         seen_lock = threading.Lock()
@@ -1240,11 +1255,11 @@ def test_postgres_legacy_commit_and_finalize_share_lock_order(tmp_path: Path) ->
         try:
 
             def legacy_commit():
-                return persistence.commit_many((model,), stored)
+                return persistence.commit_many(models, stored)
 
             def claimed_finalize():
                 try:
-                    return persistence.finalize_many((claimed,), stored)
+                    return persistence.finalize_many(claimed, stored)
                 except EvidenceClaimLostError:
                     return "lost"
 
@@ -1257,18 +1272,18 @@ def test_postgres_legacy_commit_and_finalize_share_lock_order(tmp_path: Path) ->
             event.remove(
                 persistence.engine, "before_cursor_execute", align_claim_deletes
             )
-            cached = persistence.acquire_many((query,), owner_token="peer")[0]
+            cached = persistence.acquire_many(queries, owner_token="peer")
             persistence.close()
 
     assert legacy_result in {
-        (CommitOutcome.CREATED,),
-        (CommitOutcome.EXISTING,),
+        (CommitOutcome.CREATED, CommitOutcome.CREATED),
+        (CommitOutcome.EXISTING, CommitOutcome.EXISTING),
     }
     assert finalize_result in {
-        (CommitOutcome.CREATED,),
+        (CommitOutcome.CREATED, CommitOutcome.CREATED),
         "lost",
     }
-    assert cached.disposition is ClaimDisposition.CACHED
+    assert all(item.disposition is ClaimDisposition.CACHED for item in cached)
 
 
 @pytest.mark.requires_postgres
@@ -1282,22 +1297,150 @@ def test_postgres_claim_batches_lock_in_canonical_order(tmp_path: Path) -> None:
             EvidenceQuery(commit.identity, commit.key) for commit in commits
         )
 
-        def acquire(order: tuple[EvidenceQuery, ...], owner: str):
-            persistence = PostgresEvidencePersistence.open(database_url)
-            try:
-                return persistence.acquire_many(order, owner_token=owner)
-            finally:
-                persistence.close()
+        first_persistence = PostgresEvidencePersistence.open(database_url)
+        second_persistence = PostgresEvidencePersistence.open(database_url)
+        start = threading.Barrier(2)
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            first = executor.submit(acquire, queries, "owner-a")
-            second = executor.submit(acquire, tuple(reversed(queries)), "owner-b")
-            decisions = (first.result(timeout=15), second.result(timeout=15))
+        def acquire(
+            persistence: PostgresEvidencePersistence,
+            order: tuple[EvidenceQuery, ...],
+            owner: str,
+        ):
+            start.wait(timeout=10)
+            return persistence.acquire_many(order, owner_token=owner)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(acquire, first_persistence, queries, "owner-a")
+                second = executor.submit(
+                    acquire,
+                    second_persistence,
+                    tuple(reversed(queries)),
+                    "owner-b",
+                )
+                decisions = (first.result(timeout=15), second.result(timeout=15))
+        finally:
+            first_persistence.close()
+            second_persistence.close()
 
     assert sorted(
         sum(item.disposition is ClaimDisposition.ACQUIRED for item in result)
         for result in decisions
     ) == [0, 2]
+
+
+@pytest.mark.requires_postgres
+def test_postgres_refreshes_acquire_expiry_after_later_row_lock_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("seqevi.service.persistence.CLAIM_LEASE_SECONDS", 0.2)
+    with _isolated_postgres_url() as database_url:
+        commits = (
+            _hit_commit(tmp_path / "sources-a", "MACQUIREWAITA"),
+            _hit_commit(tmp_path / "sources-b", "MACQUIREWAITB"),
+        )
+        queries = tuple(
+            sorted(
+                (EvidenceQuery(commit.identity, commit.key) for commit in commits),
+                key=lambda query: (
+                    query.key.sequence_id,
+                    query.key.adapter_contract_version,
+                    query.key.tool_runtime_digest,
+                    query.key.resource_id,
+                    query.key.semantic_parameters_hash,
+                ),
+            )
+        )
+        primary = PostgresEvidencePersistence.open(database_url)
+        blocker = PostgresEvidencePersistence.open(database_url)
+        blocked_claim = blocker.acquire_many((queries[1],), owner_token="blocker")[
+            0
+        ].claim
+        assert blocked_claim is not None
+        lock_connection = blocker.engine.connect()
+        transaction = lock_connection.begin()
+        lock_connection.execute(
+            select(evidence_claims)
+            .where(evidence_claims.c.sequence_id == queries[1].key.sequence_id)
+            .with_for_update()
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    primary.acquire_many, queries, owner_token="calculator"
+                )
+                time.sleep(0.3)
+                transaction.commit()
+                decisions = future.result(timeout=10)
+        finally:
+            if transaction.is_active:
+                transaction.rollback()
+            lock_connection.close()
+            primary.close()
+            blocker.close()
+
+    claims = tuple(decision.claim for decision in decisions)
+    assert all(claim is not None for claim in claims)
+    assert all(claim.expires_at > datetime.now(UTC) for claim in claims if claim)
+
+
+@pytest.mark.requires_postgres
+def test_postgres_refreshes_renewal_expiry_after_later_row_lock_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("seqevi.service.persistence.CLAIM_LEASE_SECONDS", 0.2)
+    with _isolated_postgres_url() as database_url:
+        commits = (
+            _hit_commit(tmp_path / "sources-a", "MRENEWWAITA"),
+            _hit_commit(tmp_path / "sources-b", "MRENEWWAITB"),
+        )
+        queries = tuple(
+            sorted(
+                (EvidenceQuery(commit.identity, commit.key) for commit in commits),
+                key=lambda query: (
+                    query.key.sequence_id,
+                    query.key.adapter_contract_version,
+                    query.key.tool_runtime_digest,
+                    query.key.resource_id,
+                    query.key.semantic_parameters_hash,
+                ),
+            )
+        )
+        primary = PostgresEvidencePersistence.open(database_url)
+        locker = PostgresEvidencePersistence.open(database_url)
+        decisions = primary.acquire_many(queries, owner_token="calculator")
+        claims = tuple(decision.claim for decision in decisions)
+        assert all(claim is not None for claim in claims)
+        with primary.engine.begin() as connection:
+            connection.execute(
+                update(evidence_claims)
+                .where(evidence_claims.c.sequence_id == queries[1].key.sequence_id)
+                .values(expires_at=datetime.now(UTC) + timedelta(seconds=5))
+            )
+        lock_connection = locker.engine.connect()
+        transaction = lock_connection.begin()
+        lock_connection.execute(
+            select(evidence_claims)
+            .where(evidence_claims.c.sequence_id == queries[1].key.sequence_id)
+            .with_for_update()
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    primary.renew_many,
+                    tuple(claim for claim in claims if claim is not None),
+                )
+                time.sleep(0.3)
+                transaction.commit()
+                renewed = future.result(timeout=10)
+        finally:
+            if transaction.is_active:
+                transaction.rollback()
+            lock_connection.close()
+            primary.close()
+            locker.close()
+
+    assert all(claim.expires_at > datetime.now(UTC) for claim in renewed)
 
 
 @pytest.mark.requires_postgres

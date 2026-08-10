@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import func, select, update
+from sqlalchemy import event, func, select, update
 
 from seqevi.errors import EvidenceClaimLostError
 from seqevi.evidence import (
@@ -147,6 +147,93 @@ def test_sqlite_concurrent_acquire_has_one_winner(tmp_path: Path) -> None:
     busy = next(result.busy for result in results if result.busy is not None)
     assert not hasattr(busy, "owner_token")
     assert not hasattr(busy, "generation")
+
+
+def test_sqlite_refreshes_acquire_expiry_after_later_item_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("seqevi.store.local._CLAIM_LEASE_SECONDS", 0.05)
+    commits = (
+        make_hit_commit("MLEASEFIRST", artifact_dir=tmp_path / "first"),
+        make_hit_commit("MLEASESECOND", artifact_dir=tmp_path / "second"),
+    )
+    queries = tuple(EvidenceQuery(commit.identity, commit.key) for commit in commits)
+    with LocalStore.open(tmp_path / "store") as store:
+        claim_selects = 0
+
+        def delay_second_claim_select(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: object,
+        ) -> None:
+            nonlocal claim_selects
+            if "FROM evidence_claim" not in statement:
+                return
+            claim_selects += 1
+            if claim_selects == 2:
+                import time
+
+                time.sleep(0.1)
+
+        event.listen(store.engine, "before_cursor_execute", delay_second_claim_select)
+        try:
+            results = store.acquire_many(queries, owner_token="owner")
+        finally:
+            event.remove(
+                store.engine, "before_cursor_execute", delay_second_claim_select
+            )
+
+    claims = tuple(result.claim for result in results)
+    assert all(claim is not None for claim in claims)
+    assert all(claim.expires_at > datetime.now(UTC) for claim in claims if claim)
+
+
+def test_sqlite_refreshes_renewal_expiry_after_later_item_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("seqevi.store.local._CLAIM_LEASE_SECONDS", 0.05)
+    commits = (
+        make_hit_commit("MRENEWFIRST", artifact_dir=tmp_path / "first"),
+        make_hit_commit("MRENEWSECOND", artifact_dir=tmp_path / "second"),
+    )
+    queries = tuple(EvidenceQuery(commit.identity, commit.key) for commit in commits)
+    with LocalStore.open(tmp_path / "store") as store:
+        acquired = store.acquire_many(queries, owner_token="owner")
+        claims = tuple(result.claim for result in acquired)
+        assert all(claim is not None for claim in claims)
+        claim_updates = 0
+
+        def delay_second_claim_update(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: object,
+        ) -> None:
+            nonlocal claim_updates
+            if not statement.lstrip().startswith("UPDATE evidence_claim"):
+                return
+            claim_updates += 1
+            if claim_updates == 2:
+                import time
+
+                time.sleep(0.1)
+
+        event.listen(store.engine, "before_cursor_execute", delay_second_claim_update)
+        try:
+            renewed = store.renew_many(
+                tuple(claim for claim in claims if claim is not None)
+            )
+        finally:
+            event.remove(
+                store.engine, "before_cursor_execute", delay_second_claim_update
+            )
+
+    assert all(claim.expires_at > datetime.now(UTC) for claim in renewed)
 
 
 def test_sqlite_renew_release_expiry_and_same_owner_takeover(tmp_path: Path) -> None:
