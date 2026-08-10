@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import batched
@@ -698,9 +698,14 @@ class _LeaseRenewer:
             with self.lock:
                 now = time.monotonic()
                 due_keys = tuple(
-                    key
-                    for key, deadline in self.deadlines.items()
-                    if deadline <= now + 0.01
+                    sorted(
+                        (
+                            key
+                            for key, deadline in self.deadlines.items()
+                            if deadline <= now + 0.01
+                        ),
+                        key=self.deadlines.__getitem__,
+                    )
                 )
                 snapshot = tuple(
                     (self.claims[key], self.queries_by_key[key]) for key in due_keys
@@ -715,7 +720,17 @@ class _LeaseRenewer:
                 with ThreadPoolExecutor(
                     max_workers=min(len(pair_batches), 32)
                 ) as executor:
-                    tuple(executor.map(self._renew_batch, pair_batches))
+                    futures = {
+                        executor.submit(self._renew_batch, pair_batch)
+                        for pair_batch in pair_batches
+                    }
+                    try:
+                        for future in as_completed(futures):
+                            future.result()
+                    except BaseException:
+                        for future in futures:
+                            future.cancel()
+                        raise
             except BaseException as error:
                 self.error = error
                 self.stop.set()

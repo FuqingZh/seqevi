@@ -611,6 +611,80 @@ def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
     assert sorted(renewal_sizes) == [500, 999, 1_000]
 
 
+def test_invocation_renewer_submits_outer_batches_by_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(annotate_module, "_STORE_BATCH_SIZE", 2)
+    identities = tuple(
+        identify_protein_sequence(sequence)
+        for sequence in ("MDEADLINELATEA", "MDEADLINELATEB", "MDEADLINEURGENT")
+    )
+    keys = tuple(
+        EvidenceKey.from_parameters(
+            sequence_id=identity.sequence_id,
+            adapter_contract_version="fixture/v1",
+            tool_runtime_digest="sha256:" + "b" * 64,
+            resource_id="fixture-resource",
+            semantic_parameters={},
+        )
+        for identity in identities
+    )
+    queries = tuple(
+        EvidenceQuery(identity, key)
+        for identity, key in zip(identities, keys, strict=True)
+    )
+    claims = tuple(
+        EvidenceClaim(
+            key,
+            "owner",
+            1,
+            datetime.now(UTC) + timedelta(seconds=60),
+            20.0,
+        )
+        for key in keys
+    )
+    urgent_key = keys[-1]
+    urgent_started = threading.Event()
+    both_batches = threading.Event()
+    call_count = 0
+    call_lock = threading.Lock()
+
+    class RecordingStore:
+        def renew_many(self, requested):
+            nonlocal call_count
+            batch = tuple(requested)
+            if any(claim.key == urgent_key for claim in batch):
+                urgent_started.set()
+            else:
+                assert urgent_started.wait(timeout=1)
+            with call_lock:
+                call_count += 1
+                if call_count == 2:
+                    both_batches.set()
+            return batch
+
+        def lookup_many(self, _requested):
+            return {}
+
+    renewer = annotate_module._LeaseRenewer(  # pyright: ignore[reportPrivateUsage]
+        RecordingStore(),  # type: ignore[arg-type]
+        claims,
+        {query.key: query for query in queries},
+    )
+    now = time.monotonic()
+    with renewer.lock:
+        renewer.deadlines[keys[0]] = now - 1.0
+        renewer.deadlines[keys[1]] = now - 1.0
+        renewer.deadlines[urgent_key] = now - 2.0
+    renewer.__enter__()
+    assert both_batches.wait(timeout=2)
+    renewer.complete(keys)
+    renewer.mark_finalized()
+    renewer.__exit__(None, None, None)
+
+    assert call_count == 2
+
+
 def test_invocation_renewer_uses_near_expiry_before_long_cadence(
     tmp_path: Path,
 ) -> None:

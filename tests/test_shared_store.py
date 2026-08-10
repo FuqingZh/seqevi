@@ -1087,7 +1087,7 @@ def test_http_renew_chunks_execute_concurrently_and_preserve_order() -> None:
     assert tuple(claim.key for claim in renewed) == tuple(claim.key for claim in claims)
 
 
-def test_http_renew_starts_every_due_chunk_without_executor_queue() -> None:
+def test_http_renew_bounded_scheduler_drains_fast_slots_before_blocked_chunk() -> None:
     claims = tuple(
         EvidenceClaim(
             key,
@@ -1100,7 +1100,12 @@ def test_http_renew_starts_every_due_chunk_without_executor_queue() -> None:
             _key("MQUEUE" + "A" * (index + 1)) for index in range(33)
         )
     )
-    all_chunks_started = threading.Barrier(len(claims))
+    blocked_key = claims[0].key
+    final_key = claims[-1].key
+    final_started = threading.Event()
+    active = 0
+    maximum_active = 0
+    active_lock = threading.Lock()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
@@ -1115,29 +1120,106 @@ def test_http_renew_starts_every_due_chunk_without_executor_queue() -> None:
                 },
             )
         body = json.loads(request.content)
-        all_chunks_started.wait(timeout=3)
         returned = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-        renewed = EvidenceClaim(
-            returned.key,
-            returned.owner_token,
-            returned.generation,
-            datetime.now(UTC) + timedelta(seconds=60),
-            returned.renewal_after_seconds,
-        )
-        return httpx.Response(
-            200,
-            json={
-                "claims": [
-                    EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
-                ]
-            },
-        )
+        nonlocal active, maximum_active
+        with active_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            if returned.key == final_key:
+                final_started.set()
+            if returned.key == blocked_key:
+                assert final_started.wait(timeout=3)
+            renewed = EvidenceClaim(
+                returned.key,
+                returned.owner_token,
+                returned.generation,
+                datetime.now(UTC) + timedelta(seconds=60),
+                returned.renewal_after_seconds,
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "claims": [
+                        EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
+                    ]
+                },
+            )
+        finally:
+            with active_lock:
+                active -= 1
 
     client = _claim_mock_client(httpx.MockTransport(handler))
     with HttpEvidenceStore("http://testserver", client=client) as store:
         renewed = store.renew_many(claims)
 
     assert tuple(claim.key for claim in renewed) == tuple(claim.key for claim in claims)
+    assert final_started.is_set()
+    assert maximum_active <= 32
+
+
+def test_http_renew_bounded_overload_fails_before_stale_chunk_starts() -> None:
+    expiry = datetime.now(UTC) + timedelta(seconds=6)
+    claims = tuple(
+        EvidenceClaim(key, "owner", 1, expiry, 20.0)
+        for _identity, key in (
+            _key("MOVERLOAD" + "A" * (index + 1)) for index in range(33)
+        )
+    )
+    first_wave = threading.Barrier(32)
+    active = 0
+    maximum_active = 0
+    request_count = 0
+    active_lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active, request_count
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "maximum_batch_size": 1,
+                    "lease_seconds": 60.0,
+                    "renewal_after_seconds": 20.0,
+                },
+            )
+        body = json.loads(request.content)
+        returned = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
+        with active_lock:
+            request_count += 1
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            first_wave.wait(timeout=3)
+            time.sleep(1.1)
+            renewed = EvidenceClaim(
+                returned.key,
+                returned.owner_token,
+                returned.generation,
+                datetime.now(UTC) + timedelta(seconds=60),
+                returned.renewal_after_seconds,
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "claims": [
+                        EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
+                    ]
+                },
+            )
+        finally:
+            with active_lock:
+                active -= 1
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        with pytest.raises(EvidenceClaimLostError, match="could not start"):
+            store.renew_many(claims)
+
+    assert request_count == 32
+    assert maximum_active == 32
 
 
 def test_http_renew_many_fails_instead_of_returning_stale_handles() -> None:

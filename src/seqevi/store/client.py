@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -63,6 +63,7 @@ from .transport import (
 
 _CLAIM_RUNWAY_SECONDS = 5.0
 _HANDOFF_SCHEDULING_SECONDS = 1.0
+_MAX_CONCURRENT_CLAIM_REQUESTS = 32
 
 
 class _ChunkAcquireRenewer:
@@ -648,10 +649,29 @@ class HttpEvidenceStore:
             )
             if not chunks:
                 return ()
-            # Every service chunk is already due. Give each one a worker so a
-            # local executor queue cannot consume the remaining lease runway.
-            with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
-                renewed_chunks = tuple(executor.map(self._renew_claim_chunk, chunks))
+            scheduled = sorted(
+                enumerate(chunks),
+                key=lambda item: min(claim.expires_at for claim in item[1]),
+            )
+            renewed_by_index: dict[int, tuple[EvidenceClaim, ...]] = {}
+            with ThreadPoolExecutor(
+                max_workers=min(len(chunks), _MAX_CONCURRENT_CLAIM_REQUESTS)
+            ) as executor:
+                futures = {
+                    executor.submit(self._renew_indexed_claim_chunk, item)
+                    for item in scheduled
+                }
+                try:
+                    for future in as_completed(futures):
+                        index, renewed_chunk = future.result()
+                        renewed_by_index[index] = renewed_chunk
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
+            renewed_chunks = tuple(
+                renewed_by_index[index] for index in range(len(chunks))
+            )
             renewed = tuple(claim for chunk in renewed_chunks for claim in chunk)
             if any(not _claim_has_runway(claim) for claim in renewed):
                 raise EvidenceClaimLostError(
@@ -678,9 +698,27 @@ class HttpEvidenceStore:
                 )
         return tuple(returned)
 
+    def _renew_indexed_claim_chunk(
+        self, indexed: tuple[int, tuple[EvidenceClaim, ...]]
+    ) -> tuple[int, tuple[EvidenceClaim, ...]]:
+        index, chunk = indexed
+        return index, self._renew_claim_chunk(chunk)
+
     def _renew_claim_chunk(
         self, chunk: tuple[EvidenceClaim, ...]
     ) -> tuple[EvidenceClaim, ...]:
+        timeout = min(
+            self._timeout_seconds,
+            min(
+                (claim.expires_at - datetime.now(UTC)).total_seconds()
+                - _CLAIM_RUNWAY_SECONDS
+                for claim in chunk
+            ),
+        )
+        if timeout <= 0:
+            raise EvidenceClaimLostError(
+                "claim renewal could not start before its authority runway"
+            )
         request = ClaimMutationRequest(
             claims=[EvidenceClaimModel.from_domain(claim) for claim in chunk]
         )
@@ -688,6 +726,7 @@ class HttpEvidenceStore:
             "POST",
             "/v1/evidence/claims/renew",
             json=request.model_dump(mode="json"),
+            timeout=timeout,
         )
         payload = ClaimRenewResponse.model_validate(response.json())
         if len(payload.claims) != len(chunk):
