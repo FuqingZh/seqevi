@@ -573,7 +573,7 @@ def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
                 renewal_started.set()
                 assert allow_renewal.wait(10)
                 raise EvidenceClaimLostError("finalized chunk")
-            if len(batch) == 1_499:
+            if len(batch) == 500:
                 remaining_renewed.set()
             return batch
 
@@ -598,9 +598,9 @@ def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
     )
     renewer.__enter__()
     assert renewal_started.wait(10)
+    assert remaining_renewed.wait(10)
     renewer.complete(first_chunk)
     allow_renewal.set()
-    assert remaining_renewed.wait(10)
     renewer.mark_finalized()
     renewer.__exit__(None, None, None)
 
@@ -608,10 +608,10 @@ def test_renewer_narrows_terminal_chunk_and_renews_remaining_claims(
         claim.key for claim in claims[1:]
     }
     assert set(renewer.queries_by_key) == {claim.key for claim in claims[1:]}
-    assert renewal_sizes == [1_500, 1_499]
+    assert sorted(renewal_sizes) == [500, 999, 1_000]
 
 
-def test_invocation_renewer_submits_full_snapshot_by_absolute_deadline(
+def test_invocation_renewer_submits_bounded_batches_by_absolute_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(annotate_module, "_STORE_BATCH_SIZE", 2)
@@ -644,14 +644,26 @@ def test_invocation_renewer_submits_full_snapshot_by_absolute_deadline(
         for key in keys
     )
     urgent_key = keys[-1]
-    renewal_observed = threading.Event()
-    requested_keys: list[EvidenceKey] = []
+    urgent_started = threading.Event()
+    both_batches = threading.Event()
+    requested_batches: list[tuple[EvidenceKey, ...]] = []
+    call_lock = threading.Lock()
 
     class RecordingStore:
         def renew_many(self, requested):
             batch = tuple(requested)
-            requested_keys.extend(claim.key for claim in batch)
-            renewal_observed.set()
+            keys_in_batch = tuple(claim.key for claim in batch)
+            if urgent_key in keys_in_batch:
+                with call_lock:
+                    requested_batches.append(keys_in_batch)
+                urgent_started.set()
+            else:
+                assert urgent_started.wait(timeout=1)
+                with call_lock:
+                    requested_batches.append(keys_in_batch)
+            with call_lock:
+                if len(requested_batches) == 2:
+                    both_batches.set()
             return batch
 
         def lookup_many(self, _requested):
@@ -668,12 +680,13 @@ def test_invocation_renewer_submits_full_snapshot_by_absolute_deadline(
         renewer.deadlines[keys[1]] = now - 1.0
         renewer.deadlines[urgent_key] = now - 2.0
     renewer.__enter__()
-    assert renewal_observed.wait(timeout=2)
+    assert both_batches.wait(timeout=2)
     renewer.complete(keys)
     renewer.mark_finalized()
     renewer.__exit__(None, None, None)
 
-    assert requested_keys == [urgent_key, keys[0], keys[1]]
+    assert requested_batches[0] == (urgent_key, keys[0])
+    assert requested_batches[1] == (keys[1],)
 
 
 def test_invocation_renewer_uses_near_expiry_before_long_cadence(
