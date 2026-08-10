@@ -313,6 +313,12 @@ class ClaimAcquireRequest(TransportModel):
     owner_token: Annotated[str, Field(min_length=1, max_length=255, repr=False)]
     queries: list[EvidenceQueryModel]
 
+    @model_validator(mode="after")
+    def validate_unique_keys(self) -> ClaimAcquireRequest:
+        if len({query.key.to_domain() for query in self.queries}) != len(self.queries):
+            raise ValueError("claim acquisition contains a duplicate evidence key")
+        return self
+
 
 class ClaimAcquireResponse(TransportModel):
     results: list[ClaimAcquireResultModel]

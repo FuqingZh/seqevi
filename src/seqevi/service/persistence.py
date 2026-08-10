@@ -112,8 +112,8 @@ class PostgresEvidencePersistence:
         self, queries: Iterable[EvidenceQuery], *, owner_token: str
     ) -> tuple[ClaimAcquireResult, ...]:
         requested = tuple(queries)
-        if len(set(requested)) != len(requested):
-            raise ValueError("acquire batch contains a duplicate evidence query")
+        if len({query.key for query in requested}) != len(requested):
+            raise ValueError("acquire batch contains a duplicate evidence key")
         _validate_owner_token(owner_token)
         results: dict[EvidenceKey, ClaimAcquireResult] = {}
         with self.engine.begin() as connection:
@@ -511,13 +511,16 @@ class PostgresEvidencePersistence:
                     raise EvidenceClaimLostError(
                         f"claim ownership was lost: {claim.key.sequence_id}"
                     )
+            for item in sorted(
+                proposed, key=lambda value: _key_sort_value(value.claim.key.to_domain())
+            ):
+                _insert_sequence(connection, item.commit.identity.to_domain())
             for digest in sorted(stored_artifacts):
                 artifact = stored_artifacts[digest]
                 _insert_artifact(connection, artifact)
             for item in sorted(
                 proposed, key=lambda value: _key_sort_value(value.claim.key.to_domain())
             ):
-                _insert_sequence(connection, item.commit.identity.to_domain())
                 outcomes[item.commit.key.to_domain()] = _insert_evidence(
                     connection, item.commit
                 )
@@ -827,12 +830,15 @@ def _key_clause(key: EvidenceKey) -> Any:
 def _lock_evidence_keys(connection: Connection, keys: Iterable[EvidenceKey]) -> None:
     """Serialize mutations even when neither evidence nor claim rows exist."""
 
-    for key in sorted(set(keys), key=_key_sort_value):
-        digest = hashlib.sha256("\0".join(_key_sort_value(key)).encode()).digest()
-        lock_id = int.from_bytes(digest[:8], byteorder="big", signed=True)
+    for lock_id in sorted({_advisory_lock_id(key) for key in keys}):
         connection.execute(
             text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id}
         )
+
+
+def _advisory_lock_id(key: EvidenceKey) -> int:
+    digest = hashlib.sha256("\0".join(_key_sort_value(key)).encode()).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
 
 def _claim_key_values(key: EvidenceKey) -> dict[str, str]:

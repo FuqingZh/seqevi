@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import tempfile
 import threading
+import time
 from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +66,7 @@ class _ChunkAcquireRenewer:
     def __init__(self, store: HttpEvidenceStore) -> None:
         self._store = store
         self._claims: dict[EvidenceKey, EvidenceClaim] = {}
+        self._deadlines: dict[EvidenceKey, float] = {}
         self._lock = threading.Lock()
         self._changed = threading.Event()
         self._stopped = threading.Event()
@@ -75,6 +79,7 @@ class _ChunkAcquireRenewer:
     def add(self, claim: EvidenceClaim) -> None:
         with self._lock:
             self._claims[claim.key] = claim
+            self._deadlines[claim.key] = time.monotonic() + claim.renewal_after_seconds
         self._changed.set()
 
     def stop(self) -> None:
@@ -90,15 +95,25 @@ class _ChunkAcquireRenewer:
         if self._failure is not None:
             raise self._failure
 
+    def release_best_effort(self) -> None:
+        for claim in self.claims().values():
+            try:
+                self._store.release_many((claim,))
+            except Exception:
+                pass
+
     def _run(self) -> None:
         while not self._stopped.is_set():
             self._changed.clear()
             with self._lock:
-                snapshot = tuple(self._claims.values())
-            cadence = min(
-                (claim.renewal_after_seconds for claim in snapshot), default=1.0
-            )
-            if self._changed.wait(cadence) or self._stopped.is_set():
+                now = time.monotonic()
+                due_keys = tuple(
+                    key for key, deadline in self._deadlines.items() if deadline <= now
+                )
+                snapshot = tuple(self._claims[key] for key in due_keys)
+                next_deadline = min(self._deadlines.values(), default=now + 1.0)
+            if not snapshot:
+                self._changed.wait(max(0.0, next_deadline - time.monotonic()))
                 continue
             try:
                 renewed = self._store.renew_many(snapshot)
@@ -107,9 +122,19 @@ class _ChunkAcquireRenewer:
                 self._stopped.set()
                 return
             with self._lock:
+                renewed_at = time.monotonic()
                 for claim in renewed:
+                    if claim.expires_at <= datetime.now(UTC):
+                        self._failure = EvidenceClaimLostError(
+                            "claim renewal returned expired authority"
+                        )
+                        self._stopped.set()
+                        return
                     if claim.key in self._claims:
                         self._claims[claim.key] = claim
+                        self._deadlines[claim.key] = (
+                            renewed_at + claim.renewal_after_seconds
+                        )
 
 
 _TRANSFER_CHUNK_SIZE = 1024 * 1024
@@ -127,6 +152,9 @@ class HttpEvidenceStore:
         maximum_batch_size: int | None = None,
         client: httpx.Client | None = None,
     ) -> None:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        self._timeout_seconds = timeout_seconds
         self._uploaded_artifact_digests: set[str] = set()
         self._download_directory = tempfile.TemporaryDirectory(
             prefix="seqevi-http-artifacts-"
@@ -267,8 +295,9 @@ class HttpEvidenceStore:
         """
 
         requested = tuple(requested_queries)
-        if len(set(requested)) != len(requested):
-            raise ValueError("acquire batch contains a duplicate evidence query")
+        if len({query.key for query in requested}) != len(requested):
+            raise ValueError("acquire batch contains a duplicate evidence key")
+        _validate_owner_token(owner_token)
         capabilities = self._require_claims()
         results = []
         renewer = _ChunkAcquireRenewer(self)
@@ -276,6 +305,7 @@ class HttpEvidenceStore:
         renewer.start()
         try:
             for offset in range(0, len(requested), maximum):
+                renewer.raise_if_failed()
                 chunk = requested[offset : offset + maximum]
                 request = ClaimAcquireRequest(
                     owner_token=owner_token,
@@ -314,10 +344,24 @@ class HttpEvidenceStore:
                     results.append(result)
                     if result.claim is not None:
                         renewer.add(result.claim)
-        finally:
+                renewer.raise_if_failed()
+        except BaseException:
             renewer.stop()
-        renewer.raise_if_failed()
+            renewer.release_best_effort()
+            raise
+        renewer.stop()
+        try:
+            renewer.raise_if_failed()
+        except BaseException:
+            renewer.release_best_effort()
+            raise
         current = renewer.claims()
+        completion_time = datetime.now(UTC)
+        if any(claim.expires_at <= completion_time for claim in current.values()):
+            renewer.release_best_effort()
+            raise EvidenceClaimLostError(
+                "claim acquisition completed with expired authority"
+            )
         return tuple(
             ClaimAcquireResult(result.disposition, claim=current[result.claim.key])
             if result.claim is not None
@@ -529,6 +573,7 @@ class HttpEvidenceStore:
         return tuple(returned)
 
     def _claim_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        kwargs.setdefault("timeout", self._timeout_seconds)
         try:
             response = self.client.request(method, path, **kwargs)
         except httpx.HTTPError as error:
@@ -593,6 +638,11 @@ class HttpEvidenceStore:
             raise StoreError(f"shared Store request failed: {error}") from error
         _raise_for_store_status(response)
         return response
+
+
+def _validate_owner_token(owner_token: str) -> None:
+    if not owner_token or len(owner_token) > 255:
+        raise ValueError("owner_token must contain 1 to 255 characters")
 
 
 def _file_chunks(path: Path) -> Iterator[bytes]:

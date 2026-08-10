@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -18,6 +19,7 @@ from seqevi.evidence import (
     EvidenceQuery,
 )
 from seqevi.store import LocalStore
+from seqevi.store import local as local_module
 from seqevi.store.schema import evidence_claims
 from seqevi.store.transport import (
     BusyEvidenceClaimModel,
@@ -77,8 +79,15 @@ def test_owner_token_is_redacted_and_duplicate_acquire_is_rejected(
         assert claim is not None
         assert "sensitive-owner" not in repr(claim)
         assert "sensitive-owner" not in repr(EvidenceClaimModel.from_domain(claim))
+
+        class DistinctQuery:
+            identity = query.identity
+            key = query.key
+
         with pytest.raises(ValueError, match="duplicate"):
-            store.acquire_many((query, query), owner_token="owner")
+            store.acquire_many(
+                (query, cast(EvidenceQuery, DistinctQuery())), owner_token="owner"
+            )
         with pytest.raises(ValidationError, match="duplicate"):
             model = EvidenceClaimModel.from_domain(claim)
             ClaimMutationRequest(claims=[model, model])
@@ -280,6 +289,37 @@ def test_sqlite_expired_claim_cannot_mutate(tmp_path: Path, operation: str) -> N
                 store.release_many((claim,))
             else:
                 store.finalize_many((ClaimedEvidenceCommit(commit, claim),))
+
+
+def test_sqlite_exact_expiry_loses_all_authority_and_reacquires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commit, query = _query(tmp_path)
+    decision_time = datetime.now(UTC) + timedelta(seconds=1)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return (
+                decision_time if tz is not None else decision_time.replace(tzinfo=None)
+            )
+
+    with LocalStore.open(tmp_path / "store") as store:
+        claim = store.acquire_many((query,), owner_token="owner")[0].claim
+        assert claim is not None
+        with store.engine.begin() as connection:
+            connection.execute(update(evidence_claims).values(expires_at=decision_time))
+        monkeypatch.setattr(local_module, "datetime", FrozenDateTime)
+        with pytest.raises(EvidenceClaimLostError):
+            store.renew_many((claim,))
+        with pytest.raises(EvidenceClaimLostError):
+            store.release_many((claim,))
+        with pytest.raises(EvidenceClaimLostError):
+            store.finalize_many((ClaimedEvidenceCommit(commit, claim),))
+        reacquired = store.acquire_many((query,), owner_token="owner")[0].claim
+
+    assert reacquired is not None
+    assert reacquired.generation == claim.generation + 1
 
 
 def test_sqlite_finalize_is_terminal_and_leaves_no_claim(tmp_path: Path) -> None:

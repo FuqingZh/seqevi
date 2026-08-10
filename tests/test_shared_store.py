@@ -16,7 +16,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import (
     BigInteger,
     create_engine,
@@ -28,6 +28,7 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.engine import Connection
 
 from seqevi.annotate import run_annotation
 from seqevi.errors import (
@@ -52,12 +53,14 @@ from seqevi.evidence import (
 )
 from seqevi.sequence import SequenceIdentity, identify_protein_sequence
 from seqevi.service import ServiceSettings, create_service_app
+from seqevi.service import persistence as persistence_module
 from seqevi.service.persistence import PostgresEvidencePersistence
 from seqevi.store import HttpEvidenceStore, LocalStore
 from seqevi.store import migration as store_migration
 from seqevi.store.schema import artifacts, evidence_claims
 from seqevi.store.transport import (
     ClaimAcquireResultModel,
+    ClaimAcquireRequest,
     ClaimedCommitModel,
     CommitModel,
     EvidenceClaimModel,
@@ -186,6 +189,14 @@ def _key(sequence: str) -> tuple[SequenceIdentity, EvidenceKey]:
         semantic_parameters={"threshold": 0.01},
     )
     return identity, key
+
+
+def _distinct_query_with_same_key(query: EvidenceQuery) -> EvidenceQuery:
+    class DistinctQuery:
+        identity = query.identity
+        key = query.key
+
+    return cast(EvidenceQuery, DistinctQuery())
 
 
 def _hit_commit(
@@ -577,7 +588,16 @@ def test_http_claim_acquire_rejects_duplicates_before_request() -> None:
     with HttpEvidenceStore("http://testserver", client=client) as store:
         query = EvidenceQuery(identity, key)
         with pytest.raises(ValueError, match="duplicate"):
-            store.acquire_many((query, query), owner_token="owner")
+            store.acquire_many(
+                (query, _distinct_query_with_same_key(query)), owner_token="owner"
+            )
+        with pytest.raises(ValueError, match="owner_token"):
+            store.acquire_many((), owner_token="")
+
+    model = EvidenceQueryModel.from_domain(query)
+
+    with pytest.raises(ValidationError, match="duplicate evidence key"):
+        ClaimAcquireRequest(owner_token="owner", queries=[model, model.model_copy()])
 
 
 def test_http_claim_mutations_reject_duplicates_before_network_or_upload(
@@ -751,6 +771,242 @@ def test_http_claim_chunks_renew_early_authority_while_acquisition_blocks() -> N
     assert len(results) == 2
 
 
+def test_http_claim_chunk_additions_cannot_postpone_due_renewal() -> None:
+    queries = tuple(
+        EvidenceQuery(identity, key)
+        for identity, key in (_key("MSTARVE" + "A" * index) for index in range(1, 13))
+    )
+    acquire_calls = 0
+    renew_at_acquire_count: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal acquire_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "maximum_batch_size": 1,
+                    "lease_seconds": 1.0,
+                    "renewal_after_seconds": 0.01,
+                },
+            )
+        body = json.loads(request.content)
+        if request.url.path.endswith("/renew"):
+            renew_at_acquire_count.append(acquire_calls)
+            return httpx.Response(200, json={"claims": body["claims"]})
+        acquire_calls += 1
+        time.sleep(0.003)
+        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
+        acquired = ClaimAcquireResult(
+            ClaimDisposition.ACQUIRED,
+            claim=EvidenceClaim(
+                query.key,
+                body["owner_token"],
+                1,
+                datetime.now(UTC) + timedelta(seconds=1),
+                0.01,
+            ),
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
+                        mode="json"
+                    )
+                ]
+            },
+        )
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        assert len(store.acquire_many(queries, owner_token="owner")) == len(queries)
+
+    assert renew_at_acquire_count
+    assert min(renew_at_acquire_count) < len(queries)
+
+
+def test_http_acquire_failure_releases_earlier_chunks_without_masking_error() -> None:
+    queries = tuple(
+        EvidenceQuery(identity, key)
+        for identity, key in (_key(sequence) for sequence in ("MCLEANUPA", "MCLEANUPB"))
+    )
+    released: list[tuple[EvidenceKey, int]] = []
+    acquire_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal acquire_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        body = json.loads(request.content)
+        if request.url.path.endswith("/release"):
+            for data in body["claims"]:
+                claim = EvidenceClaimModel.model_validate(data).to_domain()
+                released.append((claim.key, claim.generation))
+            return httpx.Response(500, text="cleanup failed")
+        acquire_calls += 1
+        if acquire_calls == 2:
+            return httpx.Response(500, text="primary acquire failed")
+        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
+        acquired = ClaimAcquireResult(
+            ClaimDisposition.ACQUIRED,
+            claim=EvidenceClaim(
+                query.key,
+                body["owner_token"],
+                1,
+                datetime.now(UTC) + timedelta(seconds=60),
+                20.0,
+            ),
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
+                        mode="json"
+                    )
+                ]
+            },
+        )
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        with pytest.raises(StoreError, match="primary acquire failed"):
+            store.acquire_many(queries, owner_token="owner")
+
+    assert released == [(queries[0].key, 1)]
+
+
+def test_http_background_renew_failure_releases_acquired_chunks() -> None:
+    queries = tuple(
+        EvidenceQuery(identity, key)
+        for identity, key in (_key(sequence) for sequence in ("MRENEWA", "MRENEWB"))
+    )
+    renew_failed = threading.Event()
+    released: list[EvidenceKey] = []
+    acquire_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal acquire_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "maximum_batch_size": 1,
+                    "lease_seconds": 1.0,
+                    "renewal_after_seconds": 0.01,
+                },
+            )
+        body = json.loads(request.content)
+        if request.url.path.endswith("/renew"):
+            renew_failed.set()
+            return httpx.Response(500, text="renew failed")
+        if request.url.path.endswith("/release"):
+            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
+            released.append(claim.key)
+            return httpx.Response(
+                200,
+                json={
+                    "released": [
+                        {
+                            "key": body["claims"][0]["key"],
+                            "generation": claim.generation,
+                        }
+                    ]
+                },
+            )
+        acquire_calls += 1
+        if acquire_calls == 2:
+            assert renew_failed.wait(timeout=1)
+        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
+        acquired = ClaimAcquireResult(
+            ClaimDisposition.ACQUIRED,
+            claim=EvidenceClaim(
+                query.key,
+                body["owner_token"],
+                1,
+                datetime.now(UTC) + timedelta(seconds=1),
+                0.01,
+            ),
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
+                        mode="json"
+                    )
+                ]
+            },
+        )
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        with pytest.raises(StoreError, match="renew failed"):
+            store.acquire_many(queries, owner_token="owner")
+
+    assert released
+    assert queries[0].key in released
+
+
+def test_http_acquire_rejects_and_releases_expired_returned_authority() -> None:
+    identity, key = _key("MEXPIREDHTTP")
+    released = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        body = json.loads(request.content)
+        if request.url.path.endswith("/release"):
+            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
+            released.set()
+            return httpx.Response(
+                200,
+                json={
+                    "released": [
+                        {
+                            "key": body["claims"][0]["key"],
+                            "generation": claim.generation,
+                        }
+                    ]
+                },
+            )
+        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
+        expired = ClaimAcquireResult(
+            ClaimDisposition.ACQUIRED,
+            claim=EvidenceClaim(
+                query.key,
+                body["owner_token"],
+                1,
+                datetime.now(UTC) - timedelta(seconds=1),
+                20.0,
+            ),
+        )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    ClaimAcquireResultModel.from_domain(expired).model_dump(mode="json")
+                ]
+            },
+        )
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        with pytest.raises(EvidenceClaimLostError, match="expired authority"):
+            store.acquire_many((EvidenceQuery(identity, key),), owner_token="owner")
+
+    assert released.is_set()
+
+
 def test_shared_store_configuration_requires_postgres_and_postgres_engine(
     tmp_path: Path,
 ) -> None:
@@ -771,6 +1027,51 @@ def test_shared_store_configuration_requires_postgres_and_postgres_engine(
             PostgresEvidencePersistence(engine)
     finally:
         engine.dispose()
+
+
+def test_postgres_advisory_locks_use_actual_signed_bigint_order() -> None:
+    keys = tuple(_key("MACTUAL" + "A" * index)[1] for index in range(1, 33))
+    expected = sorted(
+        {
+            persistence_module._advisory_lock_id(  # pyright: ignore[reportPrivateUsage]
+                key
+            )
+            for key in keys
+        }
+    )
+    observed: list[int] = []
+
+    class RecordingConnection:
+        def execute(self, _statement: object, parameters: dict[str, int]) -> None:
+            observed.append(parameters["lock_id"])
+
+    persistence_module._lock_evidence_keys(  # pyright: ignore[reportPrivateUsage]
+        cast(Connection, RecordingConnection()), reversed(keys)
+    )
+
+    assert any(lock_id < 0 for lock_id in expected)
+    assert observed == expected
+
+
+def test_postgres_advisory_locks_deduplicate_forced_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keys = tuple(_key(sequence)[1] for sequence in ("MLOCKA", "MLOCKB", "MLOCKC"))
+    lock_ids = {keys[0]: 4, keys[1]: -9, keys[2]: 4}
+    observed: list[int] = []
+
+    class RecordingConnection:
+        def execute(self, _statement: object, parameters: dict[str, int]) -> None:
+            observed.append(parameters["lock_id"])
+
+    monkeypatch.setattr(
+        persistence_module, "_advisory_lock_id", lambda key: lock_ids[key]
+    )
+    persistence_module._lock_evidence_keys(  # pyright: ignore[reportPrivateUsage]
+        cast(Connection, RecordingConnection()), reversed(keys)
+    )
+
+    assert observed == [-9, 4]
 
 
 def test_service_returns_422_for_invalid_domain_values_and_missing_raw_artifact(
@@ -1229,6 +1530,68 @@ def test_postgres_claim_lifecycle_expiry_stale_and_terminal_convergence(
 
 
 @pytest.mark.requires_postgres
+def test_postgres_exact_expiry_loses_all_authority_and_reacquires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        commit = _hit_commit(tmp_path / "sources", "MEXACTEXPIRY")
+        query = EvidenceQuery(commit.identity, commit.key)
+        persistence = PostgresEvidencePersistence.open(database_url)
+        try:
+            claim = persistence.acquire_many((query,), owner_token="owner")[0].claim
+            assert claim is not None
+            model = CommitModel.from_domain(commit)
+            references = (model.normalized_artifact, model.raw_artifact)
+            stored = {
+                reference.digest: StoredArtifact(
+                    digest=reference.digest,
+                    media_type=reference.media_type,
+                    byte_size=reference.byte_size,
+                    relative_path=f"fixture/{reference.digest}",
+                )
+                for reference in references
+                if reference is not None
+            }
+            decision_time = datetime.now(UTC) + timedelta(seconds=1)
+            with persistence.engine.begin() as connection:
+                connection.execute(
+                    update(evidence_claims).values(expires_at=decision_time)
+                )
+
+            class FrozenDateTime(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return (
+                        decision_time
+                        if tz is not None
+                        else decision_time.replace(tzinfo=None)
+                    )
+
+            monkeypatch.setattr(persistence_module, "datetime", FrozenDateTime)
+            with pytest.raises(EvidenceClaimLostError):
+                persistence.renew_many((claim,))
+            with pytest.raises(EvidenceClaimLostError):
+                persistence.release_many((claim,))
+            with pytest.raises(EvidenceClaimLostError):
+                persistence.finalize_many(
+                    (
+                        ClaimedCommitModel.from_domain(
+                            ClaimedEvidenceCommit(commit, claim)
+                        ),
+                    ),
+                    stored,
+                )
+            reacquired = persistence.acquire_many((query,), owner_token="owner")[
+                0
+            ].claim
+        finally:
+            persistence.close()
+
+    assert reacquired is not None
+    assert reacquired.generation == claim.generation + 1
+
+
+@pytest.mark.requires_postgres
 def test_postgres_legacy_commit_retires_active_claim(tmp_path: Path) -> None:
     with _isolated_postgres_url() as database_url:
         commit = _hit_commit(tmp_path / "sources", "MLEGACYCLAIM")
@@ -1236,7 +1599,10 @@ def test_postgres_legacy_commit_retires_active_claim(tmp_path: Path) -> None:
         persistence = PostgresEvidencePersistence.open(database_url)
         try:
             with pytest.raises(ValueError, match="duplicate"):
-                persistence.acquire_many((query, query), owner_token="duplicate")
+                persistence.acquire_many(
+                    (query, _distinct_query_with_same_key(query)),
+                    owner_token="duplicate",
+                )
             claim = persistence.acquire_many((query,), owner_token="new-client")[
                 0
             ].claim
@@ -1290,6 +1656,7 @@ def test_postgres_legacy_commit_serializes_absent_claim_acquire(tmp_path: Path) 
         legacy_thread: list[int] = []
         legacy_has_key_lock = threading.Event()
         allow_legacy_commit = threading.Event()
+        acquirer_reached_key_lock = threading.Event()
 
         def pause_after_key_lock(
             _connection: object,
@@ -1308,6 +1675,21 @@ def test_postgres_legacy_commit_serializes_absent_claim_acquire(tmp_path: Path) 
                 assert allow_legacy_commit.wait(timeout=10)
 
         event.listen(writer.engine, "before_cursor_execute", pause_after_key_lock)
+
+        def observe_acquirer_key_lock(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: object,
+        ) -> None:
+            if "pg_advisory_xact_lock" in statement:
+                acquirer_reached_key_lock.set()
+
+        event.listen(
+            acquirer.engine, "before_cursor_execute", observe_acquirer_key_lock
+        )
         try:
             with ThreadPoolExecutor(max_workers=2) as executor:
 
@@ -1320,6 +1702,7 @@ def test_postgres_legacy_commit_serializes_absent_claim_acquire(tmp_path: Path) 
                 acquired = executor.submit(
                     acquirer.acquire_many, (query,), owner_token="calculator"
                 )
+                assert acquirer_reached_key_lock.wait(timeout=10)
                 assert not acquired.done()
                 allow_legacy_commit.set()
                 assert published.result(timeout=10) == (CommitOutcome.CREATED,)
@@ -1327,6 +1710,9 @@ def test_postgres_legacy_commit_serializes_absent_claim_acquire(tmp_path: Path) 
         finally:
             allow_legacy_commit.set()
             event.remove(writer.engine, "before_cursor_execute", pause_after_key_lock)
+            event.remove(
+                acquirer.engine, "before_cursor_execute", observe_acquirer_key_lock
+            )
             writer.close()
             acquirer.close()
 
@@ -1401,6 +1787,136 @@ def test_postgres_legacy_commit_and_finalize_share_lock_order(tmp_path: Path) ->
         "lost",
     }
     assert all(item.disposition is ClaimDisposition.CACHED for item in cached)
+
+
+@pytest.mark.requires_postgres
+def test_postgres_different_keys_share_sequence_and_artifact_write_order(
+    tmp_path: Path,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        claimed_commit = _hit_commit(tmp_path / "sources", "MSHAREDROWS")
+        legacy_key = EvidenceKey.from_parameters(
+            sequence_id=claimed_commit.identity.sequence_id,
+            adapter_contract_version=claimed_commit.key.adapter_contract_version,
+            tool_runtime_digest=claimed_commit.key.tool_runtime_digest,
+            resource_id=claimed_commit.key.resource_id,
+            semantic_parameters={"threshold": 0.02},
+        )
+        legacy_commit = EvidenceCommit(
+            identity=claimed_commit.identity,
+            key=legacy_key,
+            status=claimed_commit.status,
+            payload_digest=claimed_commit.payload_digest,
+            normalized_artifact=claimed_commit.normalized_artifact,
+            raw_artifact=claimed_commit.raw_artifact,
+        )
+        finalizer = PostgresEvidencePersistence.open(database_url)
+        legacy = PostgresEvidencePersistence.open(database_url)
+        query = EvidenceQuery(claimed_commit.identity, claimed_commit.key)
+        claim = finalizer.acquire_many((query,), owner_token="calculator")[0].claim
+        assert claim is not None
+        claimed_model = ClaimedCommitModel.from_domain(
+            ClaimedEvidenceCommit(claimed_commit, claim)
+        )
+        legacy_model = CommitModel.from_domain(legacy_commit)
+        references = (legacy_model.normalized_artifact, legacy_model.raw_artifact)
+        stored = {
+            reference.digest: StoredArtifact(
+                digest=reference.digest,
+                media_type=reference.media_type,
+                byte_size=reference.byte_size,
+                relative_path=f"fixture/{reference.digest}",
+            )
+            for reference in references
+            if reference is not None
+        }
+        finalizer_inserted_sequence = threading.Event()
+        release_finalizer = threading.Event()
+        legacy_attempted_sequence = threading.Event()
+        operation_threads: dict[str, int] = {}
+        shared_insert_order: dict[int, list[str]] = {}
+
+        def record_shared_insert(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: object,
+        ) -> None:
+            table = next(
+                (
+                    name
+                    for name in ("sequence", "artifact")
+                    if statement.startswith(f"INSERT INTO {name}")
+                ),
+                None,
+            )
+            if table is None:
+                return
+            thread_id = threading.get_ident()
+            shared_insert_order.setdefault(thread_id, []).append(table)
+            if thread_id == operation_threads.get("legacy") and table == "sequence":
+                legacy_attempted_sequence.set()
+
+        def pause_finalizer_after_sequence(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: object,
+        ) -> None:
+            if threading.get_ident() == operation_threads.get(
+                "finalizer"
+            ) and statement.startswith("INSERT INTO sequence"):
+                finalizer_inserted_sequence.set()
+                assert release_finalizer.wait(timeout=10)
+
+        for engine in (finalizer.engine, legacy.engine):
+            event.listen(engine, "before_cursor_execute", record_shared_insert)
+        event.listen(
+            finalizer.engine, "after_cursor_execute", pause_finalizer_after_sequence
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+
+                def finalize_claim():
+                    operation_threads["finalizer"] = threading.get_ident()
+                    return finalizer.finalize_many((claimed_model,), stored)
+
+                def commit_legacy():
+                    operation_threads["legacy"] = threading.get_ident()
+                    return legacy.commit_many((legacy_model,), stored)
+
+                finalized = executor.submit(finalize_claim)
+                assert finalizer_inserted_sequence.wait(timeout=10)
+                committed = executor.submit(commit_legacy)
+                assert legacy_attempted_sequence.wait(timeout=10)
+                assert not committed.done()
+                release_finalizer.set()
+                assert finalized.result(timeout=10) == (CommitOutcome.CREATED,)
+                assert committed.result(timeout=10) == (CommitOutcome.CREATED,)
+        finally:
+            release_finalizer.set()
+            for engine in (finalizer.engine, legacy.engine):
+                event.remove(engine, "before_cursor_execute", record_shared_insert)
+            event.remove(
+                finalizer.engine,
+                "after_cursor_execute",
+                pause_finalizer_after_sequence,
+            )
+            finalizer.close()
+            legacy.close()
+
+    assert shared_insert_order[operation_threads["finalizer"]][:2] == [
+        "sequence",
+        "artifact",
+    ]
+    assert shared_insert_order[operation_threads["legacy"]][:2] == [
+        "sequence",
+        "artifact",
+    ]
 
 
 @pytest.mark.requires_postgres

@@ -298,8 +298,8 @@ class LocalStore:
         """
 
         queries = tuple(requested_queries)
-        if len(set(queries)) != len(queries):
-            raise ValueError("acquire batch contains a duplicate evidence query")
+        if len({query.key for query in queries}) != len(queries):
+            raise ValueError("acquire batch contains a duplicate evidence key")
         _validate_owner_token(owner_token)
         results: list[ClaimAcquireResult] = []
         with self.engine.connect() as connection:
@@ -519,11 +519,12 @@ class LocalStore:
             digest: self.artifact_store.put(payload)
             for digest, payload in payloads.items()
         }
-        outcomes = []
+        ordered = sorted(items, key=lambda item: _key_sort_value(item.claim.key))
+        outcomes: dict[EvidenceKey, CommitOutcome] = {}
         with self.engine.connect() as connection:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             try:
-                for item in items:
+                for item in ordered:
                     now = datetime.now(UTC)
                     consumed = connection.execute(
                         delete(evidence_claims)
@@ -534,17 +535,20 @@ class LocalStore:
                         raise EvidenceClaimLostError(
                             f"claim ownership was lost: {item.claim.key.sequence_id}"
                         )
+                for item in ordered:
+                    self._insert_sequence(connection, item.commit.identity)
                 for digest in sorted(stored):
                     artifact = stored[digest]
                     self._insert_artifact(connection, artifact)
-                for item in items:
-                    self._insert_sequence(connection, item.commit.identity)
-                    outcomes.append(self._insert_evidence(connection, item.commit))
+                for item in ordered:
+                    outcomes[item.claim.key] = self._insert_evidence(
+                        connection, item.commit
+                    )
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
-        return tuple(outcomes)
+        return tuple(outcomes[item.claim.key] for item in items)
 
     def fetch(self, key: EvidenceKey) -> FetchedEvidence | None:
         """Fetch one exact evidence record and verify referenced artifact bytes."""
