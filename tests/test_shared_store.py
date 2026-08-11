@@ -961,7 +961,119 @@ def test_http_claim_retries_retryable_backpressure(
     assert attempts == 2
     assert len(sleeps) == 1
     assert 0.9 <= sleeps[0] <= 1.1
-    assert request_timeouts[1] <= request_timeouts[0] - sleeps[0]
+    assert request_timeouts[1] <= request_timeouts[0] - sleeps[0] / 4
+
+
+def test_http_claim_renewal_enforces_one_wall_clock_deadline() -> None:
+    _identity, key = _key("MCLAIMTOTALDEADLINE")
+    claim = EvidenceClaim(
+        key,
+        "owner",
+        1,
+        datetime.now(UTC) + timedelta(seconds=5.25),
+        20.0,
+    )
+    request_started = threading.Event()
+    release_request = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        request_started.set()
+        assert release_request.wait(timeout=3)
+        return httpx.Response(503, headers={"Retry-After": "1"})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        client=_claim_mock_client(httpx.MockTransport(handler)),
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(EvidenceClaimLostError, match="authority runway"):
+            store.renew_many((claim,))
+        elapsed = time.monotonic() - started
+        assert request_started.is_set()
+        assert elapsed < 1.0
+    finally:
+        release_request.set()
+        store.close()
+
+
+def test_http_claim_scheduler_prioritizes_renewal_and_caps_all_mutations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 1)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    order: list[str] = []
+    active = 0
+    maximum_active = 0
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            order.append(request.url.path)
+        try:
+            if request.url.path.endswith("/acquire"):
+                first_started.set()
+                assert release_first.wait(timeout=3)
+            return httpx.Response(200, json={})
+        finally:
+            with lock:
+                active -= 1
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        with ThreadPoolExecutor(max_workers=4) as callers:
+            acquire = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/acquire",
+            )
+            assert first_started.wait(timeout=2)
+            release = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/release",
+            )
+            finalize = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/finalize",
+            )
+            deadline = time.monotonic() + 2
+            while store._claim_request_scheduler._queue.qsize() < 2:  # pyright: ignore[reportPrivateUsage]
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            renew = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/renew",
+            )
+            deadline = time.monotonic() + 2
+            while store._claim_request_scheduler._queue.qsize() < 3:  # pyright: ignore[reportPrivateUsage]
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            release_first.set()
+            for future in (acquire, renew, release, finalize):
+                assert future.result(timeout=3).status_code == 200
+
+    assert maximum_active == 1
+    assert order == [
+        "/v1/evidence/claims/acquire",
+        "/v1/evidence/claims/renew",
+        "/v1/evidence/claims/release",
+        "/v1/evidence/claims/finalize",
+    ]
 
 def test_http_claim_chunks_honor_client_and_capability_limits() -> None:
     queries = tuple(
@@ -1654,6 +1766,9 @@ def test_http_store_close_cancels_pending_renewal_then_drains_active_transport(
         thread.name.startswith("seqevi-claim-renewal") and thread.is_alive()
         for thread in threading.enumerate()
     )
+    assert not any(  # pyright: ignore[reportPrivateUsage]
+        thread.is_alive() for thread in store._claim_request_scheduler._threads
+    )
 
 
 def test_http_renew_bounded_overload_fails_before_stale_chunk_starts(
@@ -2295,6 +2410,15 @@ def test_shared_store_configuration_requires_postgres_and_postgres_engine(
             PostgresEvidencePersistence(engine)
     finally:
         engine.dispose()
+
+
+def test_postgres_version_requirement_rejects_pre_17() -> None:
+    with pytest.raises(RuntimeError, match="requires PostgreSQL 17 or newer"):
+        persistence_module._require_supported_postgres_version(  # pyright: ignore[reportPrivateUsage]
+            160012
+        )
+
+    persistence_module._require_supported_postgres_version(170000)  # pyright: ignore[reportPrivateUsage]
 
 
 def test_postgres_advisory_locks_use_actual_signed_bigint_order() -> None:

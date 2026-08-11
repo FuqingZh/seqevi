@@ -174,6 +174,9 @@ seqevi annotate \
 
 Shared deployments expose the same Store contract:
 
+The shared Store requires PostgreSQL 17 or newer so every mutation can enforce
+one cumulative transaction deadline inside the claim lease runway.
+
 ```bash
 seqevi serve \
   --database-url postgresql+psycopg://seqevi@postgres/seqevi \

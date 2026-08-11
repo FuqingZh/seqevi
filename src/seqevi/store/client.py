@@ -9,16 +9,19 @@ import random
 import tempfile
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError,
     Future,
+    TimeoutError as FutureTimeoutError,
     ThreadPoolExecutor,
     wait,
 )
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from queue import PriorityQueue
 from typing import Any
 
 import httpx
@@ -75,6 +78,90 @@ _MAX_CONCURRENT_CLAIM_REQUESTS = 4
 _MAX_CLAIM_BACKPRESSURE_RETRIES = 3
 _DEFAULT_CLAIM_RETRY_SECONDS = 0.25
 _CLAIM_RETRY_JITTER_RATIO = 0.1
+
+
+@dataclass(frozen=True)
+class _ScheduledClaimRequest:
+    call: Callable[[], httpx.Response]
+    deadline: float
+    future: Future[httpx.Response]
+
+
+class _ClaimRequestScheduler:
+    """Bound claim transport concurrency and give queued renewals priority."""
+
+    def __init__(self, maximum_workers: int) -> None:
+        self._queue: PriorityQueue[tuple[int, int, _ScheduledClaimRequest | None]] = (
+            PriorityQueue()
+        )
+        self._lock = threading.Lock()
+        self._closed = False
+        self._sequence = 0
+        self._threads = tuple(
+            threading.Thread(
+                target=self._run,
+                name=f"seqevi-claim-request-{index}",
+                daemon=True,
+            )
+            for index in range(maximum_workers)
+        )
+        for thread in self._threads:
+            thread.start()
+
+    def submit(
+        self,
+        call: Callable[[], httpx.Response],
+        *,
+        renewal: bool,
+        deadline: float,
+    ) -> Future[httpx.Response]:
+        future: Future[httpx.Response] = Future()
+        with self._lock:
+            if self._closed:
+                raise StoreError("shared Store closed during claim request")
+            sequence = self._sequence
+            self._sequence += 1
+            self._queue.put(
+                (
+                    0 if renewal else 1,
+                    sequence,
+                    _ScheduledClaimRequest(call, deadline, future),
+                )
+            )
+        return future
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for _thread in self._threads:
+                self._queue.put((2, self._sequence, None))
+                self._sequence += 1
+        for thread in self._threads:
+            thread.join()
+
+    def _run(self) -> None:
+        while True:
+            _priority, _sequence, scheduled = self._queue.get()
+            try:
+                if scheduled is None:
+                    return
+                if not scheduled.future.set_running_or_notify_cancel():
+                    continue
+                if time.monotonic() >= scheduled.deadline:
+                    scheduled.future.set_exception(
+                        TimeoutError("claim request expired before transport started")
+                    )
+                    continue
+                try:
+                    response = scheduled.call()
+                except BaseException as error:
+                    scheduled.future.set_exception(error)
+                else:
+                    scheduled.future.set_result(response)
+            finally:
+                self._queue.task_done()
 
 
 class _ChunkAcquireRenewer:
@@ -311,6 +398,9 @@ class HttpEvidenceStore:
             max_workers=_MAX_CONCURRENT_CLAIM_REQUESTS,
             thread_name_prefix="seqevi-claim-renewal",
         )
+        self._claim_request_scheduler = _ClaimRequestScheduler(
+            _MAX_CONCURRENT_CLAIM_REQUESTS
+        )
 
     @property
     def supports_claims(self) -> bool:
@@ -330,10 +420,13 @@ class HttpEvidenceStore:
             self._renewal_executor.shutdown(wait=True, cancel_futures=True)
         finally:
             try:
-                if self._owns_client:
-                    self.client.close()
+                self._claim_request_scheduler.close()
             finally:
-                self._download_directory.cleanup()
+                try:
+                    if self._owns_client:
+                        self.client.close()
+                finally:
+                    self._download_directory.cleanup()
 
     def __enter__(self) -> HttpEvidenceStore:
         return self
@@ -792,20 +885,38 @@ class HttpEvidenceStore:
     def _claim_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         kwargs.setdefault("timeout", self._timeout_seconds)
         request_timeout = kwargs["timeout"]
-        deadline = (
-            time.monotonic() + request_timeout
-            if isinstance(request_timeout, (int, float))
-            else None
-        )
+        if not isinstance(request_timeout, (int, float)):
+            raise TypeError("internal claim request timeout must be numeric")
+        deadline = time.monotonic() + request_timeout
         retryable = path.endswith("/acquire") or path.endswith("/renew")
+        renewal = path.endswith("/renew")
         for attempt in range(_MAX_CLAIM_BACKPRESSURE_RETRIES + 1):
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                kwargs["timeout"] = remaining
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            attempt_kwargs = dict(kwargs)
+            # The Future wait below owns the total wall-clock deadline. HTTPX
+            # applies its timeout independently to pool, connect, write and read,
+            # so split that budget too: an abandoned transport should release its
+            # scheduler worker close to the caller's deadline.
+            attempt_kwargs["timeout"] = httpx.Timeout(remaining / 4.0)
             try:
-                response = self.client.request(method, path, **kwargs)
+                future = self._claim_request_scheduler.submit(
+                    lambda: self.client.request(method, path, **attempt_kwargs),
+                    renewal=renewal,
+                    deadline=deadline,
+                )
+                try:
+                    response = future.result(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
+                except FutureTimeoutError as error:
+                    future.cancel()
+                    if renewal:
+                        raise EvidenceClaimLostError(
+                            "claim renewal exceeded its authority runway"
+                        ) from error
+                    break
             except httpx.HTTPError as error:
                 raise StoreError(
                     f"shared Store request failed during {method} {path}: {error}"
@@ -816,11 +927,10 @@ class HttpEvidenceStore:
                 and attempt < _MAX_CLAIM_BACKPRESSURE_RETRIES
             ):
                 delay = _claim_retry_delay(response)
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= delay:
-                        break
-                    delay = min(delay, remaining)
+                remaining = deadline - time.monotonic()
+                if remaining <= delay:
+                    break
+                delay = min(delay, remaining)
                 time.sleep(delay)
                 continue
             if response.status_code == 412:

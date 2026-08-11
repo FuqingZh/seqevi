@@ -50,6 +50,16 @@ _LOOKUP_CHUNK_SIZE = 1000
 CLAIM_LEASE_SECONDS = 60.0
 CLAIM_RENEWAL_SECONDS = 20.0
 CLAIM_RETRY_SECONDS = 1.0
+_MINIMUM_POSTGRES_SERVER_VERSION_NUM = 170000
+
+
+def _require_supported_postgres_version(server_version_num: int) -> None:
+    if server_version_num < _MINIMUM_POSTGRES_SERVER_VERSION_NUM:
+        major = server_version_num // 10000
+        raise RuntimeError(
+            "shared Store requires PostgreSQL 17 or newer for bounded mutation "
+            f"transactions; detected PostgreSQL {major}"
+        )
 
 
 class ServicePersistence(Protocol):
@@ -137,6 +147,11 @@ class PostgresEvidencePersistence:
             pool_timeout=pool_timeout_seconds,
         )
         try:
+            with engine.connect() as connection:
+                server_version_num = int(
+                    connection.execute(text("SHOW server_version_num")).scalar_one()
+                )
+            _require_supported_postgres_version(server_version_num)
             upgrade_postgres_database(engine)
         except Exception:
             engine.dispose()
