@@ -587,7 +587,11 @@ def serve_command(
     try:
         import uvicorn
 
-        from .service import ServiceSettings, create_service_app
+        from .service import (
+            ServiceSettings,
+            configure_claim_logging,
+            create_service_app,
+        )
 
         settings = ServiceSettings(
             database_url=database_url,
@@ -595,6 +599,7 @@ def serve_command(
             maximum_batch_size=maximum_batch_size,
             maximum_artifact_bytes=maximum_artifact_bytes,
         )
+        configure_claim_logging()
         uvicorn.run(create_service_app(settings), host=host, port=port)
     except ImportError as error:
         typer.echo(

@@ -285,7 +285,11 @@ class HttpEvidenceStore:
                 "GET", "/v1/evidence/claims/capabilities"
             )
         except httpx.HTTPError as error:
-            raise StoreError(f"shared Store request failed: {error}") from error
+            raise StoreError(
+                "shared Store request failed during GET "
+                "/v1/evidence/claims/capabilities: "
+                f"{error}"
+            ) from error
         if capability_response.status_code == 404:
             self._claim_capabilities = None
         else:
@@ -759,10 +763,17 @@ class HttpEvidenceStore:
         try:
             response = self.client.request(method, path, **kwargs)
         except httpx.HTTPError as error:
-            raise StoreError(f"shared Store request failed: {error}") from error
+            raise StoreError(
+                f"shared Store request failed during {method} {path}: {error}"
+            ) from error
         if response.status_code == 412:
             raise EvidenceClaimLostError(response.text)
-        _raise_for_store_status(response)
+        try:
+            _raise_for_store_status(response)
+        except (EvidenceClaimLostError, EvidenceConflictError):
+            raise
+        except StoreError as error:
+            raise StoreError(f"shared Store {method} {path} failed: {error}") from error
         return response
 
     def _download(self, digest: str) -> ArtifactFile:
