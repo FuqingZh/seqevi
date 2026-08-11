@@ -53,7 +53,11 @@ from seqevi.evidence import (
     sha256_digest,
 )
 from seqevi.sequence import SequenceIdentity, identify_protein_sequence
-from seqevi.service import ServiceSettings, create_service_app
+from seqevi.service import (
+    ServiceSettings,
+    configure_claim_logging,
+    create_service_app,
+)
 from seqevi.service import persistence as persistence_module
 from seqevi.service.persistence import PostgresEvidencePersistence
 from seqevi.store import HttpEvidenceStore, LocalStore
@@ -554,9 +558,61 @@ def test_service_claim_validation_errors_emit_timing_records(
     ]
     assert len(records) == 1
     assert records[0]["operation"] == "acquire"
-    assert records[0]["batch_size"] == 0
+    assert records[0]["batch_size"] is None
     assert records[0]["outcome"] == "http_error"
     assert records[0]["status_code"] == 422
+    assert records[0]["duration_ms"] >= 0
+
+
+def test_service_claim_validation_preserves_batch_size(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    identity, key = _key("MCLAIMINVALIDOWNER")
+    app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
+    caplog.set_level(logging.INFO, logger="seqevi.service.claims")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/evidence/claims/acquire",
+            json={
+                "owner_token": "x" * 256,
+                "queries": [
+                    EvidenceQueryModel.from_domain(
+                        EvidenceQuery(identity, key)
+                    ).model_dump(mode="json")
+                ],
+            },
+        )
+
+    assert response.status_code == 422
+    records = [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "seqevi.service.claims"
+    ]
+    assert len(records) == 1
+    assert records[0]["operation"] == "acquire"
+    assert records[0]["batch_size"] == 1
+    assert records[0]["duration_ms"] >= 0
+
+
+def test_configure_claim_logging_attaches_an_info_handler() -> None:
+    logger = logging.getLogger("seqevi.service.claims")
+    handlers = list(logger.handlers)
+    propagate = logger.propagate
+    try:
+        logger.handlers.clear()
+        logger.propagate = True
+        configure_claim_logging()
+        assert logger.level == logging.INFO
+        assert len(logger.handlers) == 1
+        assert logger.handlers[0].level == logging.INFO
+        assert logger.handlers[0].formatter is not None
+        assert not logger.propagate
+    finally:
+        logger.handlers.clear()
+        logger.handlers.extend(handlers)
+        logger.propagate = propagate
 
 
 def test_old_health_shape_and_missing_claim_capability_fall_back(

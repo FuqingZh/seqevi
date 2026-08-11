@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, contextmanager
 from time import perf_counter
 from typing import Annotated, Iterator
@@ -13,7 +13,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from seqevi.errors import (
     EvidenceClaimLostError,
@@ -84,17 +84,30 @@ def create_service_app(
         lifespan=lifespan,
     )
 
+    @app.middleware("http")
+    async def capture_claim_request_boundary(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if _claim_operation(request.url.path) is not None:
+            request.state.seqevi_claim_request_id = uuid4().hex
+            request.state.seqevi_claim_started = perf_counter()
+        return await call_next(request)
+
     @app.exception_handler(RequestValidationError)
     async def claim_request_validation_error(
         request: Request, error: RequestValidationError
     ) -> JSONResponse:
         operation = _claim_operation(request.url.path)
         if operation is not None:
+            started = getattr(request.state, "seqevi_claim_started", perf_counter())
             _log_claim_request(
                 operation,
-                batch_size=0,
+                batch_size=_claim_batch_size(error.body),
                 outcome="http_error",
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                request_id=getattr(request.state, "seqevi_claim_request_id", None),
+                duration_ms=round((perf_counter() - started) * 1000, 3),
             )
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -350,6 +363,19 @@ def create_service_app(
     return app
 
 
+def configure_claim_logging() -> None:
+    """Attach a concrete INFO handler for the standalone ``serve`` process."""
+
+    _CLAIM_LOGGER.setLevel(logging.INFO)
+    if _CLAIM_LOGGER.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    _CLAIM_LOGGER.addHandler(handler)
+    _CLAIM_LOGGER.propagate = False
+
+
 def _check_batch_size(size: int, maximum: int) -> None:
     if size > maximum:
         raise HTTPException(
@@ -398,7 +424,7 @@ def _claim_operation(path: str) -> str | None:
 def _log_claim_request(
     operation: str,
     *,
-    batch_size: int,
+    batch_size: int | None,
     outcome: str,
     status_code: int,
     request_id: str | None = None,
@@ -419,6 +445,16 @@ def _log_claim_request(
             sort_keys=True,
         )
     )
+
+
+def _claim_batch_size(body: object) -> int | None:
+    if not isinstance(body, dict):
+        return None
+    for field in ("queries", "claims", "commits"):
+        values = body.get(field)
+        if isinstance(values, list):
+            return len(values)
+    return None
 
 
 def _validate_commit_model(commit: CommitModel) -> None:
