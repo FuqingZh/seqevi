@@ -285,7 +285,11 @@ class HttpEvidenceStore:
                 "GET", "/v1/evidence/claims/capabilities"
             )
         except httpx.HTTPError as error:
-            raise StoreError(f"shared Store request failed: {error}") from error
+            raise StoreError(
+                "shared Store request failed during GET "
+                "/v1/evidence/claims/capabilities: "
+                f"{error}"
+            ) from error
         if capability_response.status_code == 404:
             self._claim_capabilities = None
         else:

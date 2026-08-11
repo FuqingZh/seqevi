@@ -856,6 +856,22 @@ def test_http_claim_transport_error_identifies_method_and_path() -> None:
             store.renew_many((claim,))
 
 
+def test_http_claim_capability_probe_error_identifies_method_and_path() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        raise httpx.ReadTimeout("capability probe did not respond", request=request)
+
+    with pytest.raises(
+        StoreError,
+        match=r"shared Store request failed during GET /v1/evidence/claims/capabilities",
+    ):
+        HttpEvidenceStore(
+            "http://testserver",
+            client=_claim_mock_client(httpx.MockTransport(handler)),
+        )
+
+
 def test_http_claim_chunks_honor_client_and_capability_limits() -> None:
     queries = tuple(
         EvidenceQuery(identity, key)

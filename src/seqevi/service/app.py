@@ -103,7 +103,7 @@ def create_service_app(
             started = getattr(request.state, "seqevi_claim_started", perf_counter())
             _log_claim_request(
                 operation,
-                batch_size=_claim_batch_size(error.body),
+                batch_size=_claim_batch_size(operation, error.body),
                 outcome="http_error",
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 request_id=getattr(request.state, "seqevi_claim_request_id", None),
@@ -139,8 +139,15 @@ def create_service_app(
         )
 
     @app.post("/v1/evidence/claims/acquire", response_model=ClaimAcquireResponse)
-    def acquire_claims(request: ClaimAcquireRequest) -> ClaimAcquireResponse:
-        with _observe_claim_request("acquire", len(request.queries)):
+    def acquire_claims(
+        request: ClaimAcquireRequest, http_request: Request
+    ) -> ClaimAcquireResponse:
+        with _observe_claim_request(
+            "acquire",
+            len(request.queries),
+            started=_claim_started(http_request),
+            request_id=_claim_request_id(http_request),
+        ):
             _check_batch_size(
                 len(request.queries),
                 min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
@@ -161,8 +168,15 @@ def create_service_app(
             )
 
     @app.post("/v1/evidence/claims/renew", response_model=ClaimRenewResponse)
-    def renew_claims(request: ClaimMutationRequest) -> ClaimRenewResponse:
-        with _observe_claim_request("renew", len(request.claims)):
+    def renew_claims(
+        request: ClaimMutationRequest, http_request: Request
+    ) -> ClaimRenewResponse:
+        with _observe_claim_request(
+            "renew",
+            len(request.claims),
+            started=_claim_started(http_request),
+            request_id=_claim_request_id(http_request),
+        ):
             _check_batch_size(
                 len(request.claims),
                 min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
@@ -180,8 +194,15 @@ def create_service_app(
             )
 
     @app.post("/v1/evidence/claims/release", response_model=ClaimReleaseResponse)
-    def release_claims(request: ClaimMutationRequest) -> ClaimReleaseResponse:
-        with _observe_claim_request("release", len(request.claims)):
+    def release_claims(
+        request: ClaimMutationRequest, http_request: Request
+    ) -> ClaimReleaseResponse:
+        with _observe_claim_request(
+            "release",
+            len(request.claims),
+            started=_claim_started(http_request),
+            request_id=_claim_request_id(http_request),
+        ):
             _check_batch_size(
                 len(request.claims),
                 min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
@@ -321,8 +342,15 @@ def create_service_app(
         return CommitResponse(outcomes=list(outcomes))
 
     @app.post("/v1/evidence/claims/finalize", response_model=CommitResponse)
-    def finalize_claims(request: ClaimFinalizeRequest) -> CommitResponse:
-        with _observe_claim_request("finalize", len(request.commits)):
+    def finalize_claims(
+        request: ClaimFinalizeRequest, http_request: Request
+    ) -> CommitResponse:
+        with _observe_claim_request(
+            "finalize",
+            len(request.commits),
+            started=_claim_started(http_request),
+            request_id=_claim_request_id(http_request),
+        ):
             _check_batch_size(
                 len(request.commits),
                 min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
@@ -385,11 +413,17 @@ def _check_batch_size(size: int, maximum: int) -> None:
 
 
 @contextmanager
-def _observe_claim_request(operation: str, batch_size: int) -> Iterator[None]:
+def _observe_claim_request(
+    operation: str,
+    batch_size: int,
+    *,
+    started: float | None = None,
+    request_id: str | None = None,
+) -> Iterator[None]:
     """Emit one secret-free, machine-readable timing record per claim request."""
 
-    request_id = uuid4().hex
-    started = perf_counter()
+    request_id = request_id or uuid4().hex
+    started = started if started is not None else perf_counter()
     outcome = "error"
     status_code = 500
     try:
@@ -447,13 +481,26 @@ def _log_claim_request(
     )
 
 
-def _claim_batch_size(body: object) -> int | None:
+def _claim_started(request: Request) -> float:
+    return getattr(request.state, "seqevi_claim_started", perf_counter())
+
+
+def _claim_request_id(request: Request) -> str | None:
+    return getattr(request.state, "seqevi_claim_request_id", None)
+
+
+def _claim_batch_size(operation: str, body: object) -> int | None:
     if not isinstance(body, dict):
         return None
-    for field in ("queries", "claims", "commits"):
-        values = body.get(field)
-        if isinstance(values, list):
-            return len(values)
+    field = {
+        "acquire": "queries",
+        "renew": "claims",
+        "release": "claims",
+        "finalize": "commits",
+    }[operation]
+    values = body.get(field)
+    if isinstance(values, list):
+        return len(values)
     return None
 
 
