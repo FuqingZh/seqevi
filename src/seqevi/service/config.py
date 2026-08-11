@@ -13,9 +13,11 @@ DEFAULT_DATABASE_MAX_OVERFLOW = 8
 DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS = 5.0
 DEFAULT_DATABASE_LOCK_TIMEOUT_SECONDS = 5.0
 DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS = 15.0
-DEFAULT_DATABASE_TRANSACTION_TIMEOUT_SECONDS = 30.0
-# Preserve the final five seconds of the 60-second claim lease as client runway.
-MAXIMUM_DATABASE_REQUEST_WAIT_SECONDS = 55.0
+DEFAULT_DATABASE_TRANSACTION_TIMEOUT_SECONDS = 25.0
+# The first-party lease renews after 20 seconds and preserves a five-second
+# runway. Leave a further five seconds for dispatch and the response after the
+# combined pool checkout and PostgreSQL transaction wait.
+MAXIMUM_DATABASE_REQUEST_WAIT_SECONDS = 30.0
 
 
 class ServiceSettings(BaseSettings):

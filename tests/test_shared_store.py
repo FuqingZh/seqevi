@@ -1060,6 +1060,56 @@ def test_http_claim_scheduler_releases_slot_at_request_deadline() -> None:
         store.close()
 
 
+def test_http_claim_scheduler_keeps_expired_transport_within_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 1)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        if request.url.path.endswith("/acquire"):
+            first_started.set()
+            assert release_first.wait(timeout=3)
+        else:
+            second_started.set()
+        return httpx.Response(200, json={})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        client=_claim_mock_client(httpx.MockTransport(handler)),
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=2) as callers:
+            first = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/acquire",
+                timeout=0.1,
+            )
+            assert first_started.wait(timeout=2)
+            second = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/renew",
+                timeout=0.2,
+            )
+            with pytest.raises(EvidenceClaimLostError):
+                second.result(timeout=2)
+            assert not second_started.is_set()
+            release_first.set()
+            with pytest.raises(StoreError, match="remained unavailable"):
+                first.result(timeout=2)
+    finally:
+        release_first.set()
+        store.close()
+
+
 def test_http_claim_renewal_enforces_one_wall_clock_deadline() -> None:
     _identity, key = _key("MCLAIMTOTALDEADLINE")
     claim = EvidenceClaim(
@@ -2625,8 +2675,8 @@ def test_shared_store_configuration_requires_postgres_and_postgres_engine(
     assert normalized.database_pool_timeout_seconds == 5.0
     assert normalized.database_lock_timeout_seconds == 5.0
     assert normalized.database_statement_timeout_seconds == 15.0
-    assert normalized.database_transaction_timeout_seconds == 30.0
-    with pytest.raises(ValidationError, match="must total at most 55 seconds"):
+    assert normalized.database_transaction_timeout_seconds == 25.0
+    with pytest.raises(ValidationError, match="must total at most 30 seconds"):
         ServiceSettings(
             database_url="postgresql://seqevi@postgres/seqevi",
             artifacts_dir=tmp_path,

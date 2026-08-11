@@ -96,6 +96,8 @@ class _ClaimRequestScheduler:
             PriorityQueue()
         )
         self._lock = threading.Lock()
+        self._capacity = threading.Condition(self._lock)
+        self._maximum_workers = maximum_workers
         self._closed = False
         self._sequence = 0
         self._active_transports: set[threading.Thread] = set()
@@ -145,6 +147,7 @@ class _ClaimRequestScheduler:
             if self._closed:
                 return
             self._closed = True
+            self._capacity.notify_all()
             for _thread in self._threads:
                 self._queue.put((2, self._sequence, None))
                 self._sequence += 1
@@ -199,15 +202,29 @@ class _ClaimRequestScheduler:
                             pass
                     finally:
                         done.set()
-                        with self._lock:
+                        with self._capacity:
                             self._active_transports.discard(threading.current_thread())
+                            self._capacity.notify()
 
                 transport_thread = threading.Thread(
                     target=run_transport,
                     name="seqevi-claim-transport",
                     daemon=True,
                 )
-                with self._lock:
+                with self._capacity:
+                    while (
+                        len(self._active_transports) >= self._maximum_workers
+                        and not self._closed
+                    ):
+                        self._capacity.wait()
+                    if self._closed:
+                        try:
+                            scheduled.future.set_exception(
+                                StoreError("shared Store closed during claim request")
+                            )
+                        except InvalidStateError:
+                            pass
+                        continue
                     self._active_transports.add(transport_thread)
                 transport_thread.start()
                 if not transport_done.wait(timeout=remaining):
