@@ -947,12 +947,17 @@ def test_http_claim_retries_retryable_backpressure(
             },
         )
 
-    def sleep(delay: float) -> None:
+    def wait_for_retry(_store: HttpEvidenceStore, delay: float) -> bool:
         sleeps.append(delay)
         clock[0] += delay
+        return False
 
     monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(client_module.time, "sleep", sleep)
+    monkeypatch.setattr(
+        client_module.HttpEvidenceStore,
+        "_wait_for_claim_retry",
+        wait_for_retry,
+    )
     client = _claim_mock_client(httpx.MockTransport(handler))
     with HttpEvidenceStore("http://testserver", client=client) as store:
         renewed = store.renew_many((claim,))
@@ -1010,6 +1015,49 @@ def test_http_claim_scheduler_recomputes_timeout_after_queueing(
 
     assert len(observed_timeout) == 1
     assert 0.15 < observed_timeout[0] < 0.45
+
+
+def test_http_claim_scheduler_releases_slot_at_request_deadline() -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        if request.url.path.endswith("/acquire"):
+            first_started.set()
+            assert release_first.wait(timeout=3)
+        else:
+            second_started.set()
+        return httpx.Response(200, json={})
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    store = HttpEvidenceStore("http://testserver", client=client)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as callers:
+            first = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/acquire",
+                timeout=0.1,
+            )
+            assert first_started.wait(timeout=2)
+            second = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/renew",
+                timeout=1.0,
+            )
+            assert second_started.wait(timeout=1)
+            assert second.result(timeout=2).status_code == 200
+            with pytest.raises(StoreError, match="remained unavailable"):
+                first.result(timeout=2)
+    finally:
+        release_first.set()
+        store.close()
 
 
 def test_http_claim_renewal_enforces_one_wall_clock_deadline() -> None:
@@ -1892,6 +1940,65 @@ def test_http_store_close_cancels_queued_scheduler_renewal_before_waiting(
     assert not close_thread.is_alive()
     assert not active_errors
     assert len(renewal_errors) == 1
+
+
+def test_http_store_close_interrupts_claim_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retry_waiting = threading.Event()
+    release_retry = threading.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        return httpx.Response(503, headers={"Retry-After": "5"})
+
+    original_wait = client_module.HttpEvidenceStore._wait_for_claim_retry
+
+    def observe_wait(store: HttpEvidenceStore, delay: float) -> bool:
+        retry_waiting.set()
+        result = original_wait(store, delay)
+        release_retry.set()
+        return result
+
+    monkeypatch.setattr(
+        client_module.HttpEvidenceStore,
+        "_wait_for_claim_retry",
+        observe_wait,
+    )
+    _identity, key = _key("MCLOSERETRY")
+    claim = EvidenceClaim(
+        key,
+        "owner",
+        1,
+        datetime.now(UTC) + timedelta(seconds=60),
+        20.0,
+    )
+    store = HttpEvidenceStore(
+        "http://testserver",
+        client=_claim_mock_client(httpx.MockTransport(handler)),
+    )
+    errors: list[BaseException] = []
+
+    def renew() -> None:
+        try:
+            store.renew_many((claim,))
+        except BaseException as error:
+            errors.append(error)
+
+    renewal_thread = threading.Thread(target=renew)
+    renewal_thread.start()
+    assert retry_waiting.wait(timeout=2)
+    store.close()
+    renewal_thread.join(timeout=2)
+
+    assert release_retry.is_set()
+    assert not renewal_thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], StoreError)
+    assert "closed during claim request" in str(errors[0])
 
 
 def test_http_renew_bounded_overload_fails_before_stale_chunk_starts(

@@ -14,6 +14,7 @@ from concurrent.futures import (
     FIRST_COMPLETED,
     CancelledError,
     Future,
+    InvalidStateError,
     TimeoutError as FutureTimeoutError,
     ThreadPoolExecutor,
     wait,
@@ -97,6 +98,7 @@ class _ClaimRequestScheduler:
         self._lock = threading.Lock()
         self._closed = False
         self._sequence = 0
+        self._active_transports: set[threading.Thread] = set()
         self._threads = tuple(
             threading.Thread(
                 target=self._run,
@@ -148,6 +150,13 @@ class _ClaimRequestScheduler:
                 self._sequence += 1
         for thread in self._threads:
             thread.join()
+        while True:
+            with self._lock:
+                active = tuple(self._active_transports)
+            if not active:
+                return
+            for thread in active:
+                thread.join()
 
     def _run(self) -> None:
         while True:
@@ -162,20 +171,52 @@ class _ClaimRequestScheduler:
                         TimeoutError("claim request expired before transport started")
                     )
                     continue
-                try:
-                    remaining = scheduled.deadline - time.monotonic()
-                    if remaining <= 0:
+                remaining = scheduled.deadline - time.monotonic()
+                if remaining <= 0:
+                    scheduled.future.set_exception(
+                        TimeoutError("claim request expired before transport started")
+                    )
+                    continue
+
+                transport_done = threading.Event()
+
+                def run_transport(
+                    scheduled_request: _ScheduledClaimRequest = scheduled,
+                    transport_timeout: float = remaining,
+                    done: threading.Event = transport_done,
+                ) -> None:
+                    try:
+                        response = scheduled_request.call(transport_timeout)
+                    except BaseException as error:
+                        try:
+                            scheduled_request.future.set_exception(error)
+                        except InvalidStateError:
+                            pass
+                    else:
+                        try:
+                            scheduled_request.future.set_result(response)
+                        except InvalidStateError:
+                            pass
+                    finally:
+                        done.set()
+                        with self._lock:
+                            self._active_transports.discard(threading.current_thread())
+
+                transport_thread = threading.Thread(
+                    target=run_transport,
+                    name="seqevi-claim-transport",
+                    daemon=True,
+                )
+                with self._lock:
+                    self._active_transports.add(transport_thread)
+                transport_thread.start()
+                if not transport_done.wait(timeout=remaining):
+                    try:
                         scheduled.future.set_exception(
-                            TimeoutError(
-                                "claim request expired before transport started"
-                            )
+                            TimeoutError("claim request exceeded its deadline")
                         )
-                        continue
-                    response = scheduled.call(remaining)
-                except BaseException as error:
-                    scheduled.future.set_exception(error)
-                else:
-                    scheduled.future.set_result(response)
+                    except InvalidStateError:
+                        pass
             finally:
                 self._queue.task_done()
 
@@ -368,6 +409,7 @@ class HttpEvidenceStore:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
         self._timeout_seconds = timeout_seconds
+        self._closing = threading.Event()
         self._uploaded_artifact_digests: set[str] = set()
         self._download_directory = tempfile.TemporaryDirectory(
             prefix="seqevi-http-artifacts-"
@@ -432,6 +474,7 @@ class HttpEvidenceStore:
         return self._claim_capabilities is not None
 
     def close(self) -> None:
+        self._closing.set()
         try:
             # Renewal tasks may already be blocked on the request scheduler;
             # cancel those queued transport futures before waiting for them.
@@ -902,6 +945,8 @@ class HttpEvidenceStore:
         return renewed
 
     def _claim_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        if self._closing.is_set():
+            raise StoreError("shared Store closed during claim request")
         kwargs.setdefault("timeout", self._timeout_seconds)
         request_timeout = kwargs["timeout"]
         if not isinstance(request_timeout, (int, float)):
@@ -953,7 +998,8 @@ class HttpEvidenceStore:
                 if remaining <= delay:
                     break
                 delay = min(delay, remaining)
-                time.sleep(delay)
+                if self._wait_for_claim_retry(delay):
+                    raise StoreError("shared Store closed during claim request")
                 continue
             if response.status_code == 412:
                 raise EvidenceClaimLostError(response.text)
@@ -970,6 +1016,11 @@ class HttpEvidenceStore:
             f"shared Store {method} {path} remained unavailable after "
             f"{_MAX_CLAIM_BACKPRESSURE_RETRIES} retries"
         )
+
+    def _wait_for_claim_retry(self, delay: float) -> bool:
+        """Wait for a retry delay, returning whether shutdown began."""
+
+        return self._closing.wait(delay)
 
     def _download(self, digest: str) -> ArtifactFile:
         cached = self._downloaded_artifacts.get(digest)
