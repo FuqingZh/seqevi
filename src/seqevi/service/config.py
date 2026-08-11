@@ -8,6 +8,13 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+DEFAULT_DATABASE_POOL_SIZE = 16
+DEFAULT_DATABASE_MAX_OVERFLOW = 8
+DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS = 5.0
+DEFAULT_DATABASE_LOCK_TIMEOUT_SECONDS = 5.0
+DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS = 15.0
+
+
 class ServiceSettings(BaseSettings):
     """Deployment configuration with bounded public request sizes."""
 
@@ -20,6 +27,19 @@ class ServiceSettings(BaseSettings):
         default=512 * 1024 * 1024,
         ge=1,
         le=8 * 1024 * 1024 * 1024,
+    )
+    database_pool_size: int = Field(default=DEFAULT_DATABASE_POOL_SIZE, ge=1, le=256)
+    database_max_overflow: int = Field(
+        default=DEFAULT_DATABASE_MAX_OVERFLOW, ge=0, le=256
+    )
+    database_pool_timeout_seconds: float = Field(
+        default=DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS, gt=0, le=120
+    )
+    database_lock_timeout_seconds: float = Field(
+        default=DEFAULT_DATABASE_LOCK_TIMEOUT_SECONDS, gt=0, le=60
+    )
+    database_statement_timeout_seconds: float = Field(
+        default=DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS, gt=0, le=120
     )
 
     def model_post_init(self, _context: object) -> None:

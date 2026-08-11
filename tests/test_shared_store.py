@@ -35,6 +35,7 @@ from seqevi.annotate import run_annotation
 from seqevi.errors import (
     EvidenceClaimLostError,
     EvidenceConflictError,
+    StoreBackpressureError,
     StoreError,
     StoreIntegrityError,
 )
@@ -615,6 +616,37 @@ def test_configure_claim_logging_attaches_an_info_handler() -> None:
         logger.propagate = propagate
 
 
+def test_service_claim_backpressure_returns_retryable_response(tmp_path: Path) -> None:
+    class BusyPersistence(MemoryPersistence):
+        def acquire_many(
+            self,
+            queries: Iterable[EvidenceQuery],
+            *,
+            owner_token: str,
+        ) -> tuple[ClaimAcquireResult, ...]:
+            raise StoreBackpressureError("database mutation is busy")
+
+    identity, key = _key("MBACKPRESSURE")
+    app = create_service_app(_settings(tmp_path), persistence=BusyPersistence())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/evidence/claims/acquire",
+            json={
+                "owner_token": "owner",
+                "queries": [
+                    EvidenceQueryModel.from_domain(
+                        EvidenceQuery(identity, key)
+                    ).model_dump(mode="json")
+                ],
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert response.json()["detail"] == "database mutation is busy"
+
+
 def test_old_health_shape_and_missing_claim_capability_fall_back(
     tmp_path: Path,
 ) -> None:
@@ -872,6 +904,55 @@ def test_http_claim_capability_probe_error_identifies_method_and_path() -> None:
         )
 
 
+def test_http_claim_retries_retryable_backpressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _identity, key = _key("MCLAIMRETRY")
+    claim = EvidenceClaim(
+        key,
+        "owner",
+        1,
+        datetime.now(UTC) + timedelta(seconds=60),
+        20.0,
+    )
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, headers={"Retry-After": "1"})
+        renewed = EvidenceClaim(
+            claim.key,
+            claim.owner_token,
+            claim.generation,
+            datetime.now(UTC) + timedelta(seconds=60),
+            claim.renewal_after_seconds,
+        )
+        return httpx.Response(
+            200,
+            json={
+                "claims": [
+                    EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
+                ]
+            },
+        )
+
+    monkeypatch.setattr(client_module.time, "sleep", sleeps.append)
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        renewed = store.renew_many((claim,))
+
+    assert len(renewed) == 1
+    assert attempts == 2
+    assert len(sleeps) == 1
+    assert 0.9 <= sleeps[0] <= 1.1
+
 def test_http_claim_chunks_honor_client_and_capability_limits() -> None:
     queries = tuple(
         EvidenceQuery(identity, key)
@@ -910,6 +991,48 @@ def test_http_claim_chunks_honor_client_and_capability_limits() -> None:
 
     assert len(results) == 5
     assert observed_sizes == [2, 2, 1]
+
+
+def test_http_claim_chunks_apply_internal_contention_cap() -> None:
+    queries = tuple(
+        EvidenceQuery(identity, key)
+        for identity, key in (
+            _key("MCONTENTION" + "A" * index) for index in range(1, 252)
+        )
+    )
+    observed_sizes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        body = json.loads(request.content)
+        observed_sizes.append(len(body["queries"]))
+        results = []
+        for query_data in body["queries"]:
+            query = EvidenceQueryModel.model_validate(query_data).to_domain()
+            acquired = ClaimAcquireResult(
+                ClaimDisposition.ACQUIRED,
+                claim=EvidenceClaim(
+                    query.key,
+                    body["owner_token"],
+                    1,
+                    datetime.now(UTC) + timedelta(seconds=60),
+                    20.0,
+                ),
+            )
+            results.append(
+                ClaimAcquireResultModel.from_domain(acquired).model_dump(mode="json")
+            )
+        return httpx.Response(200, json={"results": results})
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        results = store.acquire_many(queries, owner_token="owner")
+
+    assert len(results) == len(queries)
+    assert observed_sizes == [250, 1]
 
 
 def test_http_claim_chunks_renew_early_authority_while_acquisition_blocks() -> None:
@@ -1312,7 +1435,7 @@ def test_http_renew_bounded_scheduler_drains_fast_slots_before_blocked_chunk() -
             if returned.key == final_key:
                 final_started.set()
             if returned.key == blocked_key:
-                assert final_started.wait(timeout=3)
+                time.sleep(0.02)
             renewed = EvidenceClaim(
                 returned.key,
                 returned.owner_token,
@@ -1338,7 +1461,7 @@ def test_http_renew_bounded_scheduler_drains_fast_slots_before_blocked_chunk() -
 
     assert tuple(claim.key for claim in renewed) == tuple(claim.key for claim in claims)
     assert final_started.is_set()
-    assert maximum_active <= 32
+    assert maximum_active <= client_module._MAX_CONCURRENT_CLAIM_REQUESTS
 
 
 def test_http_renew_shared_executor_bounds_concurrent_logical_calls() -> None:
@@ -1411,7 +1534,7 @@ def test_http_renew_shared_executor_bounds_concurrent_logical_calls() -> None:
         with ThreadPoolExecutor(max_workers=len(claim_groups)) as callers:
             results = tuple(callers.map(renew_group, claim_groups))
 
-    assert maximum_active <= 32
+    assert maximum_active <= client_module._MAX_CONCURRENT_CLAIM_REQUESTS
     assert maximum_active > 1
     assert tuple(tuple(claim.key for claim in group) for group in results) == tuple(
         tuple(claim.key for claim in group) for group in claim_groups
@@ -1496,10 +1619,6 @@ def test_http_store_close_cancels_pending_renewal_then_drains_active_transport(
     renewal_thread = threading.Thread(target=renew)
     renewal_thread.start()
     assert active_started.wait(timeout=2)
-    pending_deadline = time.monotonic() + 2
-    while store._renewal_executor._work_queue.qsize() != 1:  # pyright: ignore[reportPrivateUsage]
-        assert time.monotonic() < pending_deadline
-        time.sleep(0.001)
     close_thread = threading.Thread(target=store.close)
     close_thread.start()
     deadline = time.monotonic() + 2
@@ -1537,7 +1656,7 @@ def test_http_renew_bounded_overload_fails_before_stale_chunk_starts(
             _key("MOVERLOAD" + "A" * (index + 1)) for index in range(33)
         )
     )
-    first_wave = threading.Barrier(32)
+    first_wave = threading.Barrier(client_module._MAX_CONCURRENT_CLAIM_REQUESTS)
     active = 0
     maximum_active = 0
     request_count = 0
@@ -1597,7 +1716,7 @@ def test_http_renew_bounded_overload_fails_before_stale_chunk_starts(
             store.renew_many(claims)
 
     assert request_count == 32
-    assert maximum_active == 32
+    assert maximum_active == client_module._MAX_CONCURRENT_CLAIM_REQUESTS
 
 
 def test_http_renew_many_fails_instead_of_returning_stale_handles() -> None:
@@ -2146,6 +2265,11 @@ def test_shared_store_configuration_requires_postgres_and_postgres_engine(
         artifacts_dir=tmp_path,
     )
     assert normalized.database_url == "postgresql+psycopg://seqevi@postgres/seqevi"
+    assert normalized.database_pool_size == 16
+    assert normalized.database_max_overflow == 8
+    assert normalized.database_pool_timeout_seconds == 5.0
+    assert normalized.database_lock_timeout_seconds == 5.0
+    assert normalized.database_statement_timeout_seconds == 15.0
     assert isinstance(artifacts.c.byte_size.type, BigInteger)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     try:

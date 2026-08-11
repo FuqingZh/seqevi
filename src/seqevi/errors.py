@@ -41,6 +41,10 @@ class StoreIntegrityError(StoreError):
     """Raised when persisted content does not match its immutable identity."""
 
 
+class StoreBackpressureError(StoreError):
+    """Raised when a shared Store mutation must be retried after backpressure."""
+
+
 class EvidenceConflictError(StoreIntegrityError):
     """Raised when one evidence key is associated with different payloads."""
 

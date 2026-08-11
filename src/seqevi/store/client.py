@@ -5,14 +5,20 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import random
 import tempfile
 import threading
 import time
 from collections.abc import Iterable, Iterator
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    CancelledError,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from datetime import UTC, datetime
 from pathlib import Path
-from queue import Queue
 from typing import Any
 
 import httpx
@@ -64,7 +70,11 @@ from .transport import (
 
 _CLAIM_RUNWAY_SECONDS = 5.0
 _HANDOFF_SCHEDULING_SECONDS = 1.0
-_MAX_CONCURRENT_CLAIM_REQUESTS = 32
+_CLAIM_MUTATION_CHUNK_SIZE = 250
+_MAX_CONCURRENT_CLAIM_REQUESTS = 4
+_MAX_CLAIM_BACKPRESSURE_RETRIES = 3
+_DEFAULT_CLAIM_RETRY_SECONDS = 0.25
+_CLAIM_RETRY_JITTER_RATIO = 0.1
 
 
 class _ChunkAcquireRenewer:
@@ -412,7 +422,11 @@ class HttpEvidenceStore:
         capabilities = self._require_claims()
         results = []
         renewer = _ChunkAcquireRenewer(self)
-        maximum = min(capabilities.maximum_batch_size, self.maximum_batch_size, 1000)
+        maximum = min(
+            capabilities.maximum_batch_size,
+            self.maximum_batch_size,
+            _CLAIM_MUTATION_CHUNK_SIZE,
+        )
         renewer.start()
         try:
             for offset in range(0, len(requested), maximum):
@@ -543,7 +557,7 @@ class HttpEvidenceStore:
         maximum = min(
             self._claim_capabilities.maximum_batch_size,  # type: ignore[union-attr]
             self.maximum_batch_size,
-            1000,
+            _CLAIM_MUTATION_CHUNK_SIZE,
         )
         for offset in range(0, len(items), maximum):
             chunk = items[offset : offset + maximum]
@@ -653,7 +667,11 @@ class HttpEvidenceStore:
             raise ValueError("claim mutation contains a duplicate evidence key")
         capabilities = self._require_claims()
         returned: list[EvidenceClaim] = []
-        maximum = min(capabilities.maximum_batch_size, self.maximum_batch_size, 1000)
+        maximum = min(
+            capabilities.maximum_batch_size,
+            self.maximum_batch_size,
+            _CLAIM_MUTATION_CHUNK_SIZE,
+        )
         if renew:
             chunks = tuple(
                 claims[offset : offset + maximum]
@@ -666,31 +684,44 @@ class HttpEvidenceStore:
                 key=lambda item: min(claim.expires_at for claim in item[1]),
             )
             renewed_by_index: dict[int, tuple[EvidenceClaim, ...]] = {}
-            completed: Queue[Future[tuple[int, tuple[EvidenceClaim, ...]]]] = Queue()
-            futures: set[Future[tuple[int, tuple[EvidenceClaim, ...]]]] = set()
-            try:
-                for item in scheduled:
-                    future = self._renewal_executor.submit(
-                        self._renew_indexed_claim_chunk, item
-                    )
-                    future.add_done_callback(completed.put)
-                    futures.add(future)
-            except RuntimeError as error:
-                for future in futures:
-                    future.cancel()
-                raise StoreError("shared Store closed during claim renewal") from error
-            try:
-                for _completed_count in range(len(futures)):
-                    future = completed.get()
+            pending: set[Future[tuple[int, tuple[EvidenceClaim, ...]]]] = set()
+            next_index = 0
+
+            def submit_next() -> None:
+                nonlocal next_index
+                while (
+                    next_index < len(scheduled)
+                    and len(pending) < _MAX_CONCURRENT_CLAIM_REQUESTS
+                ):
+                    item = scheduled[next_index]
+                    next_index += 1
                     try:
-                        index, renewed_chunk = future.result()
-                    except CancelledError as error:
+                        pending.add(
+                            self._renewal_executor.submit(
+                                self._renew_indexed_claim_chunk, item
+                            )
+                        )
+                    except RuntimeError as error:
                         raise StoreError(
                             "shared Store closed during claim renewal"
                         ) from error
-                    renewed_by_index[index] = renewed_chunk
+
+            try:
+                submit_next()
+                while pending:
+                    completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        pending.remove(future)
+                        try:
+                            index, renewed_chunk = future.result()
+                        except CancelledError as error:
+                            raise StoreError(
+                                "shared Store closed during claim renewal"
+                            ) from error
+                        renewed_by_index[index] = renewed_chunk
+                    submit_next()
             except BaseException:
-                for future in futures:
+                for future in pending:
                     future.cancel()
                 raise
             renewed_chunks = tuple(
@@ -760,21 +791,48 @@ class HttpEvidenceStore:
 
     def _claim_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         kwargs.setdefault("timeout", self._timeout_seconds)
-        try:
-            response = self.client.request(method, path, **kwargs)
-        except httpx.HTTPError as error:
-            raise StoreError(
-                f"shared Store request failed during {method} {path}: {error}"
-            ) from error
-        if response.status_code == 412:
-            raise EvidenceClaimLostError(response.text)
-        try:
-            _raise_for_store_status(response)
-        except (EvidenceClaimLostError, EvidenceConflictError):
-            raise
-        except StoreError as error:
-            raise StoreError(f"shared Store {method} {path} failed: {error}") from error
-        return response
+        request_timeout = kwargs["timeout"]
+        deadline = (
+            time.monotonic() + request_timeout
+            if isinstance(request_timeout, (int, float))
+            else None
+        )
+        retryable = path.endswith("/acquire") or path.endswith("/renew")
+        for attempt in range(_MAX_CLAIM_BACKPRESSURE_RETRIES + 1):
+            try:
+                response = self.client.request(method, path, **kwargs)
+            except httpx.HTTPError as error:
+                raise StoreError(
+                    f"shared Store request failed during {method} {path}: {error}"
+                ) from error
+            if (
+                response.status_code == 503
+                and retryable
+                and attempt < _MAX_CLAIM_BACKPRESSURE_RETRIES
+            ):
+                delay = _claim_retry_delay(response)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= delay:
+                        break
+                    delay = min(delay, remaining)
+                time.sleep(delay)
+                continue
+            if response.status_code == 412:
+                raise EvidenceClaimLostError(response.text)
+            try:
+                _raise_for_store_status(response)
+            except (EvidenceClaimLostError, EvidenceConflictError):
+                raise
+            except StoreError as error:
+                raise StoreError(
+                    f"shared Store {method} {path} failed: {error}"
+                ) from error
+            return response
+        raise StoreError(
+            f"shared Store {method} {path} remained unavailable after "
+            f"{_MAX_CLAIM_BACKPRESSURE_RETRIES} retries"
+        )
 
     def _download(self, digest: str) -> ArtifactFile:
         cached = self._downloaded_artifacts.get(digest)
@@ -859,6 +917,17 @@ def _claim_request_budget(claims: tuple[EvidenceClaim, ...]) -> float:
     if remaining > _CLAIM_RUNWAY_SECONDS:
         return remaining - _CLAIM_RUNWAY_SECONDS
     return remaining
+
+
+def _claim_retry_delay(response: httpx.Response) -> float:
+    raw = response.headers.get("retry-after")
+    try:
+        base = float(raw) if raw is not None else _DEFAULT_CLAIM_RETRY_SECONDS
+    except ValueError:
+        base = _DEFAULT_CLAIM_RETRY_SECONDS
+    base = max(0.01, min(base, 5.0))
+    jitter = base * _CLAIM_RETRY_JITTER_RATIO
+    return max(0.01, base + random.uniform(-jitter, jitter))
 
 
 def _file_chunks(path: Path) -> Iterator[bytes]:

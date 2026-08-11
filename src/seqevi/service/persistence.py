@@ -5,16 +5,19 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 from collections.abc import Iterable
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 from sqlalchemy import and_, create_engine, delete, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping
+from sqlalchemy.exc import DBAPIError, TimeoutError as SQLAlchemyTimeoutError
 
 from seqevi.errors import (
     EvidenceClaimLostError,
     EvidenceConflictError,
+    StoreBackpressureError,
     StoreIntegrityError,
 )
 from seqevi.evidence import (
@@ -33,6 +36,14 @@ from seqevi.sequence import SequenceIdentity
 from seqevi.store.migration import upgrade_postgres_database
 from seqevi.store.schema import artifacts, evidence, evidence_claims, sequences
 from seqevi.store.transport import ClaimedCommitModel, CommitModel
+
+from .config import (
+    DEFAULT_DATABASE_LOCK_TIMEOUT_SECONDS,
+    DEFAULT_DATABASE_MAX_OVERFLOW,
+    DEFAULT_DATABASE_POOL_SIZE,
+    DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS,
+    DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS,
+)
 
 _LOOKUP_CHUNK_SIZE = 1000
 CLAIM_LEASE_SECONDS = 60.0
@@ -86,20 +97,47 @@ class ServicePersistence(Protocol):
 class PostgresEvidencePersistence:
     """Immutable evidence metadata backed by PostgreSQL."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        lock_timeout_seconds: float = DEFAULT_DATABASE_LOCK_TIMEOUT_SECONDS,
+        statement_timeout_seconds: float = DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS,
+    ) -> None:
         if engine.dialect.name != "postgresql":
             raise ValueError("shared Store persistence requires PostgreSQL")
         self.engine = engine
+        self.lock_timeout_seconds = lock_timeout_seconds
+        self.statement_timeout_seconds = statement_timeout_seconds
 
     @classmethod
-    def open(cls, database_url: str) -> PostgresEvidencePersistence:
-        engine = create_engine(database_url, pool_pre_ping=True)
+    def open(
+        cls,
+        database_url: str,
+        *,
+        pool_size: int = DEFAULT_DATABASE_POOL_SIZE,
+        max_overflow: int = DEFAULT_DATABASE_MAX_OVERFLOW,
+        pool_timeout_seconds: float = DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS,
+        lock_timeout_seconds: float = DEFAULT_DATABASE_LOCK_TIMEOUT_SECONDS,
+        statement_timeout_seconds: float = DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS,
+    ) -> PostgresEvidencePersistence:
+        engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_timeout=pool_timeout_seconds,
+        )
         try:
             upgrade_postgres_database(engine)
         except Exception:
             engine.dispose()
             raise
-        return cls(engine)
+        return cls(
+            engine,
+            lock_timeout_seconds=lock_timeout_seconds,
+            statement_timeout_seconds=statement_timeout_seconds,
+        )
 
     def close(self) -> None:
         self.engine.dispose()
@@ -107,6 +145,36 @@ class PostgresEvidencePersistence:
     @property
     def supports_claims(self) -> bool:
         return True
+
+    @contextmanager
+    def _transaction(self) -> Iterator[Connection]:
+        """Apply bounded PostgreSQL mutation deadlines and translate saturation."""
+
+        try:
+            with self.engine.begin() as connection:
+                connection.execute(
+                    text("SELECT set_config('lock_timeout', :value, true)"),
+                    {"value": f"{self.lock_timeout_seconds:g}s"},
+                )
+                connection.execute(
+                    text("SELECT set_config('statement_timeout', :value, true)"),
+                    {"value": f"{self.statement_timeout_seconds:g}s"},
+                )
+                yield connection
+        except SQLAlchemyTimeoutError as error:
+            raise StoreBackpressureError(
+                "shared Store database pool is saturated; retry the request"
+            ) from error
+        except DBAPIError as error:
+            sqlstate = getattr(error.orig, "sqlstate", None) or getattr(
+                error.orig, "pgcode", None
+            )
+            if sqlstate in {"55P03", "57014"}:
+                raise StoreBackpressureError(
+                    "shared Store database mutation exceeded its wait budget; "
+                    "retry the request"
+                ) from error
+            raise
 
     def acquire_many(
         self, queries: Iterable[EvidenceQuery], *, owner_token: str
@@ -116,7 +184,7 @@ class PostgresEvidencePersistence:
             raise ValueError("acquire batch contains a duplicate evidence key")
         _validate_owner_token(owner_token)
         results: dict[EvidenceKey, ClaimAcquireResult] = {}
-        with self.engine.begin() as connection:
+        with self._transaction() as connection:
             _lock_evidence_keys(connection, (query.key for query in requested))
             for query in sorted(requested, key=lambda item: _key_sort_value(item.key)):
                 _insert_sequence(connection, query.identity)
@@ -389,7 +457,7 @@ class PostgresEvidencePersistence:
         if len({claim.key for claim in requested}) != len(requested):
             raise ValueError("claim renewal contains a duplicate evidence key")
         renewed: dict[EvidenceKey, EvidenceClaim] = {}
-        with self.engine.begin() as connection:
+        with self._transaction() as connection:
             _lock_evidence_keys(connection, (claim.key for claim in requested))
             for claim in sorted(requested, key=lambda item: _key_sort_value(item.key)):
                 row = (
@@ -459,7 +527,7 @@ class PostgresEvidencePersistence:
         requested = tuple(claims)
         if len({claim.key for claim in requested}) != len(requested):
             raise ValueError("claim release contains a duplicate evidence key")
-        with self.engine.begin() as connection:
+        with self._transaction() as connection:
             _lock_evidence_keys(connection, (claim.key for claim in requested))
             for claim in sorted(requested, key=lambda item: _key_sort_value(item.key)):
                 row = (
@@ -500,7 +568,7 @@ class PostgresEvidencePersistence:
         if len({item.claim.key.to_domain() for item in proposed}) != len(proposed):
             raise ValueError("claim finalization contains a duplicate evidence key")
         outcomes: dict[EvidenceKey, CommitOutcome] = {}
-        with self.engine.begin() as connection:
+        with self._transaction() as connection:
             _lock_evidence_keys(
                 connection, (item.claim.key.to_domain() for item in proposed)
             )
@@ -615,7 +683,7 @@ class PostgresEvidencePersistence:
             proposed, key=lambda item: _key_sort_value(item.key.to_domain())
         )
         outcomes: dict[EvidenceKey, CommitOutcome] = {}
-        with self.engine.begin() as connection:
+        with self._transaction() as connection:
             _lock_evidence_keys(
                 connection, (commit.key.to_domain() for commit in proposed)
             )
