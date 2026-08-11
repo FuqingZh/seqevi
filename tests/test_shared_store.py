@@ -1222,6 +1222,94 @@ def test_http_claim_scheduler_prioritizes_renewal_and_caps_all_mutations(
     ]
 
 
+def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 2)
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_transports = threading.Event()
+    order: list[str] = []
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        with lock:
+            order.append(request.url.path)
+        if request.url.path.endswith("/acquire"):
+            if not first_started.is_set():
+                first_started.set()
+            else:
+                second_started.set()
+            assert release_transports.wait(timeout=3)
+        return httpx.Response(200, json={})
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    store = HttpEvidenceStore("http://testserver", client=client)
+    try:
+        with ThreadPoolExecutor(max_workers=5) as callers:
+            first = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/acquire",
+                timeout=0.1,
+            )
+            assert first_started.wait(timeout=2)
+            second = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/acquire",
+                timeout=0.1,
+            )
+            assert second_started.wait(timeout=2)
+            deadline = time.monotonic() + 2
+            while len(store._claim_request_scheduler._active_transports) < 2:  # pyright: ignore[reportPrivateUsage]
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            release = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/release",
+                timeout=2.0,
+            )
+            finalize = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/finalize",
+                timeout=2.0,
+            )
+            with pytest.raises(StoreError, match="remained unavailable"):
+                first.result(timeout=2)
+            with pytest.raises(StoreError, match="remained unavailable"):
+                second.result(timeout=2)
+            renew = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/renew",
+                timeout=2.0,
+            )
+            deadline = time.monotonic() + 2
+            while store._claim_request_scheduler._queue.qsize() < 3:  # pyright: ignore[reportPrivateUsage]
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            release_transports.set()
+            assert renew.result(timeout=3).status_code == 200
+            assert release.result(timeout=3).status_code == 200
+            assert finalize.result(timeout=3).status_code == 200
+    finally:
+        release_transports.set()
+        store.close()
+
+    assert order[:2] == [
+        "/v1/evidence/claims/acquire",
+        "/v1/evidence/claims/acquire",
+    ]
+    assert order[2] == "/v1/evidence/claims/renew", order
+
+
 def test_http_claim_chunks_honor_client_and_capability_limits() -> None:
     queries = tuple(
         EvidenceQuery(identity, key)
@@ -1353,7 +1441,7 @@ def test_http_claim_chunks_renew_early_authority_while_acquisition_blocks() -> N
                 query.key,
                 body["owner_token"],
                 1,
-                datetime.now(UTC) + timedelta(seconds=0.05),
+                datetime.now(UTC) + timedelta(seconds=0.2),
                 20.0,
             ),
         )
@@ -1420,7 +1508,7 @@ def test_http_single_final_chunk_flushes_near_expiry_without_daemon_race(
                 query.key,
                 body["owner_token"],
                 1,
-                datetime.now(UTC) + timedelta(seconds=0.05),
+                datetime.now(UTC) + timedelta(seconds=0.2),
                 20.0,
             ),
         )

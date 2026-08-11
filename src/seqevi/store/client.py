@@ -163,33 +163,42 @@ class _ClaimRequestScheduler:
 
     def _run(self) -> None:
         while True:
-            _priority, _sequence, scheduled = self._queue.get()
-            try:
-                if scheduled is None:
-                    return
-                if not scheduled.future.set_running_or_notify_cancel():
+            priority, sequence, scheduled = self._queue.get()
+            if scheduled is None:
+                self._queue.task_done()
+                return
+
+            with self._capacity:
+                if self._closed:
+                    try:
+                        scheduled.future.set_exception(
+                            StoreError("shared Store closed during claim request")
+                        )
+                    except InvalidStateError:
+                        pass
+                    self._queue.task_done()
                     continue
-                if time.monotonic() >= scheduled.deadline:
-                    scheduled.future.set_exception(
-                        TimeoutError("claim request expired before transport started")
-                    )
-                    continue
-                remaining = scheduled.deadline - time.monotonic()
-                if remaining <= 0:
-                    scheduled.future.set_exception(
-                        TimeoutError("claim request expired before transport started")
-                    )
+
+                if len(self._active_transports) >= self._maximum_workers:
+                    # Do not let a lower-priority mutation occupy a scheduler
+                    # worker while it waits for a transport slot. Requeue it
+                    # and select again after capacity is available so a
+                    # renewal submitted meanwhile can overtake it.
+                    self._queue.put((priority, sequence, scheduled))
+                    self._queue.task_done()
+                    self._capacity.wait()
                     continue
 
                 transport_done = threading.Event()
 
                 def run_transport(
                     scheduled_request: _ScheduledClaimRequest = scheduled,
-                    transport_timeout: float = remaining,
                     done: threading.Event = transport_done,
                 ) -> None:
                     try:
-                        response = scheduled_request.call(transport_timeout)
+                        response = scheduled_request.call(
+                            max(scheduled_request.deadline - time.monotonic(), 0.0)
+                        )
                     except BaseException as error:
                         try:
                             scheduled_request.future.set_exception(error)
@@ -211,21 +220,24 @@ class _ClaimRequestScheduler:
                     name="seqevi-claim-transport",
                     daemon=True,
                 )
-                with self._capacity:
-                    while (
-                        len(self._active_transports) >= self._maximum_workers
-                        and not self._closed
-                    ):
-                        self._capacity.wait()
-                    if self._closed:
-                        try:
-                            scheduled.future.set_exception(
-                                StoreError("shared Store closed during claim request")
-                            )
-                        except InvalidStateError:
-                            pass
-                        continue
-                    self._active_transports.add(transport_thread)
+                self._active_transports.add(transport_thread)
+
+            try:
+                if not scheduled.future.set_running_or_notify_cancel():
+                    with self._capacity:
+                        self._active_transports.discard(transport_thread)
+                        self._capacity.notify()
+                    continue
+
+                remaining = scheduled.deadline - time.monotonic()
+                if remaining <= 0:
+                    scheduled.future.set_exception(
+                        TimeoutError("claim request expired before transport started")
+                    )
+                    with self._capacity:
+                        self._active_transports.discard(transport_thread)
+                        self._capacity.notify()
+                    continue
                 transport_thread.start()
                 if not transport_done.wait(timeout=remaining):
                     try:
