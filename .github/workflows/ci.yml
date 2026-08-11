@@ -102,7 +102,7 @@ jobs:
           docker exec "${{ job.services.postgres.id }}" \
             psql -U postgres -d seqevi_image -Atc \
             "select version_num from alembic_version" \
-            | grep -Fx "0002_artifact_byte_size_bigint"
+            | grep -Fx "0003_evidence_claim_leases"
           docker restart seqevi-ci
           for attempt in $(seq 1 30); do
             curl --fail --silent http://127.0.0.1:18081/health && break

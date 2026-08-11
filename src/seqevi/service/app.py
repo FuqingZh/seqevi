@@ -9,12 +9,25 @@ from typing import Annotated
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
-from seqevi.errors import EvidenceConflictError, StoreIntegrityError
+from seqevi.errors import (
+    EvidenceClaimLostError,
+    EvidenceConflictError,
+    StoreIntegrityError,
+)
 from seqevi.evidence import EvidenceKey
 from seqevi.store.artifact import PosixArtifactStore
 from seqevi.store.transport import (
     ArtifactReferenceModel,
     ArtifactUploadResponse,
+    ClaimAcquireRequest,
+    ClaimAcquireResponse,
+    ClaimAcquireResultModel,
+    ClaimCapabilitiesResponse,
+    ClaimFinalizeRequest,
+    ClaimMutationRequest,
+    ClaimReleaseResponse,
+    ClaimReleaseAcknowledgement,
+    ClaimRenewResponse,
     CommitRequest,
     CommitResponse,
     CommitModel,
@@ -26,10 +39,18 @@ from seqevi.store.transport import (
     HealthResponse,
     LookupRequest,
     LookupResponse,
+    EvidenceClaimModel,
 )
 
 from .config import ServiceSettings
-from .persistence import PostgresEvidencePersistence, ServicePersistence
+from .persistence import (
+    CLAIM_LEASE_SECONDS,
+    CLAIM_RENEWAL_SECONDS,
+    PostgresEvidencePersistence,
+    ServicePersistence,
+)
+
+_CLAIM_MAXIMUM_BATCH_SIZE = 1000
 
 
 def create_service_app(
@@ -60,6 +81,77 @@ def create_service_app(
         return HealthResponse(
             maximum_batch_size=settings.maximum_batch_size,
             maximum_artifact_bytes=settings.maximum_artifact_bytes,
+        )
+
+    @app.get(
+        "/v1/evidence/claims/capabilities",
+        response_model=ClaimCapabilitiesResponse,
+    )
+    def claim_capabilities() -> ClaimCapabilitiesResponse:
+        if not getattr(database, "supports_claims", False):
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "evidence claims unsupported"
+            )
+        return ClaimCapabilitiesResponse(
+            maximum_batch_size=min(
+                settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE
+            ),
+            lease_seconds=CLAIM_LEASE_SECONDS,
+            renewal_after_seconds=CLAIM_RENEWAL_SECONDS,
+        )
+
+    @app.post("/v1/evidence/claims/acquire", response_model=ClaimAcquireResponse)
+    def acquire_claims(request: ClaimAcquireRequest) -> ClaimAcquireResponse:
+        _check_batch_size(
+            len(request.queries),
+            min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
+        )
+        try:
+            results = database.acquire_many(
+                (query.to_domain() for query in request.queries),
+                owner_token=request.owner_token,
+            )
+        except StoreIntegrityError as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        return ClaimAcquireResponse(
+            results=[ClaimAcquireResultModel.from_domain(result) for result in results]
+        )
+
+    @app.post("/v1/evidence/claims/renew", response_model=ClaimRenewResponse)
+    def renew_claims(request: ClaimMutationRequest) -> ClaimRenewResponse:
+        _check_batch_size(
+            len(request.claims),
+            min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
+        )
+        try:
+            renewed = database.renew_many(claim.to_domain() for claim in request.claims)
+        except EvidenceClaimLostError as error:
+            raise HTTPException(
+                status.HTTP_412_PRECONDITION_FAILED, str(error)
+            ) from error
+        return ClaimRenewResponse(
+            claims=[EvidenceClaimModel.from_domain(claim) for claim in renewed]
+        )
+
+    @app.post("/v1/evidence/claims/release", response_model=ClaimReleaseResponse)
+    def release_claims(request: ClaimMutationRequest) -> ClaimReleaseResponse:
+        _check_batch_size(
+            len(request.claims),
+            min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
+        )
+        try:
+            database.release_many(claim.to_domain() for claim in request.claims)
+        except EvidenceClaimLostError as error:
+            raise HTTPException(
+                status.HTTP_412_PRECONDITION_FAILED, str(error)
+            ) from error
+        return ClaimReleaseResponse(
+            released=[
+                ClaimReleaseAcknowledgement(key=claim.key, generation=claim.generation)
+                for claim in request.claims
+            ]
         )
 
     @app.post("/v1/evidence/lookup", response_model=LookupResponse)
@@ -175,6 +267,45 @@ def create_service_app(
                         byte_size=reference.byte_size,
                     )
             outcomes = database.commit_many(request.commits, stored)
+        except EvidenceConflictError as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+        except (StoreIntegrityError, ValueError) as error:
+            raise HTTPException(422, str(error)) from error
+        return CommitResponse(outcomes=list(outcomes))
+
+    @app.post("/v1/evidence/claims/finalize", response_model=CommitResponse)
+    def finalize_claims(request: ClaimFinalizeRequest) -> CommitResponse:
+        _check_batch_size(
+            len(request.commits),
+            min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
+        )
+        stored = {}
+        references: dict[str, ArtifactReferenceModel] = {}
+        try:
+            for item in request.commits:
+                _validate_commit_model(item.commit)
+                for reference in (
+                    item.commit.normalized_artifact,
+                    item.commit.raw_artifact,
+                ):
+                    if reference is None:
+                        continue
+                    existing = references.setdefault(reference.digest, reference)
+                    if existing != reference:
+                        raise StoreIntegrityError(
+                            f"artifact reference conflict: {reference.digest}"
+                        )
+                    if reference.digest not in stored:
+                        stored[reference.digest] = artifact_store.describe_existing(
+                            digest=reference.digest,
+                            media_type=reference.media_type,
+                            byte_size=reference.byte_size,
+                        )
+            outcomes = database.finalize_many(request.commits, stored)
+        except EvidenceClaimLostError as error:
+            raise HTTPException(
+                status.HTTP_412_PRECONDITION_FAILED, str(error)
+            ) from error
         except EvidenceConflictError as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         except (StoreIntegrityError, ValueError) as error:

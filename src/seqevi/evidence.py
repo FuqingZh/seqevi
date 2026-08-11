@@ -7,7 +7,7 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -39,6 +39,14 @@ class CommitOutcome(StrEnum):
 
     CREATED = "created"
     EXISTING = "existing"
+
+
+class ClaimDisposition(StrEnum):
+    """Atomic Store decision for one requested EvidenceKey."""
+
+    CACHED = "cached"
+    ACQUIRED = "acquired"
+    BUSY = "busy"
 
 
 def _normalize_json_value(value: Any, *, path: str) -> Any:
@@ -258,6 +266,116 @@ class EvidenceQuery:
     def __post_init__(self) -> None:
         if self.key.sequence_id != self.identity.sequence_id:
             raise ValueError("evidence key and sequence identity do not match")
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceClaim:
+    """One server-bounded lease for an exact EvidenceKey.
+
+    Examples:
+        A caller retains the returned owner and generation for renewal or
+        finalization:
+
+        >>> claim = EvidenceClaim(key, "worker-token", 1, expiry, 20.0)
+        >>> claim.generation
+        1
+    """
+
+    key: EvidenceKey
+    owner_token: str = field(repr=False)
+    generation: int
+    expires_at: datetime
+    renewal_after_seconds: float
+
+    def __post_init__(self) -> None:
+        if not self.owner_token or len(self.owner_token) > 255:
+            raise ValueError("owner_token must contain 1 to 255 characters")
+        if self.generation < 1:
+            raise ValueError("claim generation must be positive")
+        if self.expires_at.tzinfo is None:
+            raise ValueError("claim expiry must be timezone-aware")
+        if (
+            not math.isfinite(self.renewal_after_seconds)
+            or self.renewal_after_seconds <= 0
+        ):
+            raise ValueError("claim renewal cadence must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
+class BusyEvidenceClaim:
+    """Non-authoritative wait metadata for a claim owned elsewhere.
+
+    Examples:
+        Busy metadata contains no credential that can mutate ownership:
+
+        >>> busy = BusyEvidenceClaim(key, expiry, 1.0)
+        >>> hasattr(busy, "owner_token")
+        False
+    """
+
+    key: EvidenceKey
+    expires_at: datetime
+    retry_after_seconds: float
+
+    def __post_init__(self) -> None:
+        if self.expires_at.tzinfo is None:
+            raise ValueError("busy claim expiry must be timezone-aware")
+        if not math.isfinite(self.retry_after_seconds) or self.retry_after_seconds <= 0:
+            raise ValueError("busy retry cadence must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimAcquireResult:
+    """Aligned result of one atomic evidence acquire request.
+
+    Examples:
+        Cached results carry terminal evidence and no lease:
+
+        >>> result = ClaimAcquireResult(ClaimDisposition.CACHED, record=record)
+        >>> result.claim is None
+        True
+    """
+
+    disposition: ClaimDisposition
+    record: EvidenceRecord | None = None
+    claim: EvidenceClaim | None = None
+    busy: BusyEvidenceClaim | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.disposition, ClaimDisposition):
+            raise TypeError("disposition must be a ClaimDisposition")
+        if self.disposition is ClaimDisposition.CACHED:
+            if self.record is None or self.claim is not None or self.busy is not None:
+                raise ValueError("cached acquire result requires only a record")
+        elif self.disposition is ClaimDisposition.ACQUIRED:
+            if self.record is not None or self.claim is None or self.busy is not None:
+                raise ValueError("acquired result requires only an authoritative claim")
+        elif self.record is not None or self.claim is not None or self.busy is None:
+            raise ValueError(
+                "busy result requires only non-authoritative wait metadata"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedEvidenceCommit:
+    """Terminal evidence finalized by one matching claim generation.
+
+    Examples:
+        The claim coordinates the commit without changing scientific identity:
+
+        >>> proposed = ClaimedEvidenceCommit(commit=commit, claim=claim)
+        >>> proposed.commit.key == proposed.claim.key
+        True
+    """
+
+    commit: EvidenceCommit
+    claim: EvidenceClaim
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.claim, EvidenceClaim):
+            raise TypeError("claim must be an authoritative EvidenceClaim")
+        if self.commit.key != self.claim.key:
+            raise ValueError("claim and evidence commit keys do not match")
 
 
 @dataclass(frozen=True, slots=True)

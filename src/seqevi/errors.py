@@ -45,6 +45,10 @@ class EvidenceConflictError(StoreIntegrityError):
     """Raised when one evidence key is associated with different payloads."""
 
 
+class EvidenceClaimLostError(StoreError):
+    """Raised when a claim owner or generation no longer owns its lease."""
+
+
 class AnnotationError(RuntimeError):
     """Base class for one annotation invocation failure."""
 

@@ -5,9 +5,12 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import threading
 import time
+import uuid
+from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from collections.abc import Mapping
 from datetime import UTC, datetime
 from itertools import batched
 from pathlib import Path
@@ -15,9 +18,13 @@ from typing import Literal
 
 from . import __version__
 from .adapters.base import AdapterBatchResult, AnnotationAdapter
-from .errors import AnnotationError, OutputPackageError
+from .errors import AnnotationError, EvidenceClaimLostError, OutputPackageError
 from .evidence import (
+    ClaimDisposition,
+    ClaimedEvidenceCommit,
     EvidenceCommit,
+    EvidenceClaim,
+    EvidenceKey,
     EvidenceQuery,
     EvidenceSource,
     EvidenceStatus,
@@ -31,10 +38,15 @@ from .sequence import (
     iter_fasta_lines,
     stage_fasta,
 )
-from .store.contract import EvidenceStore
+from .store.contract import (
+    ClaimCapableEvidenceStore,
+    EvidenceStore,
+    is_claim_capable_store,
+)
 
 _STORE_BATCH_SIZE = 1_000
 _ANNOTATION_BATCH_SIZE = 10_000
+_CLAIM_RUNWAY_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +89,7 @@ class _BatchMetrics:
     commit_batches: int
     adapter_seconds: float
     store_commit_seconds: float
+    peer_completed_sequence_ids: frozenset[str] = frozenset()
 
 
 class _MeasuringToolRunner(ToolRunner):
@@ -138,10 +151,21 @@ def run_annotation(
     store_lookup_seconds = 0.0
     adapter_seconds = 0.0
     store_commit_seconds = 0.0
+    claim_store: ClaimCapableEvidenceStore | None = None
+    invocation_renewer: _LeaseRenewer | None = None
     try:
         keys_by_sequence_id = {}
         computed_ids: set[str] = set()
         pending_misses: list[SequenceIdentity] = []
+        busy_queries: list[EvidenceQuery] = []
+        busy_retry_after: float | None = None
+        claim_store = store if is_claim_capable_store(store) else None
+        invocation_renewer = (
+            _LeaseRenewer(claim_store, (), {}) if claim_store is not None else None
+        )
+        if invocation_renewer is not None:
+            invocation_renewer.__enter__()
+        owner_token = uuid.uuid4().hex
         tool_runner = _MeasuringToolRunner(runner or ToolRunner())
 
         for identity_batch in batched(iter_staged_identities(stage), _STORE_BATCH_SIZE):
@@ -153,16 +177,44 @@ def run_annotation(
                 (query.identity.sequence_id, query.key) for query in queries
             )
             lookup_started = time.perf_counter()
-            cached = store.lookup_many(queries)
+            if claim_store is not None:
+                decisions = claim_store.acquire_many(queries, owner_token=owner_token)
+                cached = {
+                    query.key: decision.record
+                    for query, decision in zip(queries, decisions, strict=True)
+                    if decision.disposition is ClaimDisposition.CACHED
+                }
+                for query, decision in zip(queries, decisions, strict=True):
+                    if decision.disposition is ClaimDisposition.ACQUIRED:
+                        assert decision.claim is not None
+                        pending_misses.append(query.identity)
+                        assert invocation_renewer is not None
+                        invocation_renewer.add(decision.claim, query)
+                    elif decision.disposition is ClaimDisposition.BUSY:
+                        busy_queries.append(query)
+                        assert decision.busy is not None
+                        busy_retry_after = (
+                            decision.busy.retry_after_seconds
+                            if busy_retry_after is None
+                            else min(
+                                busy_retry_after,
+                                decision.busy.retry_after_seconds,
+                            )
+                        )
+            else:
+                cached = store.lookup_many(queries)
             store_lookup_seconds += time.perf_counter() - lookup_started
             lookup_batches += 1
-            for query in queries:
-                if query.key not in cached:
-                    pending_misses.append(query.identity)
-                    computed_ids.add(query.identity.sequence_id)
+            if claim_store is None:
+                for query in queries:
+                    if query.key not in cached:
+                        pending_misses.append(query.identity)
             while len(pending_misses) >= _ANNOTATION_BATCH_SIZE:
                 annotation_identities = tuple(pending_misses[:_ANNOTATION_BATCH_SIZE])
                 del pending_misses[:_ANNOTATION_BATCH_SIZE]
+                computed_ids.update(
+                    identity.sequence_id for identity in annotation_identities
+                )
                 tool_batches += 1
                 batch_metrics = _run_annotation_batch(
                     identities=annotation_identities,
@@ -173,12 +225,18 @@ def run_annotation(
                     runner=tool_runner,
                     timeout_seconds=timeout_seconds,
                     threads=threads,
+                    claim_store=claim_store,
+                    renewer=invocation_renewer,
                 )
                 commit_batches += batch_metrics.commit_batches
                 adapter_seconds += batch_metrics.adapter_seconds
                 store_commit_seconds += batch_metrics.store_commit_seconds
+                computed_ids.difference_update(
+                    batch_metrics.peer_completed_sequence_ids
+                )
 
         if pending_misses:
+            computed_ids.update(identity.sequence_id for identity in pending_misses)
             tool_batches += 1
             batch_metrics = _run_annotation_batch(
                 identities=tuple(pending_misses),
@@ -189,10 +247,71 @@ def run_annotation(
                 runner=tool_runner,
                 timeout_seconds=timeout_seconds,
                 threads=threads,
+                claim_store=claim_store,
+                renewer=invocation_renewer,
             )
             commit_batches += batch_metrics.commit_batches
             adapter_seconds += batch_metrics.adapter_seconds
             store_commit_seconds += batch_metrics.store_commit_seconds
+            computed_ids.difference_update(batch_metrics.peer_completed_sequence_ids)
+
+        while busy_queries:
+            time.sleep(busy_retry_after or 1.0)
+            next_retry_after: float | None = None
+            next_busy = []
+            acquired = []
+            assert claim_store is not None
+            for busy_batch in batched(busy_queries, _STORE_BATCH_SIZE):
+                reacquire_started = time.perf_counter()
+                decisions = claim_store.acquire_many(
+                    busy_batch, owner_token=owner_token
+                )
+                store_lookup_seconds += time.perf_counter() - reacquire_started
+                lookup_batches += 1
+                for query, decision in zip(busy_batch, decisions, strict=True):
+                    if decision.disposition is ClaimDisposition.ACQUIRED:
+                        assert decision.claim is not None
+                        assert invocation_renewer is not None
+                        invocation_renewer.add(decision.claim, query)
+                        acquired.append(query.identity)
+                    elif decision.disposition is ClaimDisposition.BUSY:
+                        assert decision.busy is not None
+                        next_retry_after = (
+                            decision.busy.retry_after_seconds
+                            if next_retry_after is None
+                            else min(
+                                next_retry_after,
+                                decision.busy.retry_after_seconds,
+                            )
+                        )
+                        next_busy.append(query)
+            for acquired_batch in batched(acquired, _ANNOTATION_BATCH_SIZE):
+                computed_ids.update(identity.sequence_id for identity in acquired_batch)
+                tool_batches += 1
+                batch_metrics = _run_annotation_batch(
+                    identities=acquired_batch,
+                    batch_number=tool_batches,
+                    work_dir=work_dir,
+                    adapter=adapter,
+                    store=store,
+                    runner=tool_runner,
+                    timeout_seconds=timeout_seconds,
+                    threads=threads,
+                    claim_store=claim_store,
+                    renewer=invocation_renewer,
+                )
+                commit_batches += batch_metrics.commit_batches
+                adapter_seconds += batch_metrics.adapter_seconds
+                store_commit_seconds += batch_metrics.store_commit_seconds
+                computed_ids.difference_update(
+                    batch_metrics.peer_completed_sequence_ids
+                )
+            busy_queries = next_busy
+            busy_retry_after = next_retry_after
+
+        if invocation_renewer is not None:
+            invocation_renewer.mark_finalized()
+            invocation_renewer.__exit__(None, None, None)
 
         fetch_started = time.perf_counter()
         fetched_by_key = store.fetch_many(keys_by_sequence_id.values())
@@ -243,7 +362,12 @@ def run_annotation(
             },
         )
         package_seconds = time.perf_counter() - package_started
-    except Exception as error:
+    except BaseException as error:
+        if invocation_renewer is not None and claim_store is not None:
+            invocation_renewer.stop_and_join()
+            _release_active_claims(claim_store, invocation_renewer.active_claims())
+        if not isinstance(error, Exception):
+            raise
         raise AnnotationError(
             f"annotation failed; diagnostics retained at {work_dir}: {error}"
         ) from error
@@ -340,10 +464,14 @@ def _run_annotation_batch(
     runner: ToolRunner,
     timeout_seconds: float | None,
     threads: int,
+    claim_store: ClaimCapableEvidenceStore | None = None,
+    renewer: _LeaseRenewer | None = None,
 ) -> _BatchMetrics:
     batch_dir = work_dir / f"batch-{batch_number:06d}"
     batch_dir.mkdir()
     misses_fasta = batch_dir / "cache-misses.fasta"
+    if renewer is not None:
+        renewer.raise_if_failed()
     with misses_fasta.open("w", encoding="ascii", newline="\n") as handle:
         handle.writelines(iter_fasta_lines(identities))
     adapter_started = time.perf_counter()
@@ -356,21 +484,90 @@ def _run_annotation_batch(
         threads=threads,
     )
     adapter_seconds = time.perf_counter() - adapter_started
-    commits = _build_commits(
-        batch=batch,
-        identities=identities,
-        adapter=adapter,
-    )
+    commits = _build_commits(batch=batch, identities=identities, adapter=adapter)
     batches = 0
+    peer_completed_sequence_ids: set[str] = set()
     commit_started = time.perf_counter()
     for commit_batch in batched(commits, _STORE_BATCH_SIZE):
-        store.commit_many(commit_batch)
-        batches += 1
+        if claim_store is None:
+            store.commit_many(commit_batch)
+            batches += 1
+        else:
+            assert renewer is not None
+            renewer.raise_if_failed()
+            finalize_batches, peer_completed = _finalize_current_claims(
+                commits=commit_batch,
+                store=claim_store,
+                renewer=renewer,
+            )
+            batches += finalize_batches
+            peer_completed_sequence_ids.update(peer_completed)
     return _BatchMetrics(
         commit_batches=batches,
         adapter_seconds=adapter_seconds,
         store_commit_seconds=time.perf_counter() - commit_started,
+        peer_completed_sequence_ids=frozenset(peer_completed_sequence_ids),
     )
+
+
+def _finalize_current_claims(
+    *,
+    commits: tuple[EvidenceCommit, ...],
+    store: ClaimCapableEvidenceStore,
+    renewer: _LeaseRenewer,
+) -> tuple[int, set[str]]:
+    """Finalize current authority and classify concurrent terminal winners."""
+
+    remaining = list(commits)
+    peer_completed: set[str] = set()
+    requests = 0
+    while remaining:
+        claims = renewer.claims_for(commit.key for commit in remaining)
+        missing = tuple(commit for commit in remaining if commit.key not in claims)
+        if missing:
+            terminal = store.lookup_many(
+                EvidenceQuery(commit.identity, commit.key) for commit in missing
+            )
+            terminal_keys = set(terminal)
+            nonterminal = [
+                commit for commit in missing if commit.key not in terminal_keys
+            ]
+            if nonterminal:
+                raise EvidenceClaimLostError(
+                    "claim ownership was lost before terminal evidence publication"
+                )
+            renewer.complete(terminal_keys)
+            peer_completed.update(key.sequence_id for key in terminal_keys)
+            remaining = [
+                commit for commit in remaining if commit.key not in terminal_keys
+            ]
+            if not remaining:
+                break
+            claims = renewer.claims_for(commit.key for commit in remaining)
+
+        proposed = tuple(
+            ClaimedEvidenceCommit(commit, claims[commit.key]) for commit in remaining
+        )
+        try:
+            requests += 1
+            store.finalize_many(proposed)
+        except EvidenceClaimLostError:
+            terminal = store.lookup_many(
+                EvidenceQuery(item.commit.identity, item.commit.key)
+                for item in proposed
+            )
+            terminal_keys = set(terminal)
+            if not terminal_keys:
+                raise
+            renewer.complete(terminal_keys)
+            peer_completed.update(key.sequence_id for key in terminal_keys)
+            remaining = [
+                item.commit for item in proposed if item.commit.key not in terminal_keys
+            ]
+        else:
+            renewer.complete(item.commit.key for item in proposed)
+            break
+    return requests, peer_completed
 
 
 def _build_commits(
@@ -411,3 +608,190 @@ def _build_commits(
             )
         )
     return tuple(commits)
+
+
+class _LeaseRenewer:
+    """Keep only currently authoritative claims alive for one invocation."""
+
+    def __init__(
+        self,
+        store: ClaimCapableEvidenceStore | None,
+        claims: tuple[EvidenceClaim, ...],
+        queries_by_key: Mapping[EvidenceKey, EvidenceQuery],
+    ) -> None:
+        self.store = store
+        self.claims = {claim.key: claim for claim in claims}
+        self.queries_by_key = dict(queries_by_key)
+        self.deadlines = {
+            claim.key: time.monotonic() + _claim_renewal_delay(claim)
+            for claim in claims
+        }
+        self.stop = threading.Event()
+        self.changed = threading.Event()
+        self.error: BaseException | None = None
+        self.thread: threading.Thread | None = None
+        self.lock = threading.Lock()
+        self.finalized = False
+
+    def __enter__(self) -> _LeaseRenewer:
+        self._start_if_needed()
+        return self
+
+    def __exit__(self, *_error: object) -> None:
+        self.stop_and_join()
+        if self.error is not None and not self.finalized:
+            raise self.error
+
+    def stop_and_join(self) -> None:
+        """Stop renewal without replacing an in-flight annotation failure."""
+
+        self.stop.set()
+        self.changed.set()
+        if self.thread is not None:
+            self.thread.join()
+
+    def claims_for(
+        self, keys: Iterable[EvidenceKey]
+    ) -> dict[EvidenceKey, EvidenceClaim]:
+        with self.lock:
+            return {key: self.claims[key] for key in keys if key in self.claims}
+
+    def add(self, claim: EvidenceClaim, query: EvidenceQuery) -> None:
+        """Begin renewing one newly acquired claim until it is completed."""
+
+        with self.lock:
+            self.claims[claim.key] = claim
+            self.queries_by_key[claim.key] = query
+            self.deadlines[claim.key] = time.monotonic() + _claim_renewal_delay(claim)
+        self.changed.set()
+        self._start_if_needed()
+
+    def complete(self, keys: Iterable[EvidenceKey]) -> None:
+        with self.lock:
+            for key in keys:
+                self.claims.pop(key, None)
+                self.queries_by_key.pop(key, None)
+                self.deadlines.pop(key, None)
+
+    def active_claims(self) -> tuple[EvidenceClaim, ...]:
+        with self.lock:
+            return tuple(self.claims.values())
+
+    def mark_finalized(self) -> None:
+        self.finalized = True
+
+    def raise_if_failed(self) -> None:
+        """Raise a renewal failure before more local work or finalization."""
+
+        if self.error is not None:
+            raise self.error
+
+    def _start_if_needed(self) -> None:
+        with self.lock:
+            if self.claims and self.thread is None:
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+
+    def _run(self) -> None:
+        while not self.stop.is_set():
+            self.changed.clear()
+            with self.lock:
+                now = time.monotonic()
+                due_keys = tuple(
+                    sorted(
+                        (
+                            key
+                            for key, deadline in self.deadlines.items()
+                            if deadline <= now + 0.01
+                        ),
+                        key=self.deadlines.__getitem__,
+                    )
+                )
+                snapshot = tuple(
+                    (self.claims[key], self.queries_by_key[key]) for key in due_keys
+                )
+                next_deadline = min(self.deadlines.values(), default=now + 1.0)
+            if not snapshot:
+                self.changed.wait(max(0.0, next_deadline - time.monotonic()))
+                continue
+            try:
+                assert self.store is not None
+                pair_batches = tuple(batched(snapshot, _STORE_BATCH_SIZE))
+                with ThreadPoolExecutor(
+                    max_workers=min(len(pair_batches), 32)
+                ) as executor:
+                    futures = {
+                        executor.submit(self._renew_batch, pair_batch)
+                        for pair_batch in pair_batches
+                    }
+                    try:
+                        for future in as_completed(futures):
+                            future.result()
+                    except BaseException:
+                        for future in futures:
+                            future.cancel()
+                        raise
+            except BaseException as error:
+                self.error = error
+                self.stop.set()
+                return
+
+    def _renew_batch(
+        self, pairs: tuple[tuple[EvidenceClaim, EvidenceQuery], ...]
+    ) -> None:
+        assert self.store is not None
+        pending = pairs
+        while pending:
+            claims = tuple(claim for claim, _query in pending)
+            try:
+                renewed = self.store.renew_many(claims)
+            except EvidenceClaimLostError:
+                terminal: set[EvidenceKey] = set()
+                queries = tuple(query for _claim, query in pending)
+                for query_batch in batched(queries, _STORE_BATCH_SIZE):
+                    terminal.update(self.store.lookup_many(query_batch))
+                if not terminal:
+                    raise
+                with self.lock:
+                    for key in terminal:
+                        self.claims.pop(key, None)
+                        self.queries_by_key.pop(key, None)
+                        self.deadlines.pop(key, None)
+                pending = tuple(pair for pair in pending if pair[0].key not in terminal)
+            else:
+                self._replace_renewed(renewed)
+                return
+
+    def _replace_renewed(self, renewed: tuple[EvidenceClaim, ...]) -> None:
+        if any(
+            (claim.expires_at - datetime.now(UTC)).total_seconds()
+            < _CLAIM_RUNWAY_SECONDS
+            for claim in renewed
+        ):
+            raise EvidenceClaimLostError(
+                "claim renewal completed without a safe authority runway"
+            )
+        with self.lock:
+            for claim in renewed:
+                if claim.key in self.claims:
+                    self.claims[claim.key] = claim
+                    self.deadlines[claim.key] = time.monotonic() + _claim_renewal_delay(
+                        claim
+                    )
+
+
+def _claim_renewal_delay(claim: EvidenceClaim) -> float:
+    remaining = (claim.expires_at - datetime.now(UTC)).total_seconds()
+    return max(
+        0.0,
+        min(claim.renewal_after_seconds, remaining - _CLAIM_RUNWAY_SECONDS),
+    )
+
+
+def _release_active_claims(
+    store: ClaimCapableEvidenceStore, claims: tuple[EvidenceClaim, ...]
+) -> None:
+    try:
+        store.release_many(claims)
+    except Exception:
+        pass
