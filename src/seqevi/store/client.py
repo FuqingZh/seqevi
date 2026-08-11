@@ -82,7 +82,7 @@ _CLAIM_RETRY_JITTER_RATIO = 0.1
 
 @dataclass(frozen=True)
 class _ScheduledClaimRequest:
-    call: Callable[[], httpx.Response]
+    call: Callable[[float], httpx.Response]
     deadline: float
     future: Future[httpx.Response]
 
@@ -110,7 +110,7 @@ class _ClaimRequestScheduler:
 
     def submit(
         self,
-        call: Callable[[], httpx.Response],
+        call: Callable[[float], httpx.Response],
         *,
         renewal: bool,
         deadline: float,
@@ -129,6 +129,14 @@ class _ClaimRequestScheduler:
                 )
             )
         return future
+
+    def cancel_pending(self) -> None:
+        """Cancel queued calls while leaving currently running calls alone."""
+
+        with self._queue.mutex:
+            for _priority, _sequence, scheduled in self._queue.queue:
+                if scheduled is not None:
+                    scheduled.future.cancel()
 
     def close(self) -> None:
         with self._lock:
@@ -155,7 +163,15 @@ class _ClaimRequestScheduler:
                     )
                     continue
                 try:
-                    response = scheduled.call()
+                    remaining = scheduled.deadline - time.monotonic()
+                    if remaining <= 0:
+                        scheduled.future.set_exception(
+                            TimeoutError(
+                                "claim request expired before transport started"
+                            )
+                        )
+                        continue
+                    response = scheduled.call(remaining)
                 except BaseException as error:
                     scheduled.future.set_exception(error)
                 else:
@@ -417,6 +433,9 @@ class HttpEvidenceStore:
 
     def close(self) -> None:
         try:
+            # Renewal tasks may already be blocked on the request scheduler;
+            # cancel those queued transport futures before waiting for them.
+            self._claim_request_scheduler.cancel_pending()
             self._renewal_executor.shutdown(wait=True, cancel_futures=True)
         finally:
             try:
@@ -894,15 +913,18 @@ class HttpEvidenceStore:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            attempt_kwargs = dict(kwargs)
-            # The Future wait below owns the total wall-clock deadline. HTTPX
-            # applies its timeout independently to pool, connect, write and read,
-            # so split that budget too: an abandoned transport should release its
-            # scheduler worker close to the caller's deadline.
-            attempt_kwargs["timeout"] = httpx.Timeout(remaining / 4.0)
+
+            def request(transport_timeout: float) -> httpx.Response:
+                request_kwargs = dict(kwargs)
+                # The Future wait below owns the total wall-clock deadline. The
+                # worker derives this phase timeout after queueing, preserving
+                # the full response budget that remains at actual start.
+                request_kwargs["timeout"] = httpx.Timeout(transport_timeout)
+                return self.client.request(method, path, **request_kwargs)
+
             try:
                 future = self._claim_request_scheduler.submit(
-                    lambda: self.client.request(method, path, **attempt_kwargs),
+                    request,
                     renewal=renewal,
                     deadline=deadline,
                 )
