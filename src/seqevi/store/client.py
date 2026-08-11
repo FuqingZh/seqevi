@@ -799,6 +799,11 @@ class HttpEvidenceStore:
         )
         retryable = path.endswith("/acquire") or path.endswith("/renew")
         for attempt in range(_MAX_CLAIM_BACKPRESSURE_RETRIES + 1):
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                kwargs["timeout"] = remaining
             try:
                 response = self.client.request(method, path, **kwargs)
             except httpx.HTTPError as error:

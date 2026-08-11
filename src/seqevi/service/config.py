@@ -13,6 +13,9 @@ DEFAULT_DATABASE_MAX_OVERFLOW = 8
 DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS = 5.0
 DEFAULT_DATABASE_LOCK_TIMEOUT_SECONDS = 5.0
 DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS = 15.0
+DEFAULT_DATABASE_TRANSACTION_TIMEOUT_SECONDS = 30.0
+# Preserve the final five seconds of the 60-second claim lease as client runway.
+MAXIMUM_DATABASE_REQUEST_WAIT_SECONDS = 55.0
 
 
 class ServiceSettings(BaseSettings):
@@ -41,8 +44,22 @@ class ServiceSettings(BaseSettings):
     database_statement_timeout_seconds: float = Field(
         default=DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS, gt=0, le=120
     )
+    database_transaction_timeout_seconds: float = Field(
+        default=DEFAULT_DATABASE_TRANSACTION_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAXIMUM_DATABASE_REQUEST_WAIT_SECONDS,
+    )
 
     def model_post_init(self, _context: object) -> None:
+        total_wait = (
+            self.database_pool_timeout_seconds
+            + self.database_transaction_timeout_seconds
+        )
+        if total_wait > MAXIMUM_DATABASE_REQUEST_WAIT_SECONDS:
+            raise ValueError(
+                "database pool and transaction timeouts must total at most "
+                f"{MAXIMUM_DATABASE_REQUEST_WAIT_SECONDS:g} seconds"
+            )
         if self.database_url.startswith("postgresql://"):
             object.__setattr__(
                 self,

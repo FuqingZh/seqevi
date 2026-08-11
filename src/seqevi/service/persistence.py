@@ -43,6 +43,7 @@ from .config import (
     DEFAULT_DATABASE_POOL_SIZE,
     DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS,
     DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS,
+    DEFAULT_DATABASE_TRANSACTION_TIMEOUT_SECONDS,
 )
 
 _LOOKUP_CHUNK_SIZE = 1000
@@ -103,12 +104,16 @@ class PostgresEvidencePersistence:
         *,
         lock_timeout_seconds: float = DEFAULT_DATABASE_LOCK_TIMEOUT_SECONDS,
         statement_timeout_seconds: float = DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS,
+        transaction_timeout_seconds: float = (
+            DEFAULT_DATABASE_TRANSACTION_TIMEOUT_SECONDS
+        ),
     ) -> None:
         if engine.dialect.name != "postgresql":
             raise ValueError("shared Store persistence requires PostgreSQL")
         self.engine = engine
         self.lock_timeout_seconds = lock_timeout_seconds
         self.statement_timeout_seconds = statement_timeout_seconds
+        self.transaction_timeout_seconds = transaction_timeout_seconds
 
     @classmethod
     def open(
@@ -120,6 +125,9 @@ class PostgresEvidencePersistence:
         pool_timeout_seconds: float = DEFAULT_DATABASE_POOL_TIMEOUT_SECONDS,
         lock_timeout_seconds: float = DEFAULT_DATABASE_LOCK_TIMEOUT_SECONDS,
         statement_timeout_seconds: float = DEFAULT_DATABASE_STATEMENT_TIMEOUT_SECONDS,
+        transaction_timeout_seconds: float = (
+            DEFAULT_DATABASE_TRANSACTION_TIMEOUT_SECONDS
+        ),
     ) -> PostgresEvidencePersistence:
         engine = create_engine(
             database_url,
@@ -137,6 +145,7 @@ class PostgresEvidencePersistence:
             engine,
             lock_timeout_seconds=lock_timeout_seconds,
             statement_timeout_seconds=statement_timeout_seconds,
+            transaction_timeout_seconds=transaction_timeout_seconds,
         )
 
     def close(self) -> None:
@@ -147,11 +156,27 @@ class PostgresEvidencePersistence:
         return True
 
     @contextmanager
+    def _connection(self) -> Iterator[Connection]:
+        """Acquire one read connection and translate bounded-pool saturation."""
+
+        try:
+            with self.engine.connect() as connection:
+                yield connection
+        except SQLAlchemyTimeoutError as error:
+            raise StoreBackpressureError(
+                "shared Store database pool is saturated; retry the request"
+            ) from error
+
+    @contextmanager
     def _transaction(self) -> Iterator[Connection]:
         """Apply bounded PostgreSQL mutation deadlines and translate saturation."""
 
         try:
             with self.engine.begin() as connection:
+                connection.execute(
+                    text("SELECT set_config('transaction_timeout', :value, true)"),
+                    {"value": f"{self.transaction_timeout_seconds:g}s"},
+                )
                 connection.execute(
                     text("SELECT set_config('lock_timeout', :value, true)"),
                     {"value": f"{self.lock_timeout_seconds:g}s"},
@@ -169,7 +194,7 @@ class PostgresEvidencePersistence:
             sqlstate = getattr(error.orig, "sqlstate", None) or getattr(
                 error.orig, "pgcode", None
             )
-            if sqlstate in {"55P03", "57014"}:
+            if sqlstate in {"25P04", "55P03", "57014"}:
                 raise StoreBackpressureError(
                     "shared Store database mutation exceeded its wait budget; "
                     "retry the request"
@@ -635,7 +660,7 @@ class PostgresEvidencePersistence:
             groups[query.key.contract_identity].append(query.key)
 
         found: dict[EvidenceKey, EvidenceRecord] = {}
-        with self.engine.connect() as connection:
+        with self._connection() as connection:
             for contract, group in groups.items():
                 requested_keys = set(group)
                 for offset in range(0, len(group), _LOOKUP_CHUNK_SIZE):
@@ -714,7 +739,7 @@ class PostgresEvidencePersistence:
             groups[key.contract_identity].append(key)
 
         found: dict[EvidenceKey, EvidenceRecord] = {}
-        with self.engine.connect() as connection:
+        with self._connection() as connection:
             for contract, group in groups.items():
                 requested_keys = set(group)
                 for offset in range(0, len(group), _LOOKUP_CHUNK_SIZE):
@@ -737,7 +762,7 @@ class PostgresEvidencePersistence:
         return found
 
     def artifact_metadata(self, digest: str) -> StoredArtifact | None:
-        with self.engine.connect() as connection:
+        with self._connection() as connection:
             row = (
                 connection.execute(
                     select(artifacts).where(artifacts.c.digest == digest)

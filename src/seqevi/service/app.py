@@ -76,6 +76,7 @@ def create_service_app(
         pool_timeout_seconds=settings.database_pool_timeout_seconds,
         lock_timeout_seconds=settings.database_lock_timeout_seconds,
         statement_timeout_seconds=settings.database_statement_timeout_seconds,
+        transaction_timeout_seconds=settings.database_transaction_timeout_seconds,
     )
     artifact_store = PosixArtifactStore(settings.artifacts_dir)
 
@@ -243,6 +244,8 @@ def create_service_app(
             records = database.lookup_many(
                 query.to_domain() for query in request.queries
             )
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
         except StoreIntegrityError as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         return LookupResponse(
@@ -254,7 +257,10 @@ def create_service_app(
 
     @app.post("/v1/evidence/fetch", response_model=FetchResponse)
     def fetch(request: FetchRequest) -> FetchResponse:
-        record = database.fetch_record(request.key.to_domain())
+        try:
+            record = database.fetch_record(request.key.to_domain())
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
         return FetchResponse(
             record=None if record is None else EvidenceRecordModel.from_domain(record)
         )
@@ -263,7 +269,10 @@ def create_service_app(
     def fetch_many(request: FetchManyRequest) -> FetchManyResponse:
         _check_batch_size(len(request.keys), settings.maximum_batch_size)
         keys = [key.to_domain() for key in request.keys]
-        records = database.fetch_many(keys)
+        try:
+            records = database.fetch_many(keys)
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
         return FetchManyResponse(
             records=[
                 EvidenceRecordModel.from_domain(records[key])
@@ -308,7 +317,10 @@ def create_service_app(
 
     @app.get("/v1/artifacts/{digest}")
     def download_artifact(digest: str) -> StreamingResponse:
-        artifact = database.artifact_metadata(digest)
+        try:
+            artifact = database.artifact_metadata(digest)
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
         if artifact is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact is not registered")
         return StreamingResponse(

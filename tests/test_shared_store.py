@@ -917,6 +917,8 @@ def test_http_claim_retries_retryable_backpressure(
     )
     attempts = 0
     sleeps: list[float] = []
+    request_timeouts: list[float] = []
+    clock = [100.0]
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal attempts
@@ -925,6 +927,8 @@ def test_http_claim_retries_retryable_backpressure(
         if request.url.path.endswith("/capabilities"):
             return httpx.Response(200, json=_claim_capabilities())
         attempts += 1
+        timeout = cast(dict[str, float], request.extensions["timeout"])
+        request_timeouts.append(timeout["read"])
         if attempts == 1:
             return httpx.Response(503, headers={"Retry-After": "1"})
         renewed = EvidenceClaim(
@@ -943,7 +947,12 @@ def test_http_claim_retries_retryable_backpressure(
             },
         )
 
-    monkeypatch.setattr(client_module.time, "sleep", sleeps.append)
+    def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(client_module.time, "sleep", sleep)
     client = _claim_mock_client(httpx.MockTransport(handler))
     with HttpEvidenceStore("http://testserver", client=client) as store:
         renewed = store.renew_many((claim,))
@@ -952,6 +961,7 @@ def test_http_claim_retries_retryable_backpressure(
     assert attempts == 2
     assert len(sleeps) == 1
     assert 0.9 <= sleeps[0] <= 1.1
+    assert request_timeouts[1] <= request_timeouts[0] - sleeps[0]
 
 def test_http_claim_chunks_honor_client_and_capability_limits() -> None:
     queries = tuple(
@@ -2270,6 +2280,14 @@ def test_shared_store_configuration_requires_postgres_and_postgres_engine(
     assert normalized.database_pool_timeout_seconds == 5.0
     assert normalized.database_lock_timeout_seconds == 5.0
     assert normalized.database_statement_timeout_seconds == 15.0
+    assert normalized.database_transaction_timeout_seconds == 30.0
+    with pytest.raises(ValidationError, match="must total at most 55 seconds"):
+        ServiceSettings(
+            database_url="postgresql://seqevi@postgres/seqevi",
+            artifacts_dir=tmp_path,
+            database_pool_timeout_seconds=30,
+            database_transaction_timeout_seconds=30,
+        )
     assert isinstance(artifacts.c.byte_size.type, BigInteger)
     engine = create_engine("sqlite+pysqlite:///:memory:")
     try:
@@ -3213,6 +3231,86 @@ def test_postgres_claim_batches_lock_in_canonical_order(tmp_path: Path) -> None:
 
 
 @pytest.mark.requires_postgres
+def test_postgres_read_pool_timeout_returns_retryable_service_responses(
+    tmp_path: Path,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(
+            database_url,
+            pool_size=1,
+            max_overflow=0,
+            pool_timeout_seconds=0.05,
+        )
+        identity, key = _key("MREADPOOLTIMEOUT")
+        query = EvidenceQuery(identity, key)
+        query_model = EvidenceQueryModel.from_domain(query)
+        app = create_service_app(_settings(tmp_path), persistence=persistence)
+
+        with TestClient(app) as client, persistence.engine.connect():
+            responses = (
+                client.post(
+                    "/v1/evidence/lookup",
+                    json={"queries": [query_model.model_dump(mode="json")]},
+                ),
+                client.post(
+                    "/v1/evidence/fetch-many",
+                    json={"keys": [query_model.key.model_dump(mode="json")]},
+                ),
+                client.get("/v1/artifacts/" + "a" * 64),
+            )
+
+    assert all(response.status_code == 503 for response in responses)
+    assert all(response.headers["retry-after"] == "1" for response in responses)
+    assert all(
+        "pool is saturated" in response.json()["detail"] for response in responses
+    )
+
+
+@pytest.mark.requires_postgres
+def test_postgres_transaction_timeout_returns_retryable_service_response(
+    tmp_path: Path,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        identity, key = _key("MTRANSACTIONTIMEOUT")
+        query = EvidenceQuery(identity, key)
+        primary = PostgresEvidencePersistence.open(
+            database_url,
+            lock_timeout_seconds=5.0,
+            statement_timeout_seconds=5.0,
+            transaction_timeout_seconds=0.05,
+        )
+        blocker = PostgresEvidencePersistence.open(database_url)
+        blocked_claim = blocker.acquire_many((query,), owner_token="blocker")[0].claim
+        assert blocked_claim is not None
+        lock_connection = blocker.engine.connect()
+        transaction = lock_connection.begin()
+        lock_connection.execute(
+            select(evidence_claims)
+            .where(evidence_claims.c.sequence_id == key.sequence_id)
+            .with_for_update()
+        )
+        app = create_service_app(_settings(tmp_path), persistence=primary)
+        try:
+            with TestClient(app) as client:
+                response = client.post(
+                    "/v1/evidence/claims/acquire",
+                    json=ClaimAcquireRequest(
+                        owner_token="calculator",
+                        queries=[EvidenceQueryModel.from_domain(query)],
+                    ).model_dump(mode="json"),
+                )
+        finally:
+            if transaction.is_active:
+                transaction.rollback()
+            lock_connection.close()
+            blocker.close()
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert "wait budget" in response.json()["detail"]
+
+
+@pytest.mark.requires_postgres
 def test_postgres_refreshes_acquire_expiry_after_later_row_lock_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3253,6 +3351,7 @@ def test_postgres_refreshes_acquire_expiry_after_later_row_lock_wait(
                     primary.acquire_many, queries, owner_token="calculator"
                 )
                 time.sleep(0.3)
+                lock_released_at = datetime.now(UTC)
                 transaction.commit()
                 decisions = future.result(timeout=10)
         finally:
@@ -3264,7 +3363,7 @@ def test_postgres_refreshes_acquire_expiry_after_later_row_lock_wait(
 
     claims = tuple(decision.claim for decision in decisions)
     assert all(claim is not None for claim in claims)
-    assert all(claim.expires_at > datetime.now(UTC) for claim in claims if claim)
+    assert all(claim.expires_at > lock_released_at for claim in claims if claim)
 
 
 @pytest.mark.requires_postgres
