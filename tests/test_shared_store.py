@@ -533,6 +533,32 @@ def test_service_claim_requests_emit_secret_free_timing_records(
     assert "secret-owner-token" not in caplog.records[0].message
 
 
+def test_service_claim_validation_errors_emit_timing_records(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
+    caplog.set_level(logging.INFO, logger="seqevi.service.claims")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/evidence/claims/acquire",
+            content="{not-json}",
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 422
+    records = [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "seqevi.service.claims"
+    ]
+    assert len(records) == 1
+    assert records[0]["operation"] == "acquire"
+    assert records[0]["batch_size"] == 0
+    assert records[0]["outcome"] == "http_error"
+    assert records[0]["status_code"] == 422
+
+
 def test_old_health_shape_and_missing_claim_capability_fall_back(
     tmp_path: Path,
 ) -> None:

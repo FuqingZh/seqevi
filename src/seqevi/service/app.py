@@ -11,7 +11,9 @@ from typing import Annotated, Iterator
 from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from seqevi.errors import (
     EvidenceClaimLostError,
@@ -56,6 +58,7 @@ from .persistence import (
 
 _CLAIM_MAXIMUM_BATCH_SIZE = 1000
 _CLAIM_LOGGER = logging.getLogger("seqevi.service.claims")
+_CLAIM_LOGGER.setLevel(logging.INFO)
 
 
 def create_service_app(
@@ -80,6 +83,23 @@ def create_service_app(
         version="1.0.0",
         lifespan=lifespan,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def claim_request_validation_error(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        operation = _claim_operation(request.url.path)
+        if operation is not None:
+            _log_claim_request(
+                operation,
+                batch_size=0,
+                outcome="http_error",
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={"detail": jsonable_encoder(error.errors())},
+        )
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -358,21 +378,47 @@ def _observe_claim_request(operation: str, batch_size: int) -> Iterator[None]:
         outcome = "ok"
         status_code = 200
     finally:
-        _CLAIM_LOGGER.info(
-            json.dumps(
-                {
-                    "event": "seqevi.claim_request",
-                    "request_id": request_id,
-                    "operation": operation,
-                    "batch_size": batch_size,
-                    "outcome": outcome,
-                    "status_code": status_code,
-                    "duration_ms": round((perf_counter() - started) * 1000, 3),
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            )
+        _log_claim_request(
+            operation,
+            batch_size=batch_size,
+            outcome=outcome,
+            status_code=status_code,
+            request_id=request_id,
+            duration_ms=round((perf_counter() - started) * 1000, 3),
         )
+
+
+def _claim_operation(path: str) -> str | None:
+    for operation in ("acquire", "renew", "release", "finalize"):
+        if path.endswith(f"/claims/{operation}"):
+            return operation
+    return None
+
+
+def _log_claim_request(
+    operation: str,
+    *,
+    batch_size: int,
+    outcome: str,
+    status_code: int,
+    request_id: str | None = None,
+    duration_ms: float | None = None,
+) -> None:
+    _CLAIM_LOGGER.info(
+        json.dumps(
+            {
+                "event": "seqevi.claim_request",
+                "request_id": request_id or uuid4().hex,
+                "operation": operation,
+                "batch_size": batch_size,
+                "outcome": outcome,
+                "status_code": status_code,
+                "duration_ms": duration_ms if duration_ms is not None else 0.0,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def _validate_commit_model(commit: CommitModel) -> None:
