@@ -3414,6 +3414,7 @@ def test_postgres_refreshes_renewal_expiry_after_later_row_lock_wait(
                     tuple(claim for claim in claims if claim is not None),
                 )
                 time.sleep(0.3)
+                lock_released_at = datetime.now(UTC)
                 transaction.commit()
                 renewed = future.result(timeout=10)
         finally:
@@ -3423,7 +3424,7 @@ def test_postgres_refreshes_renewal_expiry_after_later_row_lock_wait(
             primary.close()
             locker.close()
 
-    assert all(claim.expires_at > datetime.now(UTC) for claim in renewed)
+    assert all(claim.expires_at > lock_released_at for claim in renewed)
 
 
 @pytest.mark.requires_postgres
