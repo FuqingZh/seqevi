@@ -1228,23 +1228,35 @@ def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
     monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 2)
     first_started = threading.Event()
     second_started = threading.Event()
-    release_transports = threading.Event()
+    first_release = threading.Event()
+    second_release = threading.Event()
+    renew_started = threading.Event()
     order: list[str] = []
     lock = threading.Lock()
+    acquire_number = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal acquire_number
         if request.url.path == "/health":
             return httpx.Response(200, json=_claim_health())
         if request.url.path.endswith("/capabilities"):
             return httpx.Response(200, json=_claim_capabilities())
         with lock:
             order.append(request.url.path)
+            if request.url.path.endswith("/acquire"):
+                acquire_number += 1
+                current_acquire = acquire_number
+            else:
+                current_acquire = 0
         if request.url.path.endswith("/acquire"):
-            if not first_started.is_set():
+            if current_acquire == 1:
                 first_started.set()
+                assert first_release.wait(timeout=3)
             else:
                 second_started.set()
-            assert release_transports.wait(timeout=3)
+                assert second_release.wait(timeout=3)
+        elif request.url.path.endswith("/renew"):
+            renew_started.set()
         return httpx.Response(200, json={})
 
     client = _claim_mock_client(httpx.MockTransport(handler))
@@ -1295,12 +1307,24 @@ def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
             while store._claim_request_scheduler._queue.qsize() < 3:  # pyright: ignore[reportPrivateUsage]
                 assert time.monotonic() < deadline
                 time.sleep(0.001)
-            release_transports.set()
+            # Release one slot first.  With the other acquire still active,
+            # the queued renewal is the only request that can be selected;
+            # this makes the priority assertion independent of handler-thread
+            # scheduling on different Python versions.
+            first_release.set()
+            assert renew_started.wait(timeout=2)
+            assert order[:3] == [
+                "/v1/evidence/claims/acquire",
+                "/v1/evidence/claims/acquire",
+                "/v1/evidence/claims/renew",
+            ], order
+            second_release.set()
             assert renew.result(timeout=3).status_code == 200
             assert release.result(timeout=3).status_code == 200
             assert finalize.result(timeout=3).status_code == 200
     finally:
-        release_transports.set()
+        first_release.set()
+        second_release.set()
         store.close()
 
     assert order[:2] == [
