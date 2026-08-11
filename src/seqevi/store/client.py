@@ -76,6 +76,7 @@ _CLAIM_RUNWAY_SECONDS = 5.0
 _HANDOFF_SCHEDULING_SECONDS = 1.0
 _CLAIM_MUTATION_CHUNK_SIZE = 250
 _MAX_CONCURRENT_CLAIM_REQUESTS = 4
+_RESERVED_CLAIM_RENEWAL_SLOTS = 1
 _MAX_CLAIM_BACKPRESSURE_RETRIES = 3
 _DEFAULT_CLAIM_RETRY_SECONDS = 0.25
 _CLAIM_RETRY_JITTER_RATIO = 0.1
@@ -98,6 +99,11 @@ class _ClaimRequestScheduler:
         self._lock = threading.Lock()
         self._capacity = threading.Condition(self._lock)
         self._maximum_workers = maximum_workers
+        self._reserved_renewal_slots = min(
+            _RESERVED_CLAIM_RENEWAL_SLOTS,
+            max(maximum_workers - 1, 0),
+        )
+        self._maximum_mutation_workers = maximum_workers - self._reserved_renewal_slots
         self._closed = False
         self._sequence = 0
         self._active_transports: set[threading.Thread] = set()
@@ -120,7 +126,7 @@ class _ClaimRequestScheduler:
         deadline: float,
     ) -> Future[httpx.Response]:
         future: Future[httpx.Response] = Future()
-        with self._lock:
+        with self._capacity:
             if self._closed:
                 raise StoreError("shared Store closed during claim request")
             sequence = self._sequence
@@ -132,6 +138,10 @@ class _ClaimRequestScheduler:
                     _ScheduledClaimRequest(call, deadline, future),
                 )
             )
+            # A mutation worker may already be waiting because the reserved
+            # renewal slot is the only remaining capacity. Wake it when a
+            # renewal arrives so queue priority can take effect immediately.
+            self._capacity.notify_all()
         return future
 
     def cancel_pending(self) -> None:
@@ -179,7 +189,12 @@ class _ClaimRequestScheduler:
                     self._queue.task_done()
                     continue
 
-                if len(self._active_transports) >= self._maximum_workers:
+                active_limit = (
+                    self._maximum_workers
+                    if priority == 0
+                    else self._maximum_mutation_workers
+                )
+                if len(self._active_transports) >= active_limit:
                     # Do not let a lower-priority mutation occupy a scheduler
                     # worker while it waits for a transport slot. Requeue it
                     # and select again after capacity is available so a

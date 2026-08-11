@@ -1225,7 +1225,7 @@ def test_http_claim_scheduler_prioritizes_renewal_and_caps_all_mutations(
 def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 2)
+    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 3)
     first_started = threading.Event()
     second_started = threading.Event()
     first_release = threading.Event()
@@ -1297,27 +1297,26 @@ def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
                 first.result(timeout=2)
             with pytest.raises(StoreError, match="remained unavailable"):
                 second.result(timeout=2)
+            deadline = time.monotonic() + 2
+            while store._claim_request_scheduler._queue.qsize() < 2:  # pyright: ignore[reportPrivateUsage]
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
             renew = callers.submit(
                 store._claim_request,  # pyright: ignore[reportPrivateUsage]
                 "POST",
                 "/v1/evidence/claims/renew",
                 timeout=2.0,
             )
-            deadline = time.monotonic() + 2
-            while store._claim_request_scheduler._queue.qsize() < 3:  # pyright: ignore[reportPrivateUsage]
-                assert time.monotonic() < deadline
-                time.sleep(0.001)
-            # Release one slot first.  With the other acquire still active,
-            # the queued renewal is the only request that can be selected;
-            # this makes the priority assertion independent of handler-thread
-            # scheduling on different Python versions.
-            first_release.set()
+            # The two mutation slots are full, but the third scheduler slot is
+            # reserved for renewal.  The queued renewal must start without
+            # waiting for either active acquire to finish.
             assert renew_started.wait(timeout=2)
             assert order[:3] == [
                 "/v1/evidence/claims/acquire",
                 "/v1/evidence/claims/acquire",
                 "/v1/evidence/claims/renew",
             ], order
+            first_release.set()
             second_release.set()
             assert renew.result(timeout=3).status_code == 200
             assert release.result(timeout=3).status_code == 200
