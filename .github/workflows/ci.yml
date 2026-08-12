@@ -22,6 +22,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      PDM_USE_PYTHON_VERSION: "false"
       SEQEVI_TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/seqevi
     strategy:
       fail-fast: false
@@ -36,6 +37,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: true
       - run: pdm install --frozen-lockfile -G dev -G server
+      - name: Verify matrix interpreter
+        env:
+          EXPECTED_PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          test "$(pdm run python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "${EXPECTED_PYTHON_VERSION}"
       - run: pdm run check
 
   distribution-and-image:
