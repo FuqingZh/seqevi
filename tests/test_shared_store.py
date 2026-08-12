@@ -18,6 +18,8 @@ from pydantic import ValidationError
 from sqlalchemy import (
     BigInteger,
     create_engine,
+    event,
+    func,
     inspect,
     make_url,
     text,
@@ -27,6 +29,7 @@ from sqlalchemy.engine import Connection
 
 from seqevi.annotate import run_annotation
 from seqevi.errors import (
+    ClaimReceiptCapacityError,
     EvidenceConflictError,
     StoreError,
     StoreIntegrityError,
@@ -58,6 +61,7 @@ from seqevi.store.schema import (
     claim_session_acquire_receipt_items,
     claim_session_acquire_receipts,
     claim_sessions,
+    evidence_claim_generations,
 )
 from seqevi.store.transport import (
     CommitModel,
@@ -704,6 +708,46 @@ def test_annotation_results_are_equivalent_for_local_and_http_store(
     )
 
 
+def test_v020_request_contract_uses_only_released_legacy_routes(tmp_path: Path) -> None:
+    """Fixed request fixture derived from the released v0.2.0 HTTP client."""
+
+    persistence = _memory_persistence()
+    app = create_service_app(_settings(tmp_path), persistence=persistence)
+    _identity, key = _key("MVTWOCOMPATIBILITY")
+    key_json = EvidenceQueryModel.from_domain(
+        EvidenceQuery(_identity, key)
+    ).key.model_dump(mode="json")
+    with TestClient(app) as service:
+        health = service.get("/health")
+        lookup = service.post("/v1/evidence/lookup", json={"queries": []})
+        fetch = service.post("/v1/evidence/fetch", json={"key": key_json})
+        fetch_many = service.post("/v1/evidence/fetch-many", json={"keys": []})
+        commit = service.post("/v1/evidence/commit", json={"commits": []})
+        artifact = service.get("/v1/artifacts/" + "a" * 64)
+        removed = [
+            service.request(method, path, json={})
+            for method, path in (
+                ("GET", "/v1/evidence/claims/capabilities"),
+                ("POST", "/v1/evidence/claims/acquire"),
+                ("POST", "/v1/evidence/claims/renew"),
+                ("POST", "/v1/evidence/claims/release"),
+                ("POST", "/v1/evidence/claims/finalize"),
+            )
+        ]
+    assert health.json() == {
+        "status": "ok",
+        "api_version": "v1",
+        "maximum_batch_size": 1000,
+        "maximum_artifact_bytes": 512 * 1024 * 1024,
+    }
+    assert lookup.status_code == 200 and lookup.json() == {"records": []}
+    assert fetch.status_code == 200 and fetch.json() == {"record": None}
+    assert fetch_many.status_code == 200 and fetch_many.json() == {"records": []}
+    assert commit.status_code == 200 and commit.json() == {"outcomes": []}
+    assert artifact.status_code == 404
+    assert all(response.status_code == 404 for response in removed)
+
+
 @contextmanager
 def _isolated_postgres_url() -> Iterator[str]:
     database_url = os.environ.get("SEQEVI_TEST_POSTGRES_URL")
@@ -859,6 +903,91 @@ def test_postgres_migrates_artifact_byte_size_from_integer_to_bigint() -> None:
 
 
 @pytest.mark.requires_postgres
+def test_postgres_maintenance_upgrade_arms_syncs_resets_and_preserves_rows() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            _seed_0002_evidence(connection)
+            before = _snapshot_legacy_rows(connection)
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0003_evidence_claim_leases",
+        )
+        store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == "0004_claim_sessions"
+            )
+            assert _snapshot_legacy_rows(connection) == before
+            assert connection.exec_driver_sql(
+                "SHOW transaction_timeout"
+            ).scalar_one() in {"0", "0ms"}
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_reset_failure_invalidates_after_committed_upgrade() -> (
+    None
+):
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0003_evidence_claim_leases",
+        )
+        failed_connection_ids: list[int] = []
+
+        def fail_reset(
+            connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            if statement == "RESET transaction_timeout":
+                failed_connection_ids.append(id(connection))
+                raise RuntimeError("injected reset failure")
+
+        event.listen(engine, "before_cursor_execute", fail_reset)
+        with pytest.raises(RuntimeError, match="injected reset failure"):
+            store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        event.remove(engine, "before_cursor_execute", fail_reset)
+        with engine.connect() as replacement:
+            assert id(replacement.connection) not in failed_connection_ids
+            assert replacement.exec_driver_sql(
+                "SHOW transaction_timeout"
+            ).scalar_one() in {"0", "0ms"}
+            assert (
+                replacement.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == "0004_claim_sessions"
+            )
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
 def test_postgres_service_commit_lookup_fetch_contract(tmp_path: Path) -> None:
     with _isolated_postgres_url() as database_url:
         persistence = PostgresEvidencePersistence.open(database_url)
@@ -948,6 +1077,36 @@ def test_postgres_http_claim_session_end_to_end(tmp_path: Path) -> None:
 
 
 @pytest.mark.requires_postgres
+def test_postgres_http_annotation_uses_one_claim_session(tmp_path: Path) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        app = create_service_app(_settings(tmp_path), persistence=persistence)
+        fasta = tmp_path / "claim-session.fasta"
+        fasta.write_text(">one\nMPEPTIDE\n>two\nMSEQUENCE\n", encoding="utf-8")
+        adapter = FixtureAdapter(
+            executable=write_fixture_tool(tmp_path / "fixture-tool-session"),
+            database=write_fixture_database(tmp_path / "database-session"),
+        )
+        with TestClient(app) as service:
+            capability = service.get("/v1/internal/claim-sessions/capabilities")
+            with HttpEvidenceStore("http://testserver", client=service) as store:
+                summary = run_annotation(
+                    fasta_path=fasta,
+                    output_dir=tmp_path / "session-output",
+                    adapter=adapter,
+                    store=store,
+                )
+            with persistence.engine.connect() as connection:
+                session_count = connection.execute(
+                    select(func.count()).select_from(claim_sessions)
+                ).scalar_one()
+        assert capability.status_code == 200
+        assert capability.json()["protocol"] == "claim-session-v1"
+        assert summary.computed == 2
+        assert session_count <= 1
+
+
+@pytest.mark.requires_postgres
 def test_postgres_acquire_receipt_replays_fixed_width_result(tmp_path: Path) -> None:
     with _isolated_postgres_url() as database_url:
         persistence = PostgresEvidencePersistence.open(database_url)
@@ -1004,6 +1163,104 @@ def test_postgres_acquire_receipt_replays_fixed_width_result(tmp_path: Path) -> 
                 )
         finally:
             persistence.close()
+
+
+@pytest.mark.requires_postgres
+@pytest.mark.parametrize("claim_count", [0, 1, 250, 1000])
+def test_postgres_renew_and_close_statement_counts_are_o1(
+    tmp_path: Path, claim_count: int
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id=f"open-o1-{claim_count}",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        if claim_count:
+            queries = tuple(
+                EvidenceQuery(identity, key)
+                for identity, key in (
+                    _key("M" + "A" * (index + 1) + "C") for index in range(claim_count)
+                )
+            )
+            persistence.acquire_claim_session(
+                authority,
+                acquire_request_id=f"acquire-o1-{claim_count}",
+                query_digest=canonical_query_digest(
+                    [EvidenceQueryModel.from_domain(query) for query in queries]
+                ),
+                queries=queries,
+            )
+        statements: list[str] = []
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            statements.append(statement)
+
+        event.listen(persistence.engine, "before_cursor_execute", record_statement)
+        try:
+            renewed = persistence.renew_claim_session(authority)
+            renew_count = len(statements)
+            statements.clear()
+            persistence.close_claim_session(renewed)
+            close_count = len(statements)
+        finally:
+            event.remove(persistence.engine, "before_cursor_execute", record_statement)
+            persistence.close()
+        assert renew_count == 5
+        assert close_count == 5
+
+
+@pytest.mark.requires_postgres
+def test_postgres_receipt_capacity_is_pre_mutation(tmp_path: Path) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-capacity",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        with persistence.engine.begin() as connection:
+            connection.execute(
+                claim_session_acquire_receipts.insert(),
+                [
+                    {
+                        "session_id": authority.session_id,
+                        "request_id": f"capacity-{index}",
+                        "query_digest": "a" * 64,
+                        "created_at": server_time,
+                    }
+                    for index in range(1000)
+                ],
+            )
+        identity, key = _key("MCAPACITY")
+        query = EvidenceQuery(identity, key)
+        with pytest.raises(ClaimReceiptCapacityError):
+            persistence.acquire_claim_session(
+                authority,
+                acquire_request_id="capacity-overflow",
+                query_digest=canonical_query_digest(
+                    [EvidenceQueryModel.from_domain(query)]
+                ),
+                queries=(query,),
+            )
+        with persistence.engine.connect() as connection:
+            assert (
+                connection.execute(
+                    select(func.count()).select_from(evidence_claim_generations)
+                ).scalar_one()
+                == 0
+            )
+        persistence.close()
 
 
 @pytest.mark.requires_postgres

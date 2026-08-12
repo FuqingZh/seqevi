@@ -275,6 +275,43 @@ def test_annotation_rejects_non_positive_threads_before_store_access(
 
 
 @pytest.mark.parametrize(
+    ("mode", "timeout_seconds"),
+    [("fail", None), ("malformed", None), ("missing-output", None), ("sleep", 0.05)],
+)
+def test_failed_annotation_does_not_cache_evidence(
+    tmp_path: Path,
+    mode: str,
+    timeout_seconds: float | None,
+) -> None:
+    fasta = write_input(tmp_path / "proteins.fasta")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database", mode=mode),
+    )
+    identities = tuple(
+        identify_protein_sequence(sequence) for sequence in ("MPEPTIDE", "MNOHITX")
+    )
+    queries = tuple(
+        EvidenceQuery(identity, adapter.contract.evidence_key(identity))
+        for identity in identities
+    )
+
+    with LocalStore.open(tmp_path / "store") as store:
+        with pytest.raises(AnnotationError, match="diagnostics retained"):
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=tmp_path / "output",
+                adapter=adapter,
+                store=store,
+                timeout_seconds=timeout_seconds,
+            )
+        assert store.lookup_many(queries) == {}
+
+    assert not (tmp_path / "output").exists()
+    assert list(tmp_path.glob(".seqevi-annotate-*"))
+
+
+@pytest.mark.parametrize(
     ("sequence", "evidence_rows", "no_hit_rows"),
     [("MPEPTIDE", 1, 0), ("MNOHITX", 0, 1)],
 )
