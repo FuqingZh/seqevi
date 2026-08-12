@@ -852,6 +852,10 @@ class _HttpClaimSession:
                 )
             except httpx.HTTPError:
                 response = None
+            if time.monotonic() >= deadline:
+                raise EvidenceClaimLostError(
+                    "ClaimSession operation response exceeded its deadline"
+                )
             if response is not None and response.status_code == 412:
                 raise EvidenceClaimLostError(response.text)
             if response is not None and _is_receipt_capacity(response):

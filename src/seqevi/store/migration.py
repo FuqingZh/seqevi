@@ -536,26 +536,40 @@ def _maintenance_upgrade_postgres(
             primary = error
         finally:
             try:
-                connection.rollback()
-                _reset_postgres_transaction_timeout(connection)
+                _cleanup_postgres_maintenance(connection, acquired, deadline)
             except BaseException as error:
                 cleanup = error
                 connection.invalidate()
-            if acquired and not connection.invalidated:
-                try:
-                    connection.exec_driver_sql(
-                        "SELECT pg_advisory_unlock(%s)", (_POSTGRES_MIGRATION_LOCK_ID,)
-                    )
-                    connection.commit()
-                except BaseException as error:
-                    cleanup = cleanup or error
-                    connection.invalidate()
         if primary is not None:
             if cleanup is not None:
                 primary.add_note(f"maintenance connection cleanup failed: {cleanup!r}")
             raise primary
         if cleanup is not None:
             raise cleanup
+
+
+def _cleanup_postgres_maintenance(
+    connection: Connection, acquired: bool, deadline: float
+) -> None:
+    watchdog: _MaintenanceWatchdog | None = None
+    try:
+        watchdog = _MaintenanceWatchdog(connection, deadline)
+        connection.rollback()
+        watchdog.require_precommit_budget()
+        if acquired:
+            connection.exec_driver_sql(
+                "SELECT pg_advisory_unlock(%s)", (_POSTGRES_MIGRATION_LOCK_ID,)
+            )
+            connection.commit()
+            watchdog.require_precommit_budget()
+        _reset_postgres_transaction_timeout(connection)
+        watchdog.require_precommit_budget()
+    except BaseException:
+        connection.invalidate()
+        raise
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
 
 
 def _arm_postgres_transaction_timeout(

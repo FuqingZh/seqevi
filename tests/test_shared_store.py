@@ -706,6 +706,32 @@ def test_http_claim_session_rejects_partial_capability_advertisement(
         )
 
 
+@pytest.mark.parametrize("operation", ["open", "renew", "acquire", "authority"])
+def test_claim_request_rejects_response_after_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    clock = [0.0]
+
+    class SlowResponseClient:
+        def request(self, *_args, **_kwargs) -> httpx.Response:
+            clock[0] = 11.0
+            return httpx.Response(200, json={})
+
+    class Store:
+        client = SlowResponseClient()
+
+    session = object.__new__(store_client_module._HttpClaimSession)
+    session.store = Store()
+    session._stop = threading.Event()
+    monkeypatch.setattr(store_client_module.time, "monotonic", lambda: clock[0])
+
+    with pytest.raises(EvidenceClaimLostError, match="response exceeded"):
+        session._request_until(
+            "POST", f"/v1/internal/claim-sessions/{operation}", deadline=10.0
+        )
+
+
 def test_http_open_replays_malformed_success_with_same_request_id() -> None:
     now = datetime.now(UTC)
     open_ids: list[str] = []
@@ -2981,6 +3007,39 @@ def test_maintenance_watchdog_classifies_expiry_during_commit_as_ambiguous(
         store_migration._AmbiguousMaintenanceCommit  # pyright: ignore[reportPrivateUsage]
     ):
         watchdog.commit()
+    assert connection.invalidated
+
+
+def test_postgres_maintenance_cleanup_watchdog_invalidates_stalled_connection() -> None:
+    cancelled = threading.Event()
+
+    class Raw:
+        def cancel(self) -> None:
+            cancelled.set()
+
+    class Holder:
+        driver_connection = Raw()
+
+    class FakeConnection:
+        connection = Holder()
+
+        def __init__(self) -> None:
+            self.invalidated = False
+
+        def rollback(self) -> None:
+            time.sleep(0.1)
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+    connection = FakeConnection()
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        store_migration._cleanup_postgres_maintenance(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, connection), False, started + 0.05
+        )
+    assert time.monotonic() - started < 0.5
+    assert cancelled.is_set()
     assert connection.invalidated
 
 
