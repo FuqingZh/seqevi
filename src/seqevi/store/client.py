@@ -157,7 +157,11 @@ class HttpEvidenceStore:
     def claim_session(self) -> _HttpClaimSession:
         if self._claim_session_capabilities is None:
             raise StoreError("shared Store does not support ClaimSession")
-        response = self._request("GET", "/v1/internal/claim-sessions/capabilities")
+        response = self._request(
+            "GET",
+            "/v1/internal/claim-sessions/capabilities",
+            timeout=httpx.Timeout(min(self._timeout_seconds, 30.0)),
+        )
         capabilities = ClaimSessionCapabilitiesResponse.model_validate(response.json())
         self._claim_session_capabilities = capabilities
         return _HttpClaimSession(self, capabilities)
@@ -394,13 +398,24 @@ class _HttpClaimSession:
             server_time=capabilities.server_time,
             open_not_after=capabilities.server_time + timedelta(seconds=30),
         )
-        response = self._request_until(
-            "POST",
-            "/v1/internal/claim-sessions/open",
-            deadline=open_deadline,
-            json=request.model_dump(mode="json"),
-        )
-        opened = ClaimSessionOpenResponse.model_validate(response.json()).to_domain()
+        while True:
+            response = self._request_until(
+                "POST",
+                "/v1/internal/claim-sessions/open",
+                deadline=open_deadline,
+                json=request.model_dump(mode="json"),
+            )
+            try:
+                opened = ClaimSessionOpenResponse.model_validate(
+                    response.json()
+                ).to_domain()
+                break
+            except (ValueError, StoreIntegrityError):
+                remaining = open_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                if self._stop.wait(min(0.25, remaining)):
+                    raise StoreError("ClaimSession closed during open recovery")
         self._authority = opened
         self._renew_deadline = self._authority_deadline(opened, request_started)
         self._thread = threading.Thread(
@@ -583,6 +598,8 @@ class _HttpClaimSession:
     ) -> tuple[CommitOutcome, ...]:
         self.raise_if_lost()
         commits = tuple(proposed)
+        if not commits:
+            return ()
         maximum = min(
             self.capabilities.maximum_batch_size, self.store.maximum_batch_size
         )

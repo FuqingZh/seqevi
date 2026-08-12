@@ -693,6 +693,7 @@ class _LocalClaimSession:
             while not self._stop.is_set():
                 try:
                     with self.store.engine.connect() as connection:
+                        connection.exec_driver_sql("PRAGMA busy_timeout=250")
                         connection.exec_driver_sql("BEGIN IMMEDIATE")
                         now = datetime.now(UTC)
                         result = connection.execute(
@@ -917,9 +918,13 @@ class _LocalClaimSession:
 
     def close(self) -> None:
         self._stop.set()
-        self._thread.join()
+        self._thread.join(timeout=1.0)
+        if self._thread.is_alive():
+            raise StoreIntegrityError("ClaimSession heartbeat did not stop promptly")
         now = datetime.now(UTC)
-        with self.store.engine.begin() as connection:
+        with self.store.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA busy_timeout=1000")
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
             connection.execute(
                 update(claim_sessions)
                 .where(
@@ -931,6 +936,7 @@ class _LocalClaimSession:
                 )
                 .values(state="closing", expires_at=now, updated_at=now)
             )
+            connection.commit()
         self.store._sweeper_wake.set()  # pyright: ignore[reportPrivateUsage]
 
 

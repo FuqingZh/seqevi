@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+import threading
+import time
 
 import pytest
 from sqlalchemy import func, select, text
@@ -183,6 +185,32 @@ def test_local_terminal_renewal_marks_session_lost_immediately(
         with pytest.raises(EvidenceClaimLostError):
             session.raise_if_lost()
         session.close()
+
+
+def test_local_close_is_bounded_when_heartbeat_waits_for_writer_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_module, "_CLAIM_RENEWAL_SECONDS", 0.01)
+    with LocalStore.open(tmp_path / "store") as store:
+        session = store.claim_session()
+        blocker = store.engine.connect()
+        blocker.exec_driver_sql("BEGIN IMMEDIATE")
+        released = threading.Event()
+
+        def release_writer() -> None:
+            time.sleep(0.5)
+            blocker.rollback()
+            blocker.close()
+            released.set()
+
+        thread = threading.Thread(target=release_writer)
+        thread.start()
+        started = time.monotonic()
+        session.close()
+        elapsed = time.monotonic() - started
+        thread.join()
+    assert released.is_set()
+    assert elapsed < 2.0
 
 
 def test_commit_lookup_and_fetch_hit_evidence(tmp_path: Path) -> None:
