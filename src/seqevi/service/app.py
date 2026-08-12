@@ -311,6 +311,7 @@ def create_service_app(
     ) -> ClaimSessionFinalizeResponse:
         _check_batch_size(len(request.commits), min(settings.maximum_batch_size, 1000))
         stored = {}
+        references: dict[str, ArtifactReferenceModel] = {}
         try:
             for item in request.commits:
                 _validate_commit_model(item.commit)
@@ -318,7 +319,16 @@ def create_service_app(
                     item.commit.normalized_artifact,
                     item.commit.raw_artifact,
                 ):
-                    if reference is not None and reference.digest not in stored:
+                    if reference is None:
+                        continue
+                    existing_reference = references.setdefault(
+                        reference.digest, reference
+                    )
+                    if existing_reference != reference:
+                        raise StoreIntegrityError(
+                            f"artifact reference conflict: {reference.digest}"
+                        )
+                    if reference.digest not in stored:
                         stored[reference.digest] = artifact_store.describe_existing(
                             digest=reference.digest,
                             media_type=reference.media_type,
@@ -565,8 +575,8 @@ def _observe_claim_request(
 
 
 def _claim_operation(path: str) -> str | None:
-    for operation in ("acquire", "renew", "release", "finalize"):
-        if path.endswith(f"/claims/{operation}"):
+    for operation in ("capabilities", "open", "acquire", "renew", "close", "finalize"):
+        if path.endswith(f"/claim-sessions/{operation}"):
             return operation
     return None
 
