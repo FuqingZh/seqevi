@@ -930,7 +930,7 @@ def test_http_claim_retries_retryable_backpressure(
         timeout = cast(dict[str, float], request.extensions["timeout"])
         request_timeouts.append(timeout["read"])
         if attempts == 1:
-            return httpx.Response(503, headers={"Retry-After": "1"})
+            return httpx.Response(503, headers={"Retry-After": "6"})
         renewed = EvidenceClaim(
             claim.key,
             claim.owner_token,
@@ -965,9 +965,92 @@ def test_http_claim_retries_retryable_backpressure(
     assert len(renewed) == 1
     assert attempts == 2
     assert len(sleeps) == 1
-    assert 0.9 <= sleeps[0] <= 1.1
+    assert 6.0 <= sleeps[0] <= 6.6
     assert request_timeouts[0] > 30.0
     assert request_timeouts[1] <= request_timeouts[0] - sleeps[0] / 4
+
+
+def test_http_claim_retries_finalize_backpressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503, headers={"Retry-After": "1"})
+        return httpx.Response(200, json={})
+
+    def wait_for_retry(_store: HttpEvidenceStore, delay: float) -> bool:
+        sleeps.append(delay)
+        return False
+
+    monkeypatch.setattr(HttpEvidenceStore, "_wait_for_claim_retry", wait_for_retry)
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        response = store._claim_request(  # pyright: ignore[reportPrivateUsage]
+            "POST", "/v1/evidence/claims/finalize", timeout=10.0
+        )
+
+    assert response.status_code == 200
+    assert attempts == 2
+    assert len(sleeps) == 1
+    assert sleeps[0] >= 1.0
+
+
+def test_http_finalize_uses_claim_authority_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity, key = _key("MFINALIZEBUDGET")
+    commit = EvidenceCommit(
+        identity=identity,
+        key=key,
+        status=EvidenceStatus.NO_HIT,
+        payload_digest="a" * 64,
+        raw_artifact=write_artifact_file(
+            tmp_path / "result.tsv", b"no-hit", "text/tab-separated-values"
+        ),
+    )
+    claim = EvidenceClaim(
+        key,
+        "owner",
+        1,
+        datetime.now(UTC) + timedelta(seconds=20),
+        5.0,
+    )
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(200, json=_claim_capabilities())
+        raise AssertionError("claim request should be patched")
+
+    def claim_request(method: str, path: str, **kwargs: object) -> httpx.Response:
+        assert method == "POST"
+        assert path.endswith("/finalize")
+        captured.update(kwargs)
+        return httpx.Response(200, json={"outcomes": ["created"]})
+
+    client = _claim_mock_client(httpx.MockTransport(handler))
+    with HttpEvidenceStore("http://testserver", client=client) as store:
+        monkeypatch.setattr(store, "_upload", lambda _payload: None)
+        monkeypatch.setattr(store, "_claim_request", claim_request)
+        assert store.finalize_many((ClaimedEvidenceCommit(commit, claim),)) == (
+            CommitOutcome.CREATED,
+        )
+
+    timeout = captured["timeout"]
+    assert isinstance(timeout, float)
+    assert 0 < timeout < 20
 
 
 def test_http_claim_scheduler_recomputes_timeout_after_queueing(
@@ -1225,18 +1308,20 @@ def test_http_claim_scheduler_prioritizes_renewal_and_caps_all_mutations(
 def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 3)
+    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 4)
     first_started = threading.Event()
     second_started = threading.Event()
     first_release = threading.Event()
     second_release = threading.Event()
     renew_started = threading.Event()
+    renew_release = threading.Event()
     order: list[str] = []
     lock = threading.Lock()
     acquire_number = 0
+    renew_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal acquire_number
+        nonlocal acquire_number, renew_count
         if request.url.path == "/health":
             return httpx.Response(200, json=_claim_health())
         if request.url.path.endswith("/capabilities"):
@@ -1256,13 +1341,17 @@ def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
                 second_started.set()
                 assert second_release.wait(timeout=3)
         elif request.url.path.endswith("/renew"):
-            renew_started.set()
+            with lock:
+                renew_count += 1
+                if renew_count == 2:
+                    renew_started.set()
+            assert renew_release.wait(timeout=3)
         return httpx.Response(200, json={})
 
     client = _claim_mock_client(httpx.MockTransport(handler))
     store = HttpEvidenceStore("http://testserver", client=client)
     try:
-        with ThreadPoolExecutor(max_workers=5) as callers:
+        with ThreadPoolExecutor(max_workers=6) as callers:
             first = callers.submit(
                 store._claim_request,  # pyright: ignore[reportPrivateUsage]
                 "POST",
@@ -1307,18 +1396,27 @@ def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
                 "/v1/evidence/claims/renew",
                 timeout=2.0,
             )
-            # The two mutation slots are full, but the third scheduler slot is
-            # reserved for renewal.  The queued renewal must start without
-            # waiting for either active acquire to finish.
+            renew_again = callers.submit(
+                store._claim_request,  # pyright: ignore[reportPrivateUsage]
+                "POST",
+                "/v1/evidence/claims/renew",
+                timeout=2.0,
+            )
+            # The two mutation slots are full, but two scheduler slots are
+            # reserved for a concurrent renewal wave. Both renewals must start
+            # without waiting for either active acquire to finish.
             assert renew_started.wait(timeout=2)
-            assert order[:3] == [
+            assert order[:4] == [
                 "/v1/evidence/claims/acquire",
                 "/v1/evidence/claims/acquire",
                 "/v1/evidence/claims/renew",
+                "/v1/evidence/claims/renew",
             ], order
+            renew_release.set()
             first_release.set()
             second_release.set()
             assert renew.result(timeout=3).status_code == 200
+            assert renew_again.result(timeout=3).status_code == 200
             assert release.result(timeout=3).status_code == 200
             assert finalize.result(timeout=3).status_code == 200
     finally:
@@ -1330,7 +1428,10 @@ def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
         "/v1/evidence/claims/acquire",
         "/v1/evidence/claims/acquire",
     ]
-    assert order[2] == "/v1/evidence/claims/renew", order
+    assert order[2:4] == [
+        "/v1/evidence/claims/renew",
+        "/v1/evidence/claims/renew",
+    ], order
 
 
 def test_http_claim_chunks_honor_client_and_capability_limits() -> None:

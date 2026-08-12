@@ -76,7 +76,7 @@ _CLAIM_RUNWAY_SECONDS = 5.0
 _HANDOFF_SCHEDULING_SECONDS = 1.0
 _CLAIM_MUTATION_CHUNK_SIZE = 250
 _MAX_CONCURRENT_CLAIM_REQUESTS = 4
-_RESERVED_CLAIM_RENEWAL_SLOTS = 1
+_RESERVED_CLAIM_RENEWAL_SLOTS = 2
 _MAX_CLAIM_BACKPRESSURE_RETRIES = 3
 _DEFAULT_CLAIM_RETRY_SECONDS = 0.25
 _CLAIM_RETRY_JITTER_RATIO = 0.1
@@ -139,7 +139,7 @@ class _ClaimRequestScheduler:
                 )
             )
             # A mutation worker may already be waiting because the reserved
-            # renewal slot is the only remaining capacity. Wake it when a
+            # renewal slots are the only remaining capacity. Wake it when a
             # renewal arrives so queue priority can take effect immediately.
             self._capacity.notify_all()
         return future
@@ -763,10 +763,16 @@ class HttpEvidenceStore:
             request = ClaimFinalizeRequest(
                 commits=[ClaimedCommitModel.from_domain(item) for item in chunk]
             )
+            claim_budget = _claim_request_budget(tuple(item.claim for item in chunk))
+            if claim_budget <= 0:
+                raise EvidenceClaimLostError(
+                    "claim finalization could not start before its authority runway"
+                )
             response = self._claim_request(
                 "POST",
                 "/v1/evidence/claims/finalize",
                 json=request.model_dump(mode="json"),
+                timeout=min(self._timeout_seconds, claim_budget),
             )
             returned = CommitResponse.model_validate(response.json()).outcomes
             if len(returned) != len(chunk):
@@ -996,7 +1002,11 @@ class HttpEvidenceStore:
         if not isinstance(request_timeout, (int, float)):
             raise TypeError("internal claim request timeout must be numeric")
         deadline = time.monotonic() + request_timeout
-        retryable = path.endswith("/acquire") or path.endswith("/renew")
+        retryable = (
+            path.endswith("/acquire")
+            or path.endswith("/renew")
+            or path.endswith("/finalize")
+        )
         renewal = path.endswith("/renew")
         for attempt in range(_MAX_CLAIM_BACKPRESSURE_RETRIES + 1):
             remaining = deadline - time.monotonic()
@@ -1023,9 +1033,9 @@ class HttpEvidenceStore:
                     )
                 except FutureTimeoutError as error:
                     future.cancel()
-                    if renewal:
+                    if renewal or path.endswith("/finalize"):
                         raise EvidenceClaimLostError(
-                            "claim renewal exceeded its authority runway"
+                            "claim request exceeded its authority runway"
                         ) from error
                     break
             except httpx.HTTPError as error:
@@ -1157,9 +1167,9 @@ def _claim_retry_delay(response: httpx.Response) -> float:
         base = float(raw) if raw is not None else _DEFAULT_CLAIM_RETRY_SECONDS
     except ValueError:
         base = _DEFAULT_CLAIM_RETRY_SECONDS
-    base = max(0.01, min(base, 5.0))
+    base = max(0.01, base)
     jitter = base * _CLAIM_RETRY_JITTER_RATIO
-    return max(0.01, base + random.uniform(-jitter, jitter))
+    return base + random.uniform(0.0, jitter)
 
 
 def _file_chunks(path: Path) -> Iterator[bytes]:
