@@ -90,7 +90,7 @@ def test_local_store_initializes_migrated_wal_database(tmp_path: Path) -> None:
                 "PRAGMA journal_mode"
             ).scalar_one()
 
-    assert version == "0003_evidence_claim_leases"
+    assert version == "0004_claim_sessions"
     assert str(journal_mode).lower() == "wal"
     assert (tmp_path / "store" / ".migration.lock").is_file()
     assert (tmp_path / "store" / "artifacts").is_dir()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -10,16 +12,15 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from seqevi.evidence import (
     ArtifactFile,
     BusyEvidenceClaim,
-    ClaimAcquireResult,
     ClaimDisposition,
-    ClaimedEvidenceCommit,
     CommitOutcome,
-    EvidenceClaim,
     EvidenceCommit,
     EvidenceKey,
     EvidenceQuery,
     EvidenceRecord,
     EvidenceStatus,
+    ClaimSessionAuthority,
+    SessionEvidenceClaim,
 )
 from seqevi.sequence import SequenceIdentity
 
@@ -217,50 +218,90 @@ class CommitResponse(TransportModel):
     outcomes: list[CommitOutcome]
 
 
-class ClaimCapabilitiesResponse(TransportModel):
+class ArtifactUploadResponse(TransportModel):
+    status: Literal["created", "existing"]
+    artifact: ArtifactReferenceModel
+
+
+class HealthResponse(TransportModel):
+    status: Literal["ok"] = "ok"
+    api_version: Literal["v1"] = "v1"
+    maximum_batch_size: Annotated[int, Field(ge=1, strict=True)]
+    maximum_artifact_bytes: Annotated[int, Field(ge=1, strict=True)]
+
+
+OpaqueId = Annotated[str, Field(min_length=1, max_length=64)]
+
+
+class ClaimSessionCapabilitiesResponse(TransportModel):
+    protocol: Literal["claim-session-v1"] = "claim-session-v1"
     maximum_batch_size: Annotated[int, Field(ge=1, le=1000, strict=True)]
-    lease_seconds: Annotated[float, Field(gt=0)]
-    renewal_after_seconds: Annotated[float, Field(gt=0)]
-
-    @model_validator(mode="after")
-    def validate_runway(self) -> ClaimCapabilitiesResponse:
-        if self.lease_seconds <= 5.0:
-            raise ValueError("claim lease_seconds must exceed the 5-second runway")
-        if self.renewal_after_seconds > self.lease_seconds - 5.0:
-            raise ValueError("claim renewal cadence must preserve the 5-second runway")
-        return self
+    retention_seconds: Literal[60] = 60
+    maximum_session_receipt_headers: Literal[1000] = 1000
+    maximum_session_receipt_items: Literal[32000] = 32000
+    server_time: datetime
 
 
-class EvidenceClaimModel(TransportModel):
-    key: EvidenceKeyModel
+class ClaimSessionOpenRequest(TransportModel):
+    open_request_id: OpaqueId
+    server_time: datetime
+    open_not_after: datetime
+
+
+class ClaimSessionAuthorityModel(TransportModel):
+    session_id: OpaqueId
     owner_token: Annotated[str, Field(min_length=1, max_length=255, repr=False)]
     generation: Annotated[int, Field(ge=1, strict=True)]
-    expires_at: datetime
-    renewal_after_seconds: Annotated[float, Field(gt=0)]
-
-    @model_validator(mode="after")
-    def validate_domain_claim(self) -> EvidenceClaimModel:
-        self.to_domain()
-        return self
 
     @classmethod
-    def from_domain(cls, value: EvidenceClaim) -> EvidenceClaimModel:
+    def from_domain(cls, value: ClaimSessionAuthority) -> ClaimSessionAuthorityModel:
         return cls(
-            key=EvidenceKeyModel.from_domain(value.key),
+            session_id=value.session_id,
             owner_token=value.owner_token,
             generation=value.generation,
-            expires_at=value.expires_at,
-            renewal_after_seconds=value.renewal_after_seconds,
         )
 
-    def to_domain(self) -> EvidenceClaim:
-        return EvidenceClaim(
-            self.key.to_domain(),
-            self.owner_token,
-            self.generation,
-            self.expires_at,
-            self.renewal_after_seconds,
+
+class ClaimSessionOpenResponse(ClaimSessionAuthorityModel):
+    expires_at: datetime
+    remaining_lease_seconds: Annotated[float, Field(gt=0)]
+    heartbeat_after_seconds: Annotated[float, Field(gt=0)]
+    renew_deadline_seconds: Annotated[float, Field(gt=0)]
+
+    def to_domain(self) -> ClaimSessionAuthority:
+        return ClaimSessionAuthority(**self.model_dump())
+
+
+class ClaimSessionRenewRequest(ClaimSessionAuthorityModel):
+    pass
+
+
+class ClaimSessionRenewResponse(ClaimSessionOpenResponse):
+    pass
+
+
+class ClaimSessionCloseRequest(ClaimSessionAuthorityModel):
+    pass
+
+
+class ClaimSessionCloseResponse(TransportModel):
+    session_id: OpaqueId
+    generation: Annotated[int, Field(ge=1, strict=True)]
+    closed: Literal[True] = True
+
+
+class SessionEvidenceClaimModel(TransportModel):
+    key: EvidenceKeyModel
+    generation: Annotated[int, Field(ge=1, strict=True)]
+
+    @classmethod
+    def from_domain(cls, value: SessionEvidenceClaim) -> SessionEvidenceClaimModel:
+        return cls(
+            key=EvidenceKeyModel.from_domain(value.key), generation=value.generation
         )
+
+    def to_domain(self) -> SessionEvidenceClaim:
+        return SessionEvidenceClaim(self.key.to_domain(), self.generation)
 
 
 class BusyEvidenceClaimModel(TransportModel):
@@ -282,116 +323,61 @@ class BusyEvidenceClaimModel(TransportModel):
         )
 
 
-class ClaimAcquireResultModel(TransportModel):
-    disposition: ClaimDisposition
-    record: EvidenceRecordModel | None = None
-    claim: EvidenceClaimModel | None = None
-    busy: BusyEvidenceClaimModel | None = None
-
-    @model_validator(mode="after")
-    def validate_domain_result(self) -> ClaimAcquireResultModel:
-        self.to_domain()
-        return self
-
-    @classmethod
-    def from_domain(cls, value: ClaimAcquireResult) -> ClaimAcquireResultModel:
-        return cls(
-            disposition=value.disposition,
-            record=None
-            if value.record is None
-            else EvidenceRecordModel.from_domain(value.record),
-            claim=None
-            if value.claim is None
-            else EvidenceClaimModel.from_domain(value.claim),
-            busy=None
-            if value.busy is None
-            else BusyEvidenceClaimModel.from_domain(value.busy),
-        )
-
-    def to_domain(self) -> ClaimAcquireResult:
-        return ClaimAcquireResult(
-            self.disposition,
-            record=None if self.record is None else self.record.to_domain(),
-            claim=None if self.claim is None else self.claim.to_domain(),
-            busy=None if self.busy is None else self.busy.to_domain(),
-        )
-
-
-class ClaimAcquireRequest(TransportModel):
-    owner_token: Annotated[str, Field(min_length=1, max_length=255, repr=False)]
+class ClaimSessionAcquireRequest(ClaimSessionAuthorityModel):
+    acquire_request_id: OpaqueId
+    query_digest: Sha256
     queries: list[EvidenceQueryModel]
 
     @model_validator(mode="after")
-    def validate_unique_keys(self) -> ClaimAcquireRequest:
-        if len({query.key.to_domain() for query in self.queries}) != len(self.queries):
+    def validate_queries_and_digest(self) -> ClaimSessionAcquireRequest:
+        keys = [query.key.to_domain() for query in self.queries]
+        if len(set(keys)) != len(keys):
             raise ValueError("claim acquisition contains a duplicate evidence key")
+        if canonical_query_digest(self.queries) != self.query_digest:
+            raise ValueError("query_digest does not describe the submitted queries")
         return self
 
 
-class ClaimAcquireResponse(TransportModel):
-    results: list[ClaimAcquireResultModel]
+class ClaimSessionAcquireResultModel(TransportModel):
+    disposition: ClaimDisposition
+    record: EvidenceRecordModel | None = None
+    claim: SessionEvidenceClaimModel | None = None
+    busy: BusyEvidenceClaimModel | None = None
 
 
-class ClaimMutationRequest(TransportModel):
-    claims: list[EvidenceClaimModel]
-
-    @model_validator(mode="after")
-    def validate_unique_keys(self) -> ClaimMutationRequest:
-        if len({claim.key.to_domain() for claim in self.claims}) != len(self.claims):
-            raise ValueError("claim mutation contains a duplicate evidence key")
-        return self
+class ClaimSessionAcquireResponse(TransportModel):
+    results: list[ClaimSessionAcquireResultModel]
 
 
-class ClaimRenewResponse(TransportModel):
-    claims: list[EvidenceClaimModel]
-
-
-class ClaimReleaseAcknowledgement(TransportModel):
-    key: EvidenceKeyModel
-    generation: Annotated[int, Field(ge=1, strict=True)]
-
-
-class ClaimReleaseResponse(TransportModel):
-    released: list[ClaimReleaseAcknowledgement]
-
-
-class ClaimedCommitModel(TransportModel):
+class ClaimSessionFinalizeItem(TransportModel):
     commit: CommitModel
-    claim: EvidenceClaimModel
+    claim_generation: Annotated[int, Field(ge=1, strict=True)]
+
+
+class ClaimSessionFinalizeRequest(ClaimSessionAuthorityModel):
+    finalize_request_id: OpaqueId
+    commits: list[ClaimSessionFinalizeItem]
 
     @model_validator(mode="after")
-    def validate_matching_key(self) -> ClaimedCommitModel:
-        if self.commit.key != self.claim.key:
-            raise ValueError("claim and evidence commit keys do not match")
-        return self
-
-    @classmethod
-    def from_domain(cls, value: ClaimedEvidenceCommit) -> ClaimedCommitModel:
-        return cls(
-            commit=CommitModel.from_domain(value.commit),
-            claim=EvidenceClaimModel.from_domain(value.claim),
-        )
-
-
-class ClaimFinalizeRequest(TransportModel):
-    commits: list[ClaimedCommitModel]
-
-    @model_validator(mode="after")
-    def validate_unique_keys(self) -> ClaimFinalizeRequest:
-        if len({item.claim.key.to_domain() for item in self.commits}) != len(
-            self.commits
-        ):
+    def validate_unique_keys(self) -> ClaimSessionFinalizeRequest:
+        keys = [item.commit.key.to_domain() for item in self.commits]
+        if len(set(keys)) != len(keys):
             raise ValueError("claim finalization contains a duplicate evidence key")
         return self
 
 
-class ArtifactUploadResponse(TransportModel):
-    status: Literal["created", "existing"]
-    artifact: ArtifactReferenceModel
+class ClaimSessionFinalizeResponse(TransportModel):
+    outcomes: list[CommitOutcome]
 
 
-class HealthResponse(TransportModel):
-    status: Literal["ok"] = "ok"
-    api_version: Literal["v1"] = "v1"
-    maximum_batch_size: Annotated[int, Field(ge=1, strict=True)]
-    maximum_artifact_bytes: Annotated[int, Field(ge=1, strict=True)]
+class InternalErrorResponse(TransportModel):
+    code: Literal["open_request_expired", "claim_receipt_capacity"]
+    detail: str
+
+
+def canonical_query_digest(queries: list[EvidenceQueryModel]) -> str:
+    payload = [query.model_dump(mode="json") for query in queries]
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, contextmanager
 from time import perf_counter
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Iterator
 from uuid import uuid4
 
@@ -16,25 +18,30 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from seqevi.errors import (
+    ClaimReceiptCapacityError,
     EvidenceClaimLostError,
     EvidenceConflictError,
     StoreBackpressureError,
     StoreIntegrityError,
 )
-from seqevi.evidence import EvidenceKey
+from seqevi.evidence import ClaimSessionAuthority, EvidenceKey
 from seqevi.store.artifact import PosixArtifactStore
 from seqevi.store.transport import (
     ArtifactReferenceModel,
     ArtifactUploadResponse,
-    ClaimAcquireRequest,
-    ClaimAcquireResponse,
-    ClaimAcquireResultModel,
-    ClaimCapabilitiesResponse,
-    ClaimFinalizeRequest,
-    ClaimMutationRequest,
-    ClaimReleaseResponse,
-    ClaimReleaseAcknowledgement,
-    ClaimRenewResponse,
+    BusyEvidenceClaimModel,
+    ClaimSessionAcquireRequest,
+    ClaimSessionAcquireResponse,
+    ClaimSessionAcquireResultModel,
+    ClaimSessionCapabilitiesResponse,
+    ClaimSessionCloseRequest,
+    ClaimSessionCloseResponse,
+    ClaimSessionFinalizeRequest,
+    ClaimSessionFinalizeResponse,
+    ClaimSessionOpenRequest,
+    ClaimSessionOpenResponse,
+    ClaimSessionRenewRequest,
+    ClaimSessionRenewResponse,
     CommitRequest,
     CommitResponse,
     CommitModel,
@@ -46,13 +53,11 @@ from seqevi.store.transport import (
     HealthResponse,
     LookupRequest,
     LookupResponse,
-    EvidenceClaimModel,
+    SessionEvidenceClaimModel,
 )
 
 from .config import ServiceSettings
 from .persistence import (
-    CLAIM_LEASE_SECONDS,
-    CLAIM_RENEWAL_SECONDS,
     PostgresEvidencePersistence,
     ServicePersistence,
 )
@@ -82,9 +87,28 @@ def create_service_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        stopped = asyncio.Event()
+
+        async def sweep_coordination() -> None:
+            sweep = getattr(database, "sweep_claim_sessions", None)
+            if sweep is None:
+                return
+            while not stopped.is_set():
+                try:
+                    await asyncio.to_thread(sweep)
+                except StoreBackpressureError:
+                    pass
+                try:
+                    await asyncio.wait_for(stopped.wait(), timeout=1.0)
+                except TimeoutError:
+                    continue
+
+        sweeper = asyncio.create_task(sweep_coordination())
         try:
             yield
         finally:
+            stopped.set()
+            await sweeper
             database.close()
 
     app = FastAPI(
@@ -131,111 +155,153 @@ def create_service_app(
         )
 
     @app.get(
-        "/v1/evidence/claims/capabilities",
-        response_model=ClaimCapabilitiesResponse,
+        "/v1/internal/claim-sessions/capabilities",
+        response_model=ClaimSessionCapabilitiesResponse,
     )
-    def claim_capabilities() -> ClaimCapabilitiesResponse:
-        if not getattr(database, "supports_claims", False):
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "evidence claims unsupported"
-            )
-        return ClaimCapabilitiesResponse(
+    def claim_session_capabilities() -> ClaimSessionCapabilitiesResponse:
+        if not database.supports_claim_sessions:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "ClaimSession unsupported")
+        return ClaimSessionCapabilitiesResponse(
             maximum_batch_size=min(
                 settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE
             ),
-            lease_seconds=CLAIM_LEASE_SECONDS,
-            renewal_after_seconds=CLAIM_RENEWAL_SECONDS,
+            server_time=database.database_time(),
         )
 
-    @app.post("/v1/evidence/claims/acquire", response_model=ClaimAcquireResponse)
-    def acquire_claims(
-        request: ClaimAcquireRequest, http_request: Request
-    ) -> ClaimAcquireResponse:
-        with _observe_claim_request(
-            "acquire",
-            len(request.queries),
-            started=_claim_started(http_request),
-            request_id=_claim_request_id(http_request),
-        ):
-            _check_batch_size(
-                len(request.queries),
-                min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
+    @app.post(
+        "/v1/internal/claim-sessions/open", response_model=ClaimSessionOpenResponse
+    )
+    def open_claim_session(
+        request: ClaimSessionOpenRequest,
+    ) -> ClaimSessionOpenResponse:
+        try:
+            authority = database.open_claim_session(
+                open_request_id=request.open_request_id,
+                server_time=request.server_time,
+                open_not_after=request.open_not_after,
             )
-            try:
-                results = database.acquire_many(
-                    (query.to_domain() for query in request.queries),
-                    owner_token=request.owner_token,
-                )
-            except StoreBackpressureError as error:
-                raise _backpressure_error(error) from error
-            except StoreIntegrityError as error:
-                raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
-            except ValueError as error:
-                raise HTTPException(422, str(error)) from error
-            return ClaimAcquireResponse(
-                results=[
-                    ClaimAcquireResultModel.from_domain(result) for result in results
-                ]
-            )
+        except TimeoutError as error:
+            raise HTTPException(
+                status.HTTP_408_REQUEST_TIMEOUT,
+                {"code": "open_request_expired", "detail": str(error)},
+            ) from error
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
+        return ClaimSessionOpenResponse.model_validate(_authority_payload(authority))
 
-    @app.post("/v1/evidence/claims/renew", response_model=ClaimRenewResponse)
-    def renew_claims(
-        request: ClaimMutationRequest, http_request: Request
-    ) -> ClaimRenewResponse:
-        with _observe_claim_request(
-            "renew",
-            len(request.claims),
-            started=_claim_started(http_request),
-            request_id=_claim_request_id(http_request),
-        ):
-            _check_batch_size(
-                len(request.claims),
-                min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
-            )
-            try:
-                renewed = database.renew_many(
-                    claim.to_domain() for claim in request.claims
-                )
-            except StoreBackpressureError as error:
-                raise _backpressure_error(error) from error
-            except EvidenceClaimLostError as error:
-                raise HTTPException(
-                    status.HTTP_412_PRECONDITION_FAILED, str(error)
-                ) from error
-            return ClaimRenewResponse(
-                claims=[EvidenceClaimModel.from_domain(claim) for claim in renewed]
-            )
+    @app.post(
+        "/v1/internal/claim-sessions/renew", response_model=ClaimSessionRenewResponse
+    )
+    def renew_claim_session(
+        request: ClaimSessionRenewRequest,
+    ) -> ClaimSessionRenewResponse:
+        try:
+            renewed = database.renew_claim_session(_request_authority(request))
+        except EvidenceClaimLostError as error:
+            raise HTTPException(
+                status.HTTP_412_PRECONDITION_FAILED, str(error)
+            ) from error
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
+        return ClaimSessionRenewResponse.model_validate(_authority_payload(renewed))
 
-    @app.post("/v1/evidence/claims/release", response_model=ClaimReleaseResponse)
-    def release_claims(
-        request: ClaimMutationRequest, http_request: Request
-    ) -> ClaimReleaseResponse:
-        with _observe_claim_request(
-            "release",
-            len(request.claims),
-            started=_claim_started(http_request),
-            request_id=_claim_request_id(http_request),
-        ):
-            _check_batch_size(
-                len(request.claims),
-                min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
+    @app.post(
+        "/v1/internal/claim-sessions/close", response_model=ClaimSessionCloseResponse
+    )
+    def close_claim_session(
+        request: ClaimSessionCloseRequest,
+    ) -> ClaimSessionCloseResponse:
+        try:
+            database.close_claim_session(_request_authority(request))
+        except EvidenceClaimLostError as error:
+            raise HTTPException(
+                status.HTTP_412_PRECONDITION_FAILED, str(error)
+            ) from error
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
+        return ClaimSessionCloseResponse(
+            session_id=request.session_id, generation=request.generation
+        )
+
+    @app.post(
+        "/v1/internal/claim-sessions/acquire",
+        response_model=ClaimSessionAcquireResponse,
+    )
+    def acquire_claim_session(
+        request: ClaimSessionAcquireRequest,
+    ) -> ClaimSessionAcquireResponse:
+        _check_batch_size(len(request.queries), min(settings.maximum_batch_size, 1000))
+        try:
+            results = database.acquire_claim_session(
+                _request_authority(request),
+                acquire_request_id=request.acquire_request_id,
+                query_digest=request.query_digest,
+                queries=(query.to_domain() for query in request.queries),
             )
-            try:
-                database.release_many(claim.to_domain() for claim in request.claims)
-            except StoreBackpressureError as error:
-                raise _backpressure_error(error) from error
-            except EvidenceClaimLostError as error:
-                raise HTTPException(
-                    status.HTTP_412_PRECONDITION_FAILED, str(error)
-                ) from error
-            return ClaimReleaseResponse(
-                released=[
-                    ClaimReleaseAcknowledgement(
-                        key=claim.key, generation=claim.generation
-                    )
-                    for claim in request.claims
-                ]
+        except ClaimReceiptCapacityError as error:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                {"code": "claim_receipt_capacity", "detail": str(error)},
+                headers={"Retry-After": "1"},
+            ) from error
+        except EvidenceClaimLostError as error:
+            raise HTTPException(
+                status.HTTP_412_PRECONDITION_FAILED, str(error)
+            ) from error
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
+        return ClaimSessionAcquireResponse(
+            results=[
+                ClaimSessionAcquireResultModel(
+                    disposition=result.disposition,
+                    record=None
+                    if result.record is None
+                    else EvidenceRecordModel.from_domain(result.record),
+                    claim=None
+                    if result.claim is None
+                    else SessionEvidenceClaimModel.from_domain(result.claim),
+                    busy=None
+                    if result.busy is None
+                    else BusyEvidenceClaimModel.from_domain(result.busy),
+                )
+                for result in results
+            ]
+        )
+
+    @app.post(
+        "/v1/internal/claim-sessions/finalize",
+        response_model=ClaimSessionFinalizeResponse,
+    )
+    def finalize_claim_session(
+        request: ClaimSessionFinalizeRequest,
+    ) -> ClaimSessionFinalizeResponse:
+        _check_batch_size(len(request.commits), min(settings.maximum_batch_size, 1000))
+        stored = {}
+        try:
+            for item in request.commits:
+                _validate_commit_model(item.commit)
+                for reference in (
+                    item.commit.normalized_artifact,
+                    item.commit.raw_artifact,
+                ):
+                    if reference is not None and reference.digest not in stored:
+                        stored[reference.digest] = artifact_store.describe_existing(
+                            digest=reference.digest,
+                            media_type=reference.media_type,
+                            byte_size=reference.byte_size,
+                        )
+            outcomes = database.finalize_claim_session(
+                _request_authority(request), request.commits, stored
             )
+        except EvidenceClaimLostError as error:
+            raise HTTPException(
+                status.HTTP_412_PRECONDITION_FAILED, str(error)
+            ) from error
+        except EvidenceConflictError as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
+        return ClaimSessionFinalizeResponse(outcomes=list(outcomes))
 
     @app.post("/v1/evidence/lookup", response_model=LookupResponse)
     def lookup(request: LookupRequest) -> LookupResponse:
@@ -369,56 +435,34 @@ def create_service_app(
             raise HTTPException(422, str(error)) from error
         return CommitResponse(outcomes=list(outcomes))
 
-    @app.post("/v1/evidence/claims/finalize", response_model=CommitResponse)
-    def finalize_claims(
-        request: ClaimFinalizeRequest, http_request: Request
-    ) -> CommitResponse:
-        with _observe_claim_request(
-            "finalize",
-            len(request.commits),
-            started=_claim_started(http_request),
-            request_id=_claim_request_id(http_request),
-        ):
-            _check_batch_size(
-                len(request.commits),
-                min(settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE),
-            )
-            stored = {}
-            references: dict[str, ArtifactReferenceModel] = {}
-            try:
-                for item in request.commits:
-                    _validate_commit_model(item.commit)
-                    for reference in (
-                        item.commit.normalized_artifact,
-                        item.commit.raw_artifact,
-                    ):
-                        if reference is None:
-                            continue
-                        existing = references.setdefault(reference.digest, reference)
-                        if existing != reference:
-                            raise StoreIntegrityError(
-                                f"artifact reference conflict: {reference.digest}"
-                            )
-                        if reference.digest not in stored:
-                            stored[reference.digest] = artifact_store.describe_existing(
-                                digest=reference.digest,
-                                media_type=reference.media_type,
-                                byte_size=reference.byte_size,
-                            )
-                outcomes = database.finalize_many(request.commits, stored)
-            except StoreBackpressureError as error:
-                raise _backpressure_error(error) from error
-            except EvidenceClaimLostError as error:
-                raise HTTPException(
-                    status.HTTP_412_PRECONDITION_FAILED, str(error)
-                ) from error
-            except EvidenceConflictError as error:
-                raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
-            except (StoreIntegrityError, ValueError) as error:
-                raise HTTPException(422, str(error)) from error
-            return CommitResponse(outcomes=list(outcomes))
-
     return app
+
+
+def _request_authority(request: object) -> ClaimSessionAuthority:
+    session_id = getattr(request, "session_id")
+    owner_token = getattr(request, "owner_token")
+    generation = getattr(request, "generation")
+    return ClaimSessionAuthority(
+        session_id=session_id,
+        owner_token=owner_token,
+        generation=generation,
+        expires_at=datetime.now(UTC) + timedelta(seconds=1),
+        remaining_lease_seconds=1.0,
+        heartbeat_after_seconds=1.0,
+        renew_deadline_seconds=1.0,
+    )
+
+
+def _authority_payload(authority: ClaimSessionAuthority) -> dict[str, object]:
+    return {
+        "session_id": authority.session_id,
+        "owner_token": authority.owner_token,
+        "generation": authority.generation,
+        "expires_at": authority.expires_at,
+        "remaining_lease_seconds": authority.remaining_lease_seconds,
+        "heartbeat_after_seconds": authority.heartbeat_after_seconds,
+        "renew_deadline_seconds": authority.renew_deadline_seconds,
+    }
 
 
 def configure_claim_logging() -> None:

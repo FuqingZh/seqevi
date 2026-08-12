@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
+import secrets
+import threading
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import and_, create_engine, delete, event, select, tuple_, update
+from sqlalchemy import and_, create_engine, delete, event, func, select, tuple_, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping, URL
 
@@ -22,11 +26,8 @@ from seqevi.errors import (
 from seqevi.evidence import (
     ArtifactFile,
     BusyEvidenceClaim,
-    ClaimAcquireResult,
     ClaimDisposition,
-    ClaimedEvidenceCommit,
     CommitOutcome,
-    EvidenceClaim,
     EvidenceCommit,
     EvidenceKey,
     EvidenceQuery,
@@ -34,16 +35,29 @@ from seqevi.evidence import (
     EvidenceStatus,
     FetchedEvidence,
     StoredArtifact,
+    SessionClaimAcquireResult,
+    SessionEvidenceClaim,
 )
 from seqevi.sequence import SequenceIdentity
 
 from .artifact import PosixArtifactStore
 from .migration import upgrade_database
-from .schema import artifacts, evidence, evidence_claims, sequences
+from .schema import (
+    artifacts,
+    claim_sessions,
+    claim_session_acquire_receipt_items,
+    claim_session_acquire_receipts,
+    claim_session_open_receipts,
+    evidence,
+    evidence_claim_generations,
+    sequences,
+    session_claims,
+)
+from .transport import EvidenceQueryModel, canonical_query_digest
 
 _LOOKUP_CHUNK_SIZE = 400
-_CLAIM_LEASE_SECONDS = 60.0
-_CLAIM_RENEWAL_SECONDS = 20.0
+_CLAIM_LEASE_SECONDS = 120.0
+_CLAIM_RENEWAL_SECONDS = 30.0
 _CLAIM_RETRY_SECONDS = 1.0
 
 
@@ -95,6 +109,13 @@ class LocalStore:
         self.database_path = root / "store.sqlite3"
         self.engine = engine
         self.artifact_store = artifact_store
+        self._sweeper_stop = threading.Event()
+        self._sweeper_wake = threading.Event()
+        self._sweeper = threading.Thread(
+            target=self._sweep_loop,
+            name="seqevi-local-claim-sweeper",
+            daemon=True,
+        )
 
     @classmethod
     def open(
@@ -122,30 +143,162 @@ class LocalStore:
                 raise StoreConfigurationError(
                     f"SQLite Store did not enter WAL mode: {journal_mode}"
                 )
-            return cls(
+            store = cls(
                 root=root,
                 engine=engine,
                 artifact_store=PosixArtifactStore(root / "artifacts"),
             )
+            store._drain_coordination()
+            store._sweeper.start()
+            return store
         except Exception:
             engine.dispose()
             raise
 
     def close(self) -> None:
+        self._sweeper_stop.set()
+        self._sweeper_wake.set()
+        self._sweeper.join()
+        self._drain_coordination()
         self.engine.dispose()
 
+    def _sweep_loop(self) -> None:
+        while not self._sweeper_stop.is_set():
+            self._sweeper_wake.wait(timeout=1.0)
+            self._sweeper_wake.clear()
+            while not self._sweeper_stop.is_set() and self._sweep_once():
+                pass
+
+    def _drain_coordination(self) -> None:
+        while self._sweep_once():
+            pass
+
+    def _sweep_once(self) -> int:
+        now = datetime.now(UTC)
+        removed = 0
+        with self.engine.begin() as connection:
+            stale_sessions = select(claim_sessions.c.session_id).where(
+                (claim_sessions.c.state == "closing")
+                | (claim_sessions.c.expires_at <= now)
+            )
+            claim_ids = (
+                select(
+                    session_claims.c.sequence_id,
+                    session_claims.c.adapter_contract_version,
+                    session_claims.c.tool_runtime_digest,
+                    session_claims.c.resource_id,
+                    session_claims.c.semantic_parameters_hash,
+                )
+                .where(session_claims.c.session_id.in_(stale_sessions))
+                .order_by(*session_claims.primary_key.columns)
+                .limit(1000)
+            )
+            result = connection.execute(
+                delete(session_claims).where(
+                    tuple_(*session_claims.primary_key.columns).in_(claim_ids)
+                )
+            )
+            removed += result.rowcount
+            cutoff = now - timedelta(seconds=60)
+            item_ids = (
+                select(
+                    claim_session_acquire_receipt_items.c.session_id,
+                    claim_session_acquire_receipt_items.c.request_id,
+                    claim_session_acquire_receipt_items.c.input_index,
+                )
+                .join(claim_session_acquire_receipts)
+                .where(claim_session_acquire_receipts.c.created_at <= cutoff)
+                .order_by(
+                    claim_session_acquire_receipts.c.created_at,
+                    claim_session_acquire_receipt_items.c.session_id,
+                    claim_session_acquire_receipt_items.c.request_id,
+                    claim_session_acquire_receipt_items.c.input_index,
+                )
+                .limit(1000)
+            )
+            result = connection.execute(
+                delete(claim_session_acquire_receipt_items).where(
+                    tuple_(
+                        claim_session_acquire_receipt_items.c.session_id,
+                        claim_session_acquire_receipt_items.c.request_id,
+                        claim_session_acquire_receipt_items.c.input_index,
+                    ).in_(item_ids)
+                )
+            )
+            removed += result.rowcount
+            header_ids = (
+                select(
+                    claim_session_acquire_receipts.c.session_id,
+                    claim_session_acquire_receipts.c.request_id,
+                )
+                .where(
+                    claim_session_acquire_receipts.c.created_at <= cutoff,
+                    ~select(claim_session_acquire_receipt_items.c.input_index)
+                    .where(
+                        claim_session_acquire_receipt_items.c.session_id
+                        == claim_session_acquire_receipts.c.session_id,
+                        claim_session_acquire_receipt_items.c.request_id
+                        == claim_session_acquire_receipts.c.request_id,
+                    )
+                    .exists(),
+                )
+                .limit(1000)
+            )
+            result = connection.execute(
+                delete(claim_session_acquire_receipts).where(
+                    tuple_(
+                        claim_session_acquire_receipts.c.session_id,
+                        claim_session_acquire_receipts.c.request_id,
+                    ).in_(header_ids)
+                )
+            )
+            removed += result.rowcount
+            empty_sessions = (
+                select(claim_sessions.c.session_id)
+                .where(
+                    (
+                        (claim_sessions.c.state == "closing")
+                        | (claim_sessions.c.expires_at <= now)
+                    ),
+                    ~select(session_claims.c.sequence_id)
+                    .where(session_claims.c.session_id == claim_sessions.c.session_id)
+                    .exists(),
+                    ~select(claim_session_acquire_receipts.c.request_id)
+                    .where(
+                        claim_session_acquire_receipts.c.session_id
+                        == claim_sessions.c.session_id
+                    )
+                    .exists(),
+                )
+                .limit(1000)
+            )
+            result = connection.execute(
+                delete(claim_sessions).where(
+                    claim_sessions.c.session_id.in_(empty_sessions)
+                )
+            )
+            removed += result.rowcount
+            result = connection.execute(
+                delete(claim_session_open_receipts).where(
+                    claim_session_open_receipts.c.open_request_id.in_(
+                        select(claim_session_open_receipts.c.open_request_id)
+                        .where(
+                            claim_session_open_receipts.c.created_at
+                            <= now - timedelta(seconds=120)
+                        )
+                        .limit(1000)
+                    )
+                )
+            )
+            removed += result.rowcount
+        return removed
+
     @property
-    def supports_claims(self) -> bool:
-        """Return true because schema revision 0003 supplies atomic claims.
-
-        Examples:
-            An opened local Store always supports lease coordination:
-
-            >>> store.supports_claims
-            True
-        """
-
+    def supports_claim_sessions(self) -> bool:
         return True
+
+    def claim_session(self) -> _LocalClaimSession:
+        return _LocalClaimSession(self)
 
     def __enter__(self) -> LocalStore:
         return self
@@ -272,7 +425,7 @@ class LocalStore:
         with self.engine.begin() as connection:
             for commit in ordered:
                 connection.execute(
-                    delete(evidence_claims).where(_claim_key_clause(commit.key))
+                    delete(session_claims).where(_session_claim_key_clause(commit.key))
                 )
             for commit in ordered:
                 self._insert_sequence(connection, commit.identity)
@@ -282,302 +435,6 @@ class LocalStore:
             for commit in ordered:
                 outcomes[commit.key] = self._insert_evidence(connection, commit)
         return tuple(outcomes[commit.key] for commit in commits)
-
-    def acquire_many(
-        self, requested_queries: Iterable[EvidenceQuery], *, owner_token: str
-    ) -> tuple[ClaimAcquireResult, ...]:
-        """Atomically acquire exact missing evidence under a server lease.
-
-        Examples:
-            A second owner observes an unexpired claim as busy:
-
-            >>> first = store.acquire_many((query,), owner_token="a")
-            >>> second = store.acquire_many((query,), owner_token="b")
-            >>> second[0].disposition is ClaimDisposition.BUSY
-            True
-        """
-
-        queries = tuple(requested_queries)
-        if len({query.key for query in queries}) != len(queries):
-            raise ValueError("acquire batch contains a duplicate evidence key")
-        _validate_owner_token(owner_token)
-        ordered_queries = sorted(queries, key=lambda query: _key_sort_value(query.key))
-        results: dict[EvidenceKey, ClaimAcquireResult] = {}
-        with self.engine.connect() as connection:
-            connection.exec_driver_sql("BEGIN IMMEDIATE")
-            try:
-                for query in ordered_queries:
-                    now = datetime.now(UTC)
-                    expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
-                    self._insert_sequence(connection, query.identity)
-                    terminal = (
-                        connection.execute(
-                            select(evidence).where(_evidence_key_clause(query.key))
-                        )
-                        .mappings()
-                        .one_or_none()
-                    )
-                    if terminal is not None:
-                        connection.execute(
-                            delete(evidence_claims).where(_claim_key_clause(query.key))
-                        )
-                        results[query.key] = ClaimAcquireResult(
-                            ClaimDisposition.CACHED,
-                            record=self._record_from_row(terminal),
-                        )
-                        continue
-                    row = (
-                        connection.execute(
-                            select(evidence_claims).where(_claim_key_clause(query.key))
-                        )
-                        .mappings()
-                        .one_or_none()
-                    )
-                    if row is None:
-                        generation = 1
-                        connection.execute(
-                            evidence_claims.insert().values(
-                                **_claim_key_values(query.key),
-                                semantic_parameters_json=query.key.semantic_parameters_json,
-                                owner_token=owner_token,
-                                generation=generation,
-                                expires_at=expiry,
-                                created_at=now,
-                                updated_at=now,
-                            )
-                        )
-                        results[query.key] = _acquired_result(
-                            query.key, owner_token, generation, expiry
-                        )
-                    elif (
-                        row["owner_token"] == owner_token
-                        and _as_utc(row["expires_at"]) > now
-                    ):
-                        generation = row["generation"]
-                        connection.execute(
-                            update(evidence_claims)
-                            .where(_claim_key_clause(query.key))
-                            .values(expires_at=expiry, updated_at=now)
-                        )
-                        results[query.key] = _acquired_result(
-                            query.key, owner_token, generation, expiry
-                        )
-                    elif _as_utc(row["expires_at"]) <= now:
-                        generation = row["generation"] + 1
-                        connection.execute(
-                            update(evidence_claims)
-                            .where(_claim_key_clause(query.key))
-                            .values(
-                                owner_token=owner_token,
-                                generation=generation,
-                                expires_at=expiry,
-                                updated_at=now,
-                            )
-                        )
-                        results[query.key] = _acquired_result(
-                            query.key, owner_token, generation, expiry
-                        )
-                    else:
-                        results[query.key] = ClaimAcquireResult(
-                            ClaimDisposition.BUSY,
-                            busy=BusyEvidenceClaim(
-                                query.key,
-                                _as_utc(row["expires_at"]),
-                                _CLAIM_RETRY_SECONDS,
-                            ),
-                        )
-                authoritative = tuple(
-                    result.claim
-                    for result in results.values()
-                    if result.claim is not None
-                )
-                expiry: datetime | None = None
-                if authoritative:
-                    now = datetime.now(UTC)
-                    expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
-                    refreshed = connection.execute(
-                        update(evidence_claims)
-                        .where(
-                            _claim_identity_tuple().in_(
-                                [
-                                    _claim_identity_values(claim)
-                                    for claim in authoritative
-                                ]
-                            )
-                        )
-                        .values(expires_at=expiry, updated_at=now)
-                    )
-                    if refreshed.rowcount != len(authoritative):
-                        raise EvidenceClaimLostError(
-                            "claim ownership changed during acquire refresh"
-                        )
-                for claim in authoritative:
-                    assert expiry is not None
-                    results[claim.key] = _acquired_result(
-                        claim.key,
-                        claim.owner_token,
-                        claim.generation,
-                        expiry,
-                    )
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-        return tuple(results[query.key] for query in queries)
-
-    def renew_many(self, claims: Iterable[EvidenceClaim]) -> tuple[EvidenceClaim, ...]:
-        """Renew exact current claim generations or reject stale ownership.
-
-        Examples:
-            Renewal extends the server-selected expiry:
-
-            >>> renewed = store.renew_many((claim,))[0]
-            >>> renewed.expires_at >= claim.expires_at
-            True
-        """
-
-        requested = tuple(claims)
-        if len({claim.key for claim in requested}) != len(requested):
-            raise ValueError("claim renewal contains a duplicate evidence key")
-        ordered = sorted(requested, key=lambda claim: _key_sort_value(claim.key))
-        renewed: dict[EvidenceKey, EvidenceClaim] = {}
-        with self.engine.connect() as connection:
-            connection.exec_driver_sql("BEGIN IMMEDIATE")
-            try:
-                for claim in ordered:
-                    now = datetime.now(UTC)
-                    expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
-                    result = connection.execute(
-                        update(evidence_claims)
-                        .where(_claim_owner_clause(claim, now))
-                        .values(expires_at=expiry, updated_at=now)
-                    )
-                    if result.rowcount != 1:
-                        raise EvidenceClaimLostError(
-                            f"claim ownership was lost: {claim.key.sequence_id}"
-                        )
-                    renewed[claim.key] = EvidenceClaim(
-                        claim.key,
-                        claim.owner_token,
-                        claim.generation,
-                        expiry,
-                        _CLAIM_RENEWAL_SECONDS,
-                    )
-                expiry = None
-                if renewed:
-                    now = datetime.now(UTC)
-                    expiry = now + timedelta(seconds=_CLAIM_LEASE_SECONDS)
-                    refreshed = connection.execute(
-                        update(evidence_claims)
-                        .where(
-                            _claim_identity_tuple().in_(
-                                [
-                                    _claim_identity_values(claim)
-                                    for claim in renewed.values()
-                                ]
-                            )
-                        )
-                        .values(expires_at=expiry, updated_at=now)
-                    )
-                    if refreshed.rowcount != len(renewed):
-                        raise EvidenceClaimLostError(
-                            "claim ownership changed during renewal refresh"
-                        )
-                for claim in tuple(renewed.values()):
-                    assert expiry is not None
-                    renewed[claim.key] = EvidenceClaim(
-                        claim.key,
-                        claim.owner_token,
-                        claim.generation,
-                        expiry,
-                        _CLAIM_RENEWAL_SECONDS,
-                    )
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-        return tuple(renewed[claim.key] for claim in requested)
-
-    def release_many(self, claims: Iterable[EvidenceClaim]) -> None:
-        """Release exact current claim generations and reject stale owners.
-
-        Examples:
-            Released work can be acquired by another owner immediately:
-
-            >>> store.release_many((claim,))
-        """
-
-        requested = tuple(claims)
-        if len({claim.key for claim in requested}) != len(requested):
-            raise ValueError("claim release contains a duplicate evidence key")
-        with self.engine.connect() as connection:
-            connection.exec_driver_sql("BEGIN IMMEDIATE")
-            try:
-                for claim in sorted(
-                    requested, key=lambda item: _key_sort_value(item.key)
-                ):
-                    now = datetime.now(UTC)
-                    result = connection.execute(
-                        update(evidence_claims)
-                        .where(_claim_owner_clause(claim, now))
-                        .values(expires_at=now, updated_at=now)
-                    )
-                    if result.rowcount != 1:
-                        raise EvidenceClaimLostError(
-                            f"claim ownership was lost: {claim.key.sequence_id}"
-                        )
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-
-    def finalize_many(
-        self, proposed: Iterable[ClaimedEvidenceCommit]
-    ) -> tuple[CommitOutcome, ...]:
-        """Publish artifacts, commit evidence, and retire matching claims.
-
-        Examples:
-            Matching claims finalize terminal evidence atomically:
-
-            >>> outcomes = store.finalize_many((proposed,))
-        """
-
-        items = tuple(proposed)
-        payloads = _validate_claimed_commits(items)
-        stored = {
-            digest: self.artifact_store.put(payload)
-            for digest, payload in payloads.items()
-        }
-        ordered = sorted(items, key=lambda item: _key_sort_value(item.claim.key))
-        outcomes: dict[EvidenceKey, CommitOutcome] = {}
-        with self.engine.connect() as connection:
-            connection.exec_driver_sql("BEGIN IMMEDIATE")
-            try:
-                for item in ordered:
-                    now = datetime.now(UTC)
-                    consumed = connection.execute(
-                        delete(evidence_claims)
-                        .where(_claim_owner_clause(item.claim, now))
-                        .returning(evidence_claims.c.sequence_id)
-                    ).scalar_one_or_none()
-                    if consumed is None:
-                        raise EvidenceClaimLostError(
-                            f"claim ownership was lost: {item.claim.key.sequence_id}"
-                        )
-                for item in ordered:
-                    self._insert_sequence(connection, item.commit.identity)
-                for digest in sorted(stored):
-                    artifact = stored[digest]
-                    self._insert_artifact(connection, artifact)
-                for item in ordered:
-                    outcomes[item.claim.key] = self._insert_evidence(
-                        connection, item.commit
-                    )
-                connection.commit()
-            except Exception:
-                connection.rollback()
-                raise
-        return tuple(outcomes[item.claim.key] for item in items)
 
     def fetch(self, key: EvidenceKey) -> FetchedEvidence | None:
         """Fetch one exact evidence record and verify referenced artifact bytes."""
@@ -790,6 +647,366 @@ class LocalStore:
         )
 
 
+class _LocalClaimSession:
+    """SQLite ClaimSession with one invocation-scoped heartbeat."""
+
+    def __init__(self, store: LocalStore) -> None:
+        self.store = store
+        self.session_id = secrets.token_hex(24)
+        self.owner_token = secrets.token_urlsafe(32)
+        self.generation = 1
+        self.cancellation_signal = threading.Event()
+        self._stop = threading.Event()
+        self._lost: BaseException | None = None
+        self._claims: dict[EvidenceKey, SessionEvidenceClaim] = {}
+        now = datetime.now(UTC)
+        with store.engine.begin() as connection:
+            connection.execute(
+                claim_sessions.insert().values(
+                    session_id=self.session_id,
+                    owner_token=self.owner_token,
+                    generation=self.generation,
+                    state="open",
+                    expires_at=now + timedelta(seconds=_CLAIM_LEASE_SECONDS),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        self._thread = threading.Thread(
+            target=self._heartbeat, name="seqevi-claim-session-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def __enter__(self) -> _LocalClaimSession:
+        return self
+
+    def __exit__(self, *_error: object) -> None:
+        self.close()
+
+    def raise_if_lost(self) -> None:
+        if self._lost is not None:
+            raise EvidenceClaimLostError(
+                "ClaimSession authority was lost"
+            ) from self._lost
+
+    def _heartbeat(self) -> None:
+        while not self._stop.wait(_CLAIM_RENEWAL_SECONDS):
+            deadline = time.monotonic() + 90.0
+            while not self._stop.is_set():
+                try:
+                    now = datetime.now(UTC)
+                    with self.store.engine.begin() as connection:
+                        result = connection.execute(
+                            update(claim_sessions)
+                            .where(
+                                and_(
+                                    claim_sessions.c.session_id == self.session_id,
+                                    claim_sessions.c.owner_token == self.owner_token,
+                                    claim_sessions.c.generation == self.generation,
+                                    claim_sessions.c.state == "open",
+                                    claim_sessions.c.expires_at > now,
+                                )
+                            )
+                            .values(
+                                expires_at=now
+                                + timedelta(seconds=_CLAIM_LEASE_SECONDS),
+                                updated_at=now,
+                            )
+                        )
+                    if result.rowcount != 1:
+                        raise EvidenceClaimLostError("ClaimSession renewal was fenced")
+                    break
+                except BaseException as error:
+                    if time.monotonic() >= deadline:
+                        self._lost = error
+                        self.cancellation_signal.set()
+                        return
+                    self._stop.wait(min(1.0, max(deadline - time.monotonic(), 0.0)))
+
+    def acquire_many(
+        self, requested_queries: Iterable[EvidenceQuery]
+    ) -> tuple[SessionClaimAcquireResult, ...]:
+        self.raise_if_lost()
+        queries = tuple(requested_queries)
+        if len({query.key for query in queries}) != len(queries):
+            raise ValueError("acquire batch contains a duplicate evidence key")
+        results: dict[EvidenceKey, SessionClaimAcquireResult] = {}
+        request_id = uuid4().hex
+        digest = canonical_query_digest(
+            [EvidenceQueryModel.from_domain(query) for query in queries]
+        )
+        now = datetime.now(UTC)
+        with self.store.engine.connect() as connection:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                _require_local_session(connection, self, now)
+                header_count, item_count = connection.execute(
+                    select(
+                        select(func.count())
+                        .select_from(claim_session_acquire_receipts)
+                        .where(
+                            claim_session_acquire_receipts.c.session_id
+                            == self.session_id
+                        )
+                        .scalar_subquery(),
+                        select(func.count())
+                        .select_from(claim_session_acquire_receipt_items)
+                        .where(
+                            claim_session_acquire_receipt_items.c.session_id
+                            == self.session_id
+                        )
+                        .scalar_subquery(),
+                    )
+                ).one()
+                if header_count >= 1000 or item_count + len(queries) > 32000:
+                    raise StoreIntegrityError("claim_receipt_capacity")
+                for query in sorted(
+                    queries, key=lambda item: _key_sort_value(item.key)
+                ):
+                    claim: SessionEvidenceClaim | None = None
+                    self.store._insert_sequence(connection, query.identity)
+                    terminal = (
+                        connection.execute(
+                            select(evidence).where(_evidence_key_clause(query.key))
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if terminal is not None:
+                        results[query.key] = SessionClaimAcquireResult(
+                            ClaimDisposition.CACHED,
+                            record=self.store._record_from_row(terminal),
+                        )
+                        continue
+                    row = (
+                        connection.execute(
+                            select(session_claims).where(
+                                _session_claim_key_clause(query.key)
+                            )
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if row is not None and row["session_id"] == self.session_id:
+                        claim = SessionEvidenceClaim(query.key, row["generation"])
+                    elif row is not None:
+                        owner = (
+                            connection.execute(
+                                select(
+                                    claim_sessions.c.expires_at, claim_sessions.c.state
+                                ).where(
+                                    claim_sessions.c.session_id == row["session_id"]
+                                )
+                            )
+                            .mappings()
+                            .one_or_none()
+                        )
+                        if (
+                            owner is not None
+                            and owner["state"] == "open"
+                            and _as_utc(owner["expires_at"]) > now
+                        ):
+                            results[query.key] = SessionClaimAcquireResult(
+                                ClaimDisposition.BUSY,
+                                busy=BusyEvidenceClaim(
+                                    query.key,
+                                    _as_utc(owner["expires_at"]),
+                                    _CLAIM_RETRY_SECONDS,
+                                ),
+                            )
+                            continue
+                        connection.execute(
+                            delete(session_claims).where(
+                                _session_claim_key_clause(query.key)
+                            )
+                        )
+                        row = None
+                    if row is None:
+                        generation_row = connection.execute(
+                            select(evidence_claim_generations.c.high_water).where(
+                                _generation_key_clause(query.key)
+                            )
+                        ).scalar_one_or_none()
+                        generation = 1 if generation_row is None else generation_row + 1
+                        statement = (
+                            sqlite_insert(evidence_claim_generations)
+                            .values(
+                                **_claim_key_values(query.key), high_water=generation
+                            )
+                            .on_conflict_do_update(
+                                index_elements=list(
+                                    evidence_claim_generations.primary_key.columns
+                                ),
+                                set_={"high_water": generation},
+                            )
+                        )
+                        connection.execute(statement)
+                        connection.execute(
+                            session_claims.insert().values(
+                                **_claim_key_values(query.key),
+                                semantic_parameters_json=query.key.semantic_parameters_json,
+                                session_id=self.session_id,
+                                generation=generation,
+                                created_at=now,
+                            )
+                        )
+                        claim = SessionEvidenceClaim(query.key, generation)
+                    assert claim is not None
+                    self._claims[query.key] = claim
+                    results[query.key] = SessionClaimAcquireResult(
+                        ClaimDisposition.ACQUIRED, claim=claim
+                    )
+                connection.execute(
+                    claim_session_acquire_receipts.insert().values(
+                        session_id=self.session_id,
+                        request_id=request_id,
+                        query_digest=digest,
+                        created_at=now,
+                    )
+                )
+                connection.execute(
+                    claim_session_acquire_receipt_items.insert(),
+                    [
+                        _local_receipt_item(
+                            self.session_id,
+                            request_id,
+                            index,
+                            results[query.key],
+                        )
+                        for index, query in enumerate(queries)
+                    ],
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return tuple(results[query.key] for query in queries)
+
+    def finalize_many(
+        self, proposed: Iterable[EvidenceCommit]
+    ) -> tuple[CommitOutcome, ...]:
+        self.raise_if_lost()
+        commits = tuple(proposed)
+        if len({commit.key for commit in commits}) != len(commits):
+            raise ValueError("finalize batch contains a duplicate evidence key")
+        payloads = {
+            payload.digest: payload
+            for commit in commits
+            for payload in (commit.normalized_artifact, commit.raw_artifact)
+            if payload is not None
+        }
+        stored = {
+            digest: self.store.artifact_store.put(value)
+            for digest, value in payloads.items()
+        }
+        outcomes: dict[EvidenceKey, CommitOutcome] = {}
+        now = datetime.now(UTC)
+        with self.store.engine.connect() as connection:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            try:
+                _require_local_session(connection, self, now)
+                for commit in sorted(
+                    commits, key=lambda item: _key_sort_value(item.key)
+                ):
+                    claim = self._claims.get(commit.key)
+                    if claim is None:
+                        raise EvidenceClaimLostError("no exact claim for finalization")
+                    consumed = connection.execute(
+                        delete(session_claims)
+                        .where(
+                            and_(
+                                _session_claim_key_clause(commit.key),
+                                session_claims.c.session_id == self.session_id,
+                                session_claims.c.generation == claim.generation,
+                            )
+                        )
+                        .returning(session_claims.c.sequence_id)
+                    ).scalar_one_or_none()
+                    if consumed is None:
+                        terminal = (
+                            connection.execute(
+                                select(evidence).where(_evidence_key_clause(commit.key))
+                            )
+                            .mappings()
+                            .one_or_none()
+                        )
+                        if terminal is None:
+                            raise EvidenceClaimLostError("exact claim was fenced")
+                for commit in commits:
+                    self.store._insert_sequence(connection, commit.identity)
+                for digest in sorted(stored):
+                    self.store._insert_artifact(connection, stored[digest])
+                for commit in commits:
+                    outcomes[commit.key] = self.store._insert_evidence(
+                        connection, commit
+                    )
+                    self._claims.pop(commit.key, None)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return tuple(outcomes[commit.key] for commit in commits)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join()
+        now = datetime.now(UTC)
+        with self.store.engine.begin() as connection:
+            connection.execute(
+                update(claim_sessions)
+                .where(
+                    and_(
+                        claim_sessions.c.session_id == self.session_id,
+                        claim_sessions.c.owner_token == self.owner_token,
+                        claim_sessions.c.generation == self.generation,
+                    )
+                )
+                .values(state="closing", expires_at=now, updated_at=now)
+            )
+        self.store._sweeper_wake.set()  # pyright: ignore[reportPrivateUsage]
+
+
+def _require_local_session(
+    connection: Connection, session: _LocalClaimSession, now: datetime
+) -> None:
+    row = (
+        connection.execute(
+            select(claim_sessions).where(
+                claim_sessions.c.session_id == session.session_id
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if (
+        row is None
+        or row["owner_token"] != session.owner_token
+        or row["generation"] != session.generation
+        or row["state"] != "open"
+        or _as_utc(row["expires_at"]) <= now
+    ):
+        raise EvidenceClaimLostError("ClaimSession authority was lost")
+
+
+def _local_receipt_item(
+    session_id: str,
+    request_id: str,
+    input_index: int,
+    result: SessionClaimAcquireResult,
+) -> dict[str, object]:
+    return {
+        "session_id": session_id,
+        "request_id": request_id,
+        "input_index": input_index,
+        "outcome": result.disposition.value,
+        "generation": None if result.claim is None else result.claim.generation,
+        "busy_expires_at": None if result.busy is None else result.busy.expires_at,
+        "evidence_created_at": (
+            None if result.record is None else result.record.created_at
+        ),
+    }
+
+
 def _evidence_key_clause(key: EvidenceKey) -> Any:
     return and_(
         evidence.c.sequence_id == key.sequence_id,
@@ -810,49 +1027,26 @@ def _claim_key_values(key: EvidenceKey) -> dict[str, str]:
     }
 
 
-def _claim_key_clause(key: EvidenceKey) -> Any:
+def _session_claim_key_clause(key: EvidenceKey) -> Any:
     return and_(
-        evidence_claims.c.sequence_id == key.sequence_id,
-        evidence_claims.c.adapter_contract_version == key.adapter_contract_version,
-        evidence_claims.c.tool_runtime_digest == key.tool_runtime_digest,
-        evidence_claims.c.resource_id == key.resource_id,
-        evidence_claims.c.semantic_parameters_hash == key.semantic_parameters_hash,
+        session_claims.c.sequence_id == key.sequence_id,
+        session_claims.c.adapter_contract_version == key.adapter_contract_version,
+        session_claims.c.tool_runtime_digest == key.tool_runtime_digest,
+        session_claims.c.resource_id == key.resource_id,
+        session_claims.c.semantic_parameters_hash == key.semantic_parameters_hash,
     )
 
 
-def _claim_owner_clause(claim: EvidenceClaim, now: datetime) -> Any:
+def _generation_key_clause(key: EvidenceKey) -> Any:
     return and_(
-        _claim_key_clause(claim.key),
-        evidence_claims.c.owner_token == claim.owner_token,
-        evidence_claims.c.generation == claim.generation,
-        evidence_claims.c.expires_at > now,
+        evidence_claim_generations.c.sequence_id == key.sequence_id,
+        evidence_claim_generations.c.adapter_contract_version
+        == key.adapter_contract_version,
+        evidence_claim_generations.c.tool_runtime_digest == key.tool_runtime_digest,
+        evidence_claim_generations.c.resource_id == key.resource_id,
+        evidence_claim_generations.c.semantic_parameters_hash
+        == key.semantic_parameters_hash,
     )
-
-
-def _claim_exact_clause(claim: EvidenceClaim) -> Any:
-    return and_(
-        _claim_key_clause(claim.key),
-        evidence_claims.c.owner_token == claim.owner_token,
-        evidence_claims.c.generation == claim.generation,
-    )
-
-
-def _claim_identity_tuple() -> Any:
-    return tuple_(
-        evidence_claims.c.sequence_id,
-        evidence_claims.c.adapter_contract_version,
-        evidence_claims.c.tool_runtime_digest,
-        evidence_claims.c.resource_id,
-        evidence_claims.c.semantic_parameters_hash,
-        evidence_claims.c.owner_token,
-        evidence_claims.c.generation,
-    )
-
-
-def _claim_identity_values(
-    claim: EvidenceClaim,
-) -> tuple[str, str, str, str, str, str, int]:
-    return (*_key_sort_value(claim.key), claim.owner_token, claim.generation)
 
 
 def _key_sort_value(key: EvidenceKey) -> tuple[str, str, str, str, str]:
@@ -865,42 +1059,8 @@ def _key_sort_value(key: EvidenceKey) -> tuple[str, str, str, str, str]:
     )
 
 
-def _validate_owner_token(owner_token: str) -> None:
-    if not owner_token or len(owner_token) > 255:
-        raise ValueError("owner_token must contain 1 to 255 characters")
-
-
 def _as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-
-
-def _acquired_result(
-    key: EvidenceKey, owner_token: str, generation: int, expiry: datetime
-) -> ClaimAcquireResult:
-    return ClaimAcquireResult(
-        ClaimDisposition.ACQUIRED,
-        claim=EvidenceClaim(
-            key, owner_token, generation, expiry, _CLAIM_RENEWAL_SECONDS
-        ),
-    )
-
-
-def _validate_claimed_commits(
-    items: tuple[ClaimedEvidenceCommit, ...],
-) -> dict[str, ArtifactFile]:
-    if len({item.commit.key for item in items}) != len(items):
-        raise ValueError("finalize batch contains a duplicate evidence key")
-    payloads: dict[str, ArtifactFile] = {}
-    for item in items:
-        for payload in (item.commit.normalized_artifact, item.commit.raw_artifact):
-            if payload is None:
-                continue
-            existing = payloads.setdefault(payload.digest, payload)
-            if _artifact_identity(existing) != _artifact_identity(payload):
-                raise StoreIntegrityError(
-                    f"artifact digest has conflicting payload metadata: {payload.digest}"
-                )
-    return payloads
 
 
 def _artifact_identity(artifact: ArtifactFile) -> tuple[str, str, int]:
