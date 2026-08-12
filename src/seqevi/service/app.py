@@ -32,6 +32,8 @@ from seqevi.store.transport import (
     BusyEvidenceClaimModel,
     ClaimSessionAcquireRequest,
     ClaimSessionAcquireResponse,
+    ClaimSessionAuthorityCheckRequest,
+    ClaimSessionAuthorityCheckResponse,
     ClaimSessionAcquireResultModel,
     ClaimSessionCapabilitiesResponse,
     ClaimSessionCloseRequest,
@@ -305,6 +307,20 @@ def create_service_app(
                 )
                 for result in results
             ]
+        )
+
+    @app.post(
+        "/v1/internal/claim-sessions/authority",
+        response_model=ClaimSessionAuthorityCheckResponse,
+    )
+    def claim_session_authority(
+        request: ClaimSessionAuthorityCheckRequest,
+    ) -> ClaimSessionAuthorityCheckResponse:
+        return ClaimSessionAuthorityCheckResponse(
+            live=database.claim_session_authority_is_live(
+                _request_authority(request),
+                (claim.to_domain() for claim in request.claims),
+            )
         )
 
     @app.post(

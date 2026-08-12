@@ -349,6 +349,14 @@ class ClaimSessionAcquireResponse(TransportModel):
     results: list[ClaimSessionAcquireResultModel]
 
 
+class ClaimSessionAuthorityCheckRequest(ClaimSessionAuthorityModel):
+    claims: list[SessionEvidenceClaimModel]
+
+
+class ClaimSessionAuthorityCheckResponse(TransportModel):
+    live: bool
+
+
 class ClaimSessionFinalizeItem(TransportModel):
     commit: CommitModel
     claim_generation: Annotated[int, Field(ge=1, strict=True)]

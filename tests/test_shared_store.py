@@ -483,6 +483,7 @@ def test_service_openapi_preserves_legacy_and_adds_claim_operations(
         "/v1/internal/claim-sessions/open",
         "/v1/internal/claim-sessions/renew",
         "/v1/internal/claim-sessions/acquire",
+        "/v1/internal/claim-sessions/authority",
         "/v1/internal/claim-sessions/finalize",
         "/v1/internal/claim-sessions/close",
     }
@@ -595,6 +596,159 @@ def test_http_receipt_capacity_restarts_acquire_with_new_request_id() -> None:
         session.close()
     assert len(acquire_ids) == 2
     assert acquire_ids[0] != acquire_ids[1]
+
+
+@pytest.mark.parametrize("first_results", [None, []])
+def test_http_acquire_replays_malformed_success_with_same_request_id(
+    first_results: list[object] | None,
+) -> None:
+    identity, key = _key("MAMBIGUOUSACQUIRE")
+    query = EvidenceQuery(identity, key)
+    acquire_ids: list[str] = []
+    now = datetime.now(UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            acquire_ids.append(json.loads(request.content)["acquire_request_id"])
+            if len(acquire_ids) == 1:
+                return httpx.Response(
+                    200,
+                    json={} if first_results is None else {"results": first_results},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            assert (
+                session.acquire_many((query,))[0].disposition
+                is ClaimDisposition.ACQUIRED
+            )
+    assert len(acquire_ids) == 2
+    assert acquire_ids[0] == acquire_ids[1]
+
+
+def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> None:
+    commit = _hit_commit(tmp_path / "source", "MDETERMINISTICFINALIZE")
+    now = datetime.now(UTC)
+    lookup_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal lookup_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": CommitModel.from_domain(commit).key.model_dump(
+                                    mode="json"
+                                ),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            return httpx.Response(422, text="invalid commit")
+        if request.url.path.endswith("/lookup"):
+            lookup_calls += 1
+            return httpx.Response(200, json={"records": []})
+        if request.method == "PUT":
+            return httpx.Response(
+                201,
+                json={
+                    "status": "created",
+                    "digest": request.url.path.rsplit("/", 1)[-1],
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            session.acquire_many((EvidenceQuery(commit.identity, commit.key),))
+            store._uploaded_artifact_digests.update(
+                payload.digest
+                for payload in (commit.normalized_artifact, commit.raw_artifact)
+                if payload is not None
+            )
+            with pytest.raises(StoreError, match="HTTP 422"):
+                session.finalize_many((commit,))
+    assert lookup_calls == 0
 
 
 def test_http_heartbeat_renews_before_request_deadline() -> None:
@@ -1606,6 +1760,35 @@ def test_postgres_receipt_capacity_is_pre_mutation(tmp_path: Path) -> None:
                 ).scalar_one()
                 == 0
             )
+        persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_exact_session_and_claim_authority_readback() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-authority-readback",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        identity, key = _key("MAUTHORITYREADBACK")
+        query = EvidenceQuery(identity, key)
+        acquired = persistence.acquire_claim_session(
+            authority,
+            acquire_request_id="acquire-authority-readback",
+            query_digest=canonical_query_digest(
+                [EvidenceQueryModel.from_domain(query)]
+            ),
+            queries=(query,),
+        )[0]
+        assert acquired.claim is not None
+        assert persistence.claim_session_authority_is_live(authority, (acquired.claim,))
+        persistence.close_claim_session(authority)
+        assert not persistence.claim_session_authority_is_live(
+            authority, (acquired.claim,)
+        )
         persistence.close()
 
 

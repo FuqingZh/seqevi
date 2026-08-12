@@ -716,6 +716,10 @@ class _LocalClaimSession:
                     if result.rowcount != 1:
                         raise EvidenceClaimLostError("ClaimSession renewal was fenced")
                     break
+                except EvidenceClaimLostError as error:
+                    self._lost = error
+                    self.cancellation_signal.set()
+                    return
                 except BaseException as error:
                     if time.monotonic() >= deadline:
                         self._lost = error
@@ -845,12 +849,19 @@ class _LocalClaimSession:
         commits = tuple(proposed)
         if len({commit.key for commit in commits}) != len(commits):
             raise ValueError("finalize batch contains a duplicate evidence key")
-        payloads = {
-            payload.digest: payload
-            for commit in commits
-            for payload in (commit.normalized_artifact, commit.raw_artifact)
-            if payload is not None
-        }
+        payloads: dict[str, ArtifactFile] = {}
+        for commit in commits:
+            for payload in (commit.normalized_artifact, commit.raw_artifact):
+                if payload is None:
+                    continue
+                existing = payloads.setdefault(payload.digest, payload)
+                if (
+                    existing.media_type != payload.media_type
+                    or existing.byte_size != payload.byte_size
+                ):
+                    raise StoreIntegrityError(
+                        f"artifact metadata conflict: {payload.digest}"
+                    )
         stored = {
             digest: self.store.artifact_store.put(value)
             for digest, value in payloads.items()
@@ -896,11 +907,12 @@ class _LocalClaimSession:
                     outcomes[commit.key] = self.store._insert_evidence(
                         connection, commit
                     )
-                    self._claims.pop(commit.key, None)
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
+        for commit in commits:
+            self._claims.pop(commit.key, None)
         return tuple(outcomes[commit.key] for commit in commits)
 
     def close(self) -> None:

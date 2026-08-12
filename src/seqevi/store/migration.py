@@ -20,6 +20,14 @@ _POSTGRES_MIGRATION_LOCK_ID = 0x534551455649
 _MAINTENANCE_TIMEOUT_SECONDS = 60.0
 _CURRENT_REVISION = "0004_claim_sessions"
 _AUTOMATIC_EXISTING_CEILING = "0003_evidence_claim_leases"
+_CLAIM_SESSION_TABLES = {
+    "claim_sessions",
+    "session_claims",
+    "evidence_claim_generations",
+    "claim_session_open_receipts",
+    "claim_session_acquire_receipts",
+    "claim_session_acquire_receipt_items",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,8 +166,13 @@ def maintenance_upgrade_database(
                 _run_maintenance_upgrade(connection, acknowledgement, deadline)
             finally:
                 raw.set_progress_handler(None, 0)
+        _verify_maintenance_completion(engine, _CURRENT_REVISION)
         return
-    _maintenance_upgrade_postgres(engine, acknowledgement, deadline)
+    try:
+        _maintenance_upgrade_postgres(engine, acknowledgement, deadline)
+    except DBAPIError as error:
+        _classify_ambiguous_maintenance(engine, _CURRENT_REVISION, error)
+    _verify_maintenance_completion(engine, _CURRENT_REVISION)
 
 
 def maintenance_downgrade_database(
@@ -188,8 +201,50 @@ def maintenance_downgrade_database(
                 _run_maintenance_downgrade(connection, acknowledgement, deadline)
             finally:
                 raw.set_progress_handler(None, 0)
+        _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING)
         return
-    _maintenance_upgrade_postgres(engine, acknowledgement, deadline, downgrade=True)
+    try:
+        _maintenance_upgrade_postgres(engine, acknowledgement, deadline, downgrade=True)
+    except DBAPIError as error:
+        _classify_ambiguous_maintenance(engine, _AUTOMATIC_EXISTING_CEILING, error)
+    _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING)
+
+
+def _maintenance_state(engine: Engine) -> tuple[str | None, set[str]]:
+    with engine.connect() as connection:
+        return _revision(connection), set(inspect(connection).get_table_names())
+
+
+def _state_matches_target(revision: str | None, tables: set[str], target: str) -> bool:
+    if revision != target:
+        return False
+    if target == _CURRENT_REVISION:
+        return _CLAIM_SESSION_TABLES <= tables and "evidence_claim" not in tables
+    return "evidence_claim" in tables and not (_CLAIM_SESSION_TABLES & tables)
+
+
+def _verify_maintenance_completion(engine: Engine, target: str) -> None:
+    revision, tables = _maintenance_state(engine)
+    if not _state_matches_target(revision, tables, target):
+        raise RuntimeError("maintenance completion readback found mixed schema state")
+
+
+def _classify_ambiguous_maintenance(
+    engine: Engine, target: str, error: BaseException
+) -> None:
+    revision, tables = _maintenance_state(engine)
+    if _state_matches_target(revision, tables, target):
+        return
+    source = (
+        _AUTOMATIC_EXISTING_CEILING
+        if target == _CURRENT_REVISION
+        else _CURRENT_REVISION
+    )
+    if _state_matches_target(revision, tables, source):
+        raise RuntimeError(
+            "maintenance commit did not change the acknowledged source schema"
+        ) from error
+    raise RuntimeError("maintenance commit outcome left mixed schema state") from error
 
 
 @contextmanager
@@ -290,10 +345,10 @@ def _maintenance_upgrade_postgres(
                         f"SET LOCAL lock_timeout = '{lock_ms}ms'"
                     )
                     lock_tables = (
-                        "LOCK TABLE sequence, claim_sessions, session_claims, "
-                        "evidence_claim_generations, claim_session_open_receipts, "
-                        "claim_session_acquire_receipts, "
-                        "claim_session_acquire_receipt_items, artifact, evidence "
+                        "LOCK TABLE claim_session_open_receipts, claim_sessions, "
+                        "evidence_claim_generations, session_claims, "
+                        "claim_session_acquire_receipt_items, "
+                        "claim_session_acquire_receipts, sequence, artifact, evidence "
                         if downgrade
                         else "LOCK TABLE sequence, evidence_claim, artifact, evidence "
                     )

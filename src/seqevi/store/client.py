@@ -47,6 +47,8 @@ from .transport import (
     CommitResponse,
     ClaimSessionAcquireRequest,
     ClaimSessionAcquireResponse,
+    ClaimSessionAuthorityCheckRequest,
+    ClaimSessionAuthorityCheckResponse,
     ClaimSessionCapabilitiesResponse,
     ClaimSessionCloseRequest,
     ClaimSessionFinalizeItem,
@@ -63,8 +65,16 @@ from .transport import (
     HealthResponse,
     LookupRequest,
     LookupResponse,
+    SessionEvidenceClaimModel,
     canonical_query_digest,
 )
+
+
+class _StoreResponseError(StoreError):
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(f"shared Store returned HTTP {status_code}: {detail}")
+        self.status_code = status_code
+
 
 _CLAIM_RUNWAY_SECONDS = 5.0
 _HANDOFF_SCHEDULING_SECONDS = 1.0
@@ -473,6 +483,7 @@ class _HttpClaimSession:
             models = [EvidenceQueryModel.from_domain(query) for query in chunk]
             while True:
                 started = time.monotonic()
+                deadline = min(started + 30.0, self._renew_deadline)
                 request = ClaimSessionAcquireRequest.model_validate(
                     {
                         **self._authority_request(),
@@ -481,25 +492,40 @@ class _HttpClaimSession:
                         "queries": [model.model_dump(mode="json") for model in models],
                     }
                 )
-                try:
-                    response = self._request_until(
-                        "POST",
-                        "/v1/internal/claim-sessions/acquire",
-                        deadline=min(started + 30.0, self._renew_deadline),
-                        json=request.model_dump(mode="json"),
-                    )
-                    break
-                except ClaimReceiptCapacityError:
-                    delay = min(1.0, self._renew_deadline - time.monotonic())
-                    if delay <= 0 or self._stop.wait(delay):
-                        raise EvidenceClaimLostError(
-                            "ClaimSession authority runway expired during receipt admission"
+                payload: ClaimSessionAcquireResponse | None = None
+                while True:
+                    try:
+                        response = self._request_until(
+                            "POST",
+                            "/v1/internal/claim-sessions/acquire",
+                            deadline=deadline,
+                            json=request.model_dump(mode="json"),
                         )
-            payload = ClaimSessionAcquireResponse.model_validate(response.json())
-            if len(payload.results) != len(chunk):
-                raise StoreIntegrityError(
-                    "shared Store returned incomplete acquire results"
-                )
+                        payload = ClaimSessionAcquireResponse.model_validate(
+                            response.json()
+                        )
+                        if len(payload.results) != len(chunk):
+                            raise StoreIntegrityError(
+                                "shared Store returned incomplete acquire results"
+                            )
+                        break
+                    except ClaimReceiptCapacityError:
+                        delay = min(1.0, self._renew_deadline - time.monotonic())
+                        if delay <= 0 or self._stop.wait(delay):
+                            raise EvidenceClaimLostError(
+                                "ClaimSession authority runway expired during receipt admission"
+                            )
+                        break
+                    except (ValueError, StoreIntegrityError):
+                        if time.monotonic() >= deadline:
+                            raise
+                        if self._stop.wait(min(0.25, deadline - time.monotonic())):
+                            raise StoreError(
+                                "ClaimSession closed during acquire recovery"
+                            )
+                        continue
+                if payload is not None:
+                    break
             for query, model in zip(chunk, payload.results, strict=True):
                 record = None if model.record is None else model.record.to_domain()
                 claim = None if model.claim is None else model.claim.to_domain()
@@ -591,6 +617,8 @@ class _HttpClaimSession:
                 )
                 break
             except (StoreError, ValueError) as error:
+                if isinstance(error, _StoreResponseError) and error.status_code < 500:
+                    raise
                 found = self.store.lookup_many(
                     EvidenceQuery(commit.identity, commit.key) for commit, _ in pending
                 )
@@ -608,6 +636,29 @@ class _HttpClaimSession:
                     self._claims.pop(commit.key, None)
                 if not remaining:
                     break
+                authority_check = ClaimSessionAuthorityCheckRequest.model_validate(
+                    {
+                        **self._authority_request(),
+                        "claims": [
+                            SessionEvidenceClaimModel.from_domain(
+                                self._claims[commit.key]
+                            ).model_dump(mode="json")
+                            for commit, _item in remaining
+                        ],
+                    }
+                )
+                authority_response = self._request_until(
+                    "POST",
+                    "/v1/internal/claim-sessions/authority",
+                    deadline=deadline,
+                    json=authority_check.model_dump(mode="json"),
+                )
+                if not ClaimSessionAuthorityCheckResponse.model_validate(
+                    authority_response.json()
+                ).live:
+                    raise EvidenceClaimLostError(
+                        "exact ClaimSession finalization authority was lost"
+                    ) from error
                 if time.monotonic() >= deadline:
                     raise
                 if len(remaining) == len(pending):
@@ -713,7 +764,7 @@ def _raise_for_store_status(
     detail = response.text if include_body else response.reason_phrase
     if response.status_code == 409:
         raise EvidenceConflictError(detail)
-    raise StoreError(f"shared Store returned HTTP {response.status_code}: {detail}")
+    raise _StoreResponseError(response.status_code, detail)
 
 
 def _artifact_identity(artifact: ArtifactFile) -> tuple[str, str, int]:

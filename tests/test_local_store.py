@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select, text
 
 from seqevi.errors import (
+    EvidenceClaimLostError,
     EvidenceConflictError,
     StoreConfigurationError,
     StoreIntegrityError,
@@ -23,7 +25,8 @@ from seqevi.evidence import (
 )
 from seqevi.sequence import SequenceIdentity, identify_protein_sequence
 from seqevi.store import LocalStore, resolve_store_path
-from seqevi.store.schema import claim_session_acquire_receipts
+from seqevi.store.schema import claim_session_acquire_receipts, claim_sessions
+from seqevi.store import local as local_module
 
 from .support import write_artifact_file
 
@@ -108,6 +111,78 @@ def test_local_claim_session_does_not_retain_transport_receipts(tmp_path: Path) 
                 select(func.count()).select_from(claim_session_acquire_receipts)
             ).scalar_one()
     assert count == 0
+
+
+def test_local_claim_finalize_rejects_conflicting_artifact_metadata(
+    tmp_path: Path,
+) -> None:
+    first = make_hit_commit("MLOCALMETAONE", artifact_dir=tmp_path / "sources")
+    second = make_hit_commit("MLOCALMETATWO", artifact_dir=tmp_path / "sources")
+    assert first.normalized_artifact is not None
+    assert second.normalized_artifact is not None
+    conflicting = replace(
+        second,
+        normalized_artifact=replace(
+            first.normalized_artifact, media_type="application/conflicting"
+        ),
+    )
+    with LocalStore.open(tmp_path / "store") as store:
+        with store.claim_session() as session:
+            session.acquire_many(
+                (
+                    EvidenceQuery(first.identity, first.key),
+                    EvidenceQuery(conflicting.identity, conflicting.key),
+                )
+            )
+            with pytest.raises(StoreIntegrityError, match="artifact metadata conflict"):
+                session.finalize_many((first, conflicting))
+
+
+def test_local_claim_handles_survive_rolled_back_finalize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = make_hit_commit("MLOCALROLLBACKONE", artifact_dir=tmp_path / "sources")
+    second = make_hit_commit("MLOCALROLLBACKTWO", artifact_dir=tmp_path / "sources")
+    with LocalStore.open(tmp_path / "store") as store:
+        with store.claim_session() as session:
+            session.acquire_many(
+                (
+                    EvidenceQuery(first.identity, first.key),
+                    EvidenceQuery(second.identity, second.key),
+                )
+            )
+            original = store._insert_evidence
+            calls = 0
+
+            def fail_second(connection, commit):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise StoreIntegrityError("injected finalize failure")
+                return original(connection, commit)
+
+            monkeypatch.setattr(store, "_insert_evidence", fail_second)
+            with pytest.raises(StoreIntegrityError, match="injected"):
+                session.finalize_many((first, second))
+            monkeypatch.setattr(store, "_insert_evidence", original)
+            assert session.finalize_many((first, second)) == (
+                CommitOutcome.CREATED,
+                CommitOutcome.CREATED,
+            )
+
+
+def test_local_terminal_renewal_marks_session_lost_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(local_module, "_CLAIM_RENEWAL_SECONDS", 0.01)
+    with LocalStore.open(tmp_path / "store") as store:
+        session = store.claim_session()
+        with store.engine.begin() as connection:
+            connection.execute(claim_sessions.update().values(state="closing"))
+        assert session.cancellation_signal.wait(1.0)
+        with pytest.raises(EvidenceClaimLostError):
+            session.raise_if_lost()
+        session.close()
 
 
 def test_commit_lookup_and_fetch_hit_evidence(tmp_path: Path) -> None:

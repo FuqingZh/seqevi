@@ -138,6 +138,12 @@ class ServicePersistence(Protocol):
         stored_artifacts: dict[str, StoredArtifact],
     ) -> tuple[CommitOutcome, ...]: ...
 
+    def claim_session_authority_is_live(
+        self,
+        authority: ClaimSessionAuthority,
+        claims: Iterable[SessionEvidenceClaim],
+    ) -> bool: ...
+
     def sweep_claim_sessions(self) -> int: ...
 
     def close(self) -> None: ...
@@ -400,6 +406,35 @@ class PostgresEvidencePersistence:
             )
             if closed.rowcount != 1:
                 raise EvidenceClaimLostError("ClaimSession authority was lost")
+
+    def claim_session_authority_is_live(
+        self,
+        authority: ClaimSessionAuthority,
+        claims: Iterable[SessionEvidenceClaim],
+    ) -> bool:
+        requested = tuple(claims)
+        with self._transaction() as connection:
+            now = _database_now(connection)
+            session_live = connection.execute(
+                select(func.count())
+                .select_from(claim_sessions)
+                .where(_session_authority_clause(authority, now))
+            ).scalar_one()
+            if session_live != 1:
+                return False
+            if not requested:
+                return True
+            expected = {
+                (*_key_sort_value(claim.key), claim.generation) for claim in requested
+            }
+            rows = connection.execute(
+                select(
+                    *(session_claims.c[name] for name in _CLAIM_KEY_NAMES),
+                    session_claims.c.generation,
+                ).where(session_claims.c.session_id == authority.session_id)
+            ).all()
+            actual = {tuple(row) for row in rows}
+            return expected <= actual
 
     def sweep_claim_sessions(self) -> int:
         """Reclaim at most one fixed-width chunk of each coordination row type."""
