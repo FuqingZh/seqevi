@@ -2095,6 +2095,109 @@ def test_postgres_maintenance_upgrade_arms_syncs_resets_and_preserves_rows() -> 
 
 
 @pytest.mark.requires_postgres
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+def test_postgres_maintenance_classifies_commit_after_operation_deadline(
+    monkeypatch: pytest.MonkeyPatch, direction: str
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        source_revision = (
+            "0003_evidence_claim_leases"
+            if direction == "upgrade"
+            else "0004_claim_sessions"
+        )
+        target_revision = (
+            "0004_claim_sessions"
+            if direction == "upgrade"
+            else "0003_evidence_claim_leases"
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, source_revision)
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision=source_revision,
+        )
+        run_name = f"_run_maintenance_{direction}"
+        original = getattr(store_migration, run_name)
+
+        def committed_late(*args, **kwargs):
+            original(*args, **kwargs)
+            time.sleep(1.05)
+            raise store_migration._AmbiguousMaintenanceCommit(  # pyright: ignore[reportPrivateUsage]
+                "commit returned after operation deadline"
+            )
+
+        monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 1.0)
+        monkeypatch.setattr(
+            store_migration, "_MAINTENANCE_READBACK_TIMEOUT_SECONDS", 1.0
+        )
+        monkeypatch.setattr(store_migration, run_name, committed_late)
+        if direction == "upgrade":
+            store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        else:
+            store_migration.maintenance_downgrade_database(
+                engine, None, acknowledgement
+            )
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == target_revision
+            )
+        engine.dispose()
+
+
+def test_sqlite_maintenance_classifies_commit_after_operation_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    engine = create_engine(f"sqlite+pysqlite:///{store_root / 'store.sqlite3'}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0003_evidence_claim_leases")
+        connection.commit()
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+        expected_revision="0003_evidence_claim_leases",
+    )
+    original = store_migration._run_maintenance_upgrade  # pyright: ignore[reportPrivateUsage]
+
+    def committed_late(*args, **kwargs):
+        original(*args, **kwargs)
+        time.sleep(0.25)
+        raise store_migration._AmbiguousMaintenanceCommit(  # pyright: ignore[reportPrivateUsage]
+            "commit returned after operation deadline"
+        )
+
+    monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(store_migration, "_MAINTENANCE_READBACK_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(store_migration, "_run_maintenance_upgrade", committed_late)
+    store_migration.maintenance_upgrade_database(engine, store_root, acknowledgement)
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            == "0004_claim_sessions"
+        )
+    engine.dispose()
+
+
+@pytest.mark.requires_postgres
 def test_postgres_fenced_downgrade_recreates_empty_0003_coordination() -> None:
     with _isolated_postgres_url() as database_url:
         engine = create_engine(database_url)

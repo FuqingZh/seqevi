@@ -19,6 +19,7 @@ from sqlalchemy.exc import DBAPIError
 
 _POSTGRES_MIGRATION_LOCK_ID = 0x534551455649
 _MAINTENANCE_TIMEOUT_SECONDS = 60.0
+_MAINTENANCE_READBACK_TIMEOUT_SECONDS = 60.0
 _CURRENT_REVISION = "0004_claim_sessions"
 _AUTOMATIC_EXISTING_CEILING = "0003_evidence_claim_leases"
 _CLAIM_SESSION_TABLES = {
@@ -216,14 +217,20 @@ def maintenance_upgrade_database(
                 finally:
                     raw.set_progress_handler(None, 0)
         except _AmbiguousMaintenanceCommit as error:
-            _classify_ambiguous_maintenance(engine, _CURRENT_REVISION, deadline, error)
-        _verify_maintenance_completion(engine, _CURRENT_REVISION, deadline)
+            _classify_ambiguous_maintenance(
+                engine, _CURRENT_REVISION, _readback_deadline(), error
+            )
+            return
+        _verify_maintenance_completion(engine, _CURRENT_REVISION, _readback_deadline())
         return
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline)
     except _AmbiguousMaintenanceCommit as error:
-        _classify_ambiguous_maintenance(engine, _CURRENT_REVISION, deadline, error)
-    _verify_maintenance_completion(engine, _CURRENT_REVISION, deadline)
+        _classify_ambiguous_maintenance(
+            engine, _CURRENT_REVISION, _readback_deadline(), error
+        )
+        return
+    _verify_maintenance_completion(engine, _CURRENT_REVISION, _readback_deadline())
 
 
 def maintenance_downgrade_database(
@@ -258,17 +265,33 @@ def maintenance_downgrade_database(
                     raw.set_progress_handler(None, 0)
         except _AmbiguousMaintenanceCommit as error:
             _classify_ambiguous_maintenance(
-                engine, _AUTOMATIC_EXISTING_CEILING, deadline, error
+                engine,
+                _AUTOMATIC_EXISTING_CEILING,
+                _readback_deadline(),
+                error,
             )
-        _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING, deadline)
+            return
+        _verify_maintenance_completion(
+            engine, _AUTOMATIC_EXISTING_CEILING, _readback_deadline()
+        )
         return
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline, downgrade=True)
     except _AmbiguousMaintenanceCommit as error:
         _classify_ambiguous_maintenance(
-            engine, _AUTOMATIC_EXISTING_CEILING, deadline, error
+            engine,
+            _AUTOMATIC_EXISTING_CEILING,
+            _readback_deadline(),
+            error,
         )
-    _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING, deadline)
+        return
+    _verify_maintenance_completion(
+        engine, _AUTOMATIC_EXISTING_CEILING, _readback_deadline()
+    )
+
+
+def _readback_deadline() -> float:
+    return time.monotonic() + _MAINTENANCE_READBACK_TIMEOUT_SECONDS
 
 
 def _maintenance_state(engine: Engine, deadline: float) -> tuple[str | None, set[str]]:
