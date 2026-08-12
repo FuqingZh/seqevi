@@ -483,26 +483,15 @@ class _HttpClaimSession:
                 renew_json = ClaimSessionRenewRequest.model_validate(
                     authority_request
                 ).model_dump(mode="json")
-                while True:
-                    response = self._request_until(
-                        "POST",
-                        "/v1/internal/claim-sessions/renew",
-                        deadline=renew_deadline,
-                        json=renew_json,
-                    )
-                    try:
-                        renewed = ClaimSessionRenewResponse.model_validate(
-                            response.json()
-                        ).to_domain()
-                        break
-                    except (ValueError, StoreIntegrityError):
-                        remaining = renew_deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise
-                        if self._stop.wait(min(0.25, remaining)):
-                            raise StoreError(
-                                "ClaimSession closed during renewal recovery"
-                            )
+                response = self._request_until(
+                    "POST",
+                    "/v1/internal/claim-sessions/renew",
+                    deadline=renew_deadline,
+                    json=renew_json,
+                )
+                renewed = ClaimSessionRenewResponse.model_validate(
+                    response.json()
+                ).to_domain()
                 with self._lock:
                     self._authority = renewed
                     self._renew_deadline = self._authority_deadline(renewed, started)
@@ -616,6 +605,8 @@ class _HttpClaimSession:
     ) -> tuple[CommitOutcome, ...]:
         self.raise_if_lost()
         commits = tuple(proposed)
+        if len({commit.key for commit in commits}) != len(commits):
+            raise ValueError("finalize batch contains a duplicate evidence key")
         if not commits:
             return ()
         maximum = min(

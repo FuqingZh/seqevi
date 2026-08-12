@@ -658,6 +658,59 @@ def test_http_empty_finalize_is_a_noop() -> None:
     assert finalize_calls == 0
 
 
+def test_http_finalize_rejects_logical_duplicate_before_chunk_or_upload(
+    tmp_path: Path,
+) -> None:
+    commit = _hit_commit(tmp_path / "source", "MDUPLICATEFINALIZE")
+    now = datetime.now(UTC)
+    artifact_calls = 0
+    finalize_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal artifact_calls, finalize_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(maximum_batch_size=1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.startswith("/v1/artifacts/"):
+            artifact_calls += 1
+        if request.url.path.endswith("/finalize"):
+            finalize_calls += 1
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            with pytest.raises(ValueError, match="duplicate evidence key"):
+                session.finalize_many((commit, commit))
+
+    assert artifact_calls == 0
+    assert finalize_calls == 0
+
+
 def test_claim_session_capability_clock_backpressure_is_retryable(
     tmp_path: Path,
 ) -> None:
@@ -1239,8 +1292,8 @@ def test_http_heartbeat_renews_before_request_deadline() -> None:
         session.close()
 
 
-def test_http_heartbeat_replays_malformed_success_with_same_authority() -> None:
-    renewed = threading.Event()
+def test_http_heartbeat_malformed_success_is_terminal_session_loss() -> None:
+    malformed = threading.Event()
     now = datetime.now(UTC)
     renewal_payloads: list[dict[str, object]] = []
 
@@ -1273,33 +1326,21 @@ def test_http_heartbeat_replays_malformed_success_with_same_authority() -> None:
             )
         if request.url.path.endswith("/renew"):
             renewal_payloads.append(json.loads(request.content))
-            if len(renewal_payloads) == 1:
-                return httpx.Response(200, json={})
-            renewed.set()
-            return httpx.Response(
-                200,
-                json={
-                    "session_id": "session",
-                    "owner_token": "owner",
-                    "generation": 1,
-                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
-                    "remaining_lease_seconds": 120,
-                    "heartbeat_after_seconds": 30,
-                    "renew_deadline_seconds": 90,
-                },
-            )
+            malformed.set()
+            return httpx.Response(200, json={})
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
         "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
     ) as store:
         session = store.claim_session()
-        assert renewed.wait(1.5)
-        session.raise_if_lost()
+        assert malformed.wait(1.5)
+        assert session.cancellation_signal.wait(0.5)
+        with pytest.raises(EvidenceClaimLostError):
+            session.raise_if_lost()
         session.close()
 
-    assert len(renewal_payloads) == 2
-    assert renewal_payloads[0] == renewal_payloads[1]
+    assert len(renewal_payloads) == 1
 
 
 def test_http_heartbeat_applies_deterministic_session_jitter(
