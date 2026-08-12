@@ -970,19 +970,22 @@ def test_http_acquire_rejects_duplicate_keys_before_logical_batch_chunking() -> 
     "first_outcome", ["transport", "503", "412", "transport-then-412"]
 )
 @pytest.mark.parametrize("first_lookup", ["503", "malformed"])
+@pytest.mark.parametrize("first_authority", ["valid", "malformed"])
 def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
     tmp_path: Path,
     first_outcome: str,
     first_lookup: str,
+    first_authority: str,
 ) -> None:
     commit = _hit_commit(tmp_path / "source", "MUNKNOWNTHENSUCCESS")
     query = EvidenceQuery(commit.identity, commit.key)
     now = datetime.now(UTC)
     finalize_calls = 0
     lookup_calls = 0
+    authority_calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal finalize_calls, lookup_calls
+        nonlocal finalize_calls, lookup_calls, authority_calls
         if request.url.path == "/health":
             return httpx.Response(200, json=_claim_health())
         if request.url.path.endswith("/capabilities"):
@@ -1038,6 +1041,9 @@ def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
                 return httpx.Response(412, text="authority uncertain")
             return httpx.Response(200, json={"outcomes": ["created"]})
         if request.url.path.endswith("/authority"):
+            authority_calls += 1
+            if first_authority == "malformed" and authority_calls == 1:
+                return httpx.Response(200, json={})
             return httpx.Response(200, json={"live": True})
         if request.url.path.endswith("/lookup"):
             lookup_calls += 1
@@ -1079,10 +1085,13 @@ def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
             assert session.finalize_many((commit,)) == (CommitOutcome.EXISTING,)
     assert finalize_calls == 2
     assert lookup_calls == 3
+    assert authority_calls == (2 if first_authority == "malformed" else 1)
 
 
+@pytest.mark.parametrize("stalled_stage", ["lookup", "authority"])
 def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
     tmp_path: Path,
+    stalled_stage: str,
 ) -> None:
     commit = _hit_commit(tmp_path / "source", "MSTALLEDREADBACK")
     query = EvidenceQuery(commit.identity, commit.key)
@@ -1137,7 +1146,12 @@ def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
             return httpx.Response(503, text="unknown")
         if request.url.path.endswith("/lookup"):
             lookup_timeouts.append(request.extensions["timeout"]["read"])
-            raise httpx.ReadTimeout("stalled")
+            if stalled_stage == "lookup":
+                raise httpx.ReadTimeout("stalled")
+            return httpx.Response(200, json={"records": []})
+        if request.url.path.endswith("/authority"):
+            lookup_timeouts.append(request.extensions["timeout"]["read"])
+            return httpx.Response(200, json={})
         return httpx.Response(200, json={"live": True})
 
     with HttpEvidenceStore(
@@ -2524,6 +2538,44 @@ def test_postgres_maintenance_deadline_covers_advisory_lock_round_trip(
                 ).scalar_one()
                 == "0003_evidence_claim_leases"
             )
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_completion_readback_uses_fresh_bounded_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0004_claim_sessions")
+            connection.commit()
+
+        revision, tables = store_migration._maintenance_state(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        )
+        assert revision == "0004_claim_sessions"
+        assert "claim_sessions" in tables
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def delay_revision_readback(
+            _connection, _cursor, statement, _parameters, _context, _executemany
+        ) -> None:
+            if "SELECT version_num FROM alembic_version" in statement:
+                time.sleep(0.15)
+
+        started = time.monotonic()
+        with pytest.raises((TimeoutError, DBAPIError)):
+            store_migration._maintenance_state(  # pyright: ignore[reportPrivateUsage]
+                engine, time.monotonic() + 0.05
+            )
+        assert time.monotonic() - started < 0.5
         engine.dispose()
 
 

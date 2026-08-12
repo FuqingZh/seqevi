@@ -216,14 +216,14 @@ def maintenance_upgrade_database(
                 finally:
                     raw.set_progress_handler(None, 0)
         except _AmbiguousMaintenanceCommit as error:
-            _classify_ambiguous_maintenance(engine, _CURRENT_REVISION, error)
-        _verify_maintenance_completion(engine, _CURRENT_REVISION)
+            _classify_ambiguous_maintenance(engine, _CURRENT_REVISION, deadline, error)
+        _verify_maintenance_completion(engine, _CURRENT_REVISION, deadline)
         return
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline)
     except _AmbiguousMaintenanceCommit as error:
-        _classify_ambiguous_maintenance(engine, _CURRENT_REVISION, error)
-    _verify_maintenance_completion(engine, _CURRENT_REVISION)
+        _classify_ambiguous_maintenance(engine, _CURRENT_REVISION, deadline, error)
+    _verify_maintenance_completion(engine, _CURRENT_REVISION, deadline)
 
 
 def maintenance_downgrade_database(
@@ -257,19 +257,62 @@ def maintenance_downgrade_database(
                 finally:
                     raw.set_progress_handler(None, 0)
         except _AmbiguousMaintenanceCommit as error:
-            _classify_ambiguous_maintenance(engine, _AUTOMATIC_EXISTING_CEILING, error)
-        _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING)
+            _classify_ambiguous_maintenance(
+                engine, _AUTOMATIC_EXISTING_CEILING, deadline, error
+            )
+        _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING, deadline)
         return
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline, downgrade=True)
     except _AmbiguousMaintenanceCommit as error:
-        _classify_ambiguous_maintenance(engine, _AUTOMATIC_EXISTING_CEILING, error)
-    _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING)
+        _classify_ambiguous_maintenance(
+            engine, _AUTOMATIC_EXISTING_CEILING, deadline, error
+        )
+    _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING, deadline)
 
 
-def _maintenance_state(engine: Engine) -> tuple[str | None, set[str]]:
+def _maintenance_state(engine: Engine, deadline: float) -> tuple[str | None, set[str]]:
     with engine.connect() as connection:
-        return _revision(connection), set(inspect(connection).get_table_names())
+        if engine.dialect.name == "sqlite":
+            remaining = _remaining(deadline)
+            connection.exec_driver_sql(
+                f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
+            )
+            raw = cast(Any, connection.connection.driver_connection)
+            raw.set_progress_handler(
+                lambda: 1 if time.monotonic() >= deadline else 0, 1000
+            )
+            try:
+                state = (
+                    _revision(connection),
+                    set(inspect(connection).get_table_names()),
+                )
+                _remaining(deadline)
+                return state
+            finally:
+                raw.set_progress_handler(None, 0)
+        watchdog = _arm_postgres_transaction_timeout(connection, deadline)
+        try:
+            connection.exec_driver_sql("BEGIN")
+            state = _revision(connection), set(inspect(connection).get_table_names())
+            watchdog.require_precommit_budget()
+            return state
+        except BaseException:
+            if watchdog.expired.is_set():
+                connection.invalidate()
+            raise
+        finally:
+            try:
+                if not connection.invalidated:
+                    try:
+                        connection.rollback()
+                        _reset_postgres_transaction_timeout(connection)
+                        watchdog.require_precommit_budget()
+                    except BaseException:
+                        connection.invalidate()
+                        raise
+            finally:
+                watchdog.cancel()
 
 
 def _state_matches_target(revision: str | None, tables: set[str], target: str) -> bool:
@@ -280,16 +323,18 @@ def _state_matches_target(revision: str | None, tables: set[str], target: str) -
     return "evidence_claim" in tables and not (_CLAIM_SESSION_TABLES & tables)
 
 
-def _verify_maintenance_completion(engine: Engine, target: str) -> None:
-    revision, tables = _maintenance_state(engine)
+def _verify_maintenance_completion(
+    engine: Engine, target: str, deadline: float
+) -> None:
+    revision, tables = _maintenance_state(engine, deadline)
     if not _state_matches_target(revision, tables, target):
         raise RuntimeError("maintenance completion readback found mixed schema state")
 
 
 def _classify_ambiguous_maintenance(
-    engine: Engine, target: str, error: BaseException
+    engine: Engine, target: str, deadline: float, error: BaseException
 ) -> None:
-    revision, tables = _maintenance_state(engine)
+    revision, tables = _maintenance_state(engine, deadline)
     if _state_matches_target(revision, tables, target):
         return
     source = (

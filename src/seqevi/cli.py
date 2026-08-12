@@ -638,7 +638,13 @@ def store_maintenance_upgrade_command(
             maintenance_upgrade_database,
         )
 
-        engine = create_engine(database_url)
+        from .service.config import _normalize_postgres_database_url
+
+        engine = create_engine(
+            _normalize_postgres_database_url(database_url)
+            if database_url.startswith("postgresql")
+            else database_url
+        )
         try:
             maintenance_upgrade_database(
                 engine,
@@ -680,7 +686,13 @@ def store_maintenance_downgrade_command(
             maintenance_downgrade_database,
         )
 
-        engine = create_engine(database_url)
+        from .service.config import _normalize_postgres_database_url
+
+        engine = create_engine(
+            _normalize_postgres_database_url(database_url)
+            if database_url.startswith("postgresql")
+            else database_url
+        )
         try:
             maintenance_downgrade_database(
                 engine,

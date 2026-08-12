@@ -795,15 +795,29 @@ class _HttpClaimSession:
                     ],
                 }
             )
-            authority_response = self._request_until(
-                "POST",
-                "/v1/internal/claim-sessions/authority",
-                deadline=deadline,
-                json=authority_check.model_dump(mode="json"),
-            )
-            if not ClaimSessionAuthorityCheckResponse.model_validate(
-                authority_response.json()
-            ).live:
+            while True:
+                authority_response = self._request_until(
+                    "POST",
+                    "/v1/internal/claim-sessions/authority",
+                    deadline=deadline,
+                    json=authority_check.model_dump(mode="json"),
+                )
+                try:
+                    authority_is_live = (
+                        ClaimSessionAuthorityCheckResponse.model_validate(
+                            authority_response.json()
+                        ).live
+                    )
+                    break
+                except ValueError:
+                    remaining_time = deadline - time.monotonic()
+                    if remaining_time <= 0:
+                        raise
+                    if self._stop.wait(min(0.25, remaining_time)):
+                        raise StoreError(
+                            "ClaimSession closed during authority recovery"
+                        )
+            if not authority_is_live:
                 raise EvidenceClaimLostError(
                     "exact ClaimSession finalization authority was lost"
                 ) from recovery_error
