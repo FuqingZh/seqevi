@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 
 from seqevi.errors import (
     EvidenceConflictError,
@@ -23,6 +23,7 @@ from seqevi.evidence import (
 )
 from seqevi.sequence import SequenceIdentity, identify_protein_sequence
 from seqevi.store import LocalStore, resolve_store_path
+from seqevi.store.schema import claim_session_acquire_receipts
 
 from .support import write_artifact_file
 
@@ -94,6 +95,19 @@ def test_local_store_initializes_migrated_wal_database(tmp_path: Path) -> None:
     assert str(journal_mode).lower() == "wal"
     assert (tmp_path / "store" / ".migration.lock").is_file()
     assert (tmp_path / "store" / "artifacts").is_dir()
+
+
+def test_local_claim_session_does_not_retain_transport_receipts(tmp_path: Path) -> None:
+    identity = identify_protein_sequence("MLOCALSESSION")
+    query = EvidenceQuery(identity, make_key(identity))
+    with LocalStore.open(tmp_path / "store") as store:
+        with store.claim_session() as session:
+            assert session.acquire_many((query,))[0].disposition.value == "acquired"
+        with store.engine.connect() as connection:
+            count = connection.execute(
+                select(func.count()).select_from(claim_session_acquire_receipts)
+            ).scalar_one()
+    assert count == 0
 
 
 def test_commit_lookup_and_fetch_hit_evidence(tmp_path: Path) -> None:

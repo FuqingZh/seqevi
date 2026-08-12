@@ -96,7 +96,8 @@ def create_service_app(
             while not stopped.is_set():
                 try:
                     await asyncio.to_thread(sweep)
-                except StoreBackpressureError:
+                except Exception:
+                    _CLAIM_LOGGER.exception("ClaimSession sweeper failed; retrying")
                     pass
                 try:
                     await asyncio.wait_for(stopped.wait(), timeout=1.0)
@@ -212,6 +213,10 @@ def create_service_app(
             raise HTTPException(
                 status.HTTP_408_REQUEST_TIMEOUT,
                 {"code": "open_request_expired", "detail": str(error)},
+            ) from error
+        except EvidenceClaimLostError as error:
+            raise HTTPException(
+                status.HTTP_412_PRECONDITION_FAILED, str(error)
             ) from error
         except StoreBackpressureError as error:
             raise _backpressure_error(error) from error
@@ -343,6 +348,10 @@ def create_service_app(
             ) from error
         except EvidenceConflictError as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
+        except (StoreIntegrityError, ValueError) as error:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)
+            ) from error
         except StoreBackpressureError as error:
             raise _backpressure_error(error) from error
         return ClaimSessionFinalizeResponse(outcomes=list(outcomes))

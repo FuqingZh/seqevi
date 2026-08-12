@@ -358,16 +358,24 @@ class PostgresEvidencePersistence:
         self, authority: ClaimSessionAuthority
     ) -> ClaimSessionAuthority:
         with self._transaction() as connection:
-            now = _database_now(connection)
-            expiry = now + timedelta(seconds=CLAIM_LEASE_SECONDS)
             row = connection.execute(
                 update(claim_sessions)
-                .where(_session_authority_clause(authority, now))
-                .values(expires_at=expiry, updated_at=now)
+                .where(
+                    claim_sessions.c.session_id == authority.session_id,
+                    claim_sessions.c.owner_token == authority.owner_token,
+                    claim_sessions.c.generation == authority.generation,
+                    claim_sessions.c.state == "open",
+                    claim_sessions.c.expires_at > func.clock_timestamp(),
+                )
+                .values(
+                    expires_at=func.clock_timestamp() + text("interval '120 seconds'"),
+                    updated_at=func.clock_timestamp(),
+                )
                 .returning(claim_sessions.c.expires_at)
             ).scalar_one_or_none()
             if row is None:
                 raise EvidenceClaimLostError("ClaimSession authority was lost")
+            now = _database_now(connection)
             return _authority(
                 authority.session_id,
                 authority.owner_token,
@@ -398,9 +406,17 @@ class PostgresEvidencePersistence:
 
         with self._transaction() as connection:
             now = _database_now(connection)
-            stale = select(claim_sessions.c.session_id).where(
-                (claim_sessions.c.state == "closing")
-                | (claim_sessions.c.expires_at <= now)
+            stale = tuple(
+                connection.execute(
+                    select(claim_sessions.c.session_id)
+                    .where(
+                        (claim_sessions.c.state == "closing")
+                        | (claim_sessions.c.expires_at <= now)
+                    )
+                    .order_by(claim_sessions.c.session_id)
+                    .limit(1000)
+                    .with_for_update(skip_locked=True)
+                ).scalars()
             )
             claim_ids = (
                 select(*session_claims.primary_key.columns)

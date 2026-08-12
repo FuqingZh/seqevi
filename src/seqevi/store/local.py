@@ -11,9 +11,8 @@ from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
-from sqlalchemy import and_, create_engine, delete, event, func, select, tuple_, update
+from sqlalchemy import and_, create_engine, delete, event, select, tuple_, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping, URL
 
@@ -53,7 +52,6 @@ from .schema import (
     sequences,
     session_claims,
 )
-from .transport import EvidenceQueryModel, canonical_query_digest
 
 _LOOKUP_CHUNK_SIZE = 400
 _CLAIM_LEASE_SECONDS = 120.0
@@ -733,35 +731,11 @@ class _LocalClaimSession:
         if len({query.key for query in queries}) != len(queries):
             raise ValueError("acquire batch contains a duplicate evidence key")
         results: dict[EvidenceKey, SessionClaimAcquireResult] = {}
-        request_id = uuid4().hex
-        digest = canonical_query_digest(
-            [EvidenceQueryModel.from_domain(query) for query in queries]
-        )
         with self.store.engine.connect() as connection:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             try:
                 now = datetime.now(UTC)
                 _require_local_session(connection, self, now)
-                header_count, item_count = connection.execute(
-                    select(
-                        select(func.count())
-                        .select_from(claim_session_acquire_receipts)
-                        .where(
-                            claim_session_acquire_receipts.c.session_id
-                            == self.session_id
-                        )
-                        .scalar_subquery(),
-                        select(func.count())
-                        .select_from(claim_session_acquire_receipt_items)
-                        .where(
-                            claim_session_acquire_receipt_items.c.session_id
-                            == self.session_id
-                        )
-                        .scalar_subquery(),
-                    )
-                ).one()
-                if header_count >= 1000 or item_count + len(queries) > 32000:
-                    raise StoreIntegrityError("claim_receipt_capacity")
                 for query in sorted(
                     queries, key=lambda item: _key_sort_value(item.key)
                 ):
@@ -858,26 +832,6 @@ class _LocalClaimSession:
                     results[query.key] = SessionClaimAcquireResult(
                         ClaimDisposition.ACQUIRED, claim=claim
                     )
-                connection.execute(
-                    claim_session_acquire_receipts.insert().values(
-                        session_id=self.session_id,
-                        request_id=request_id,
-                        query_digest=digest,
-                        created_at=now,
-                    )
-                )
-                connection.execute(
-                    claim_session_acquire_receipt_items.insert(),
-                    [
-                        _local_receipt_item(
-                            self.session_id,
-                            request_id,
-                            index,
-                            results[query.key],
-                        )
-                        for index, query in enumerate(queries)
-                    ],
-                )
                 connection.commit()
             except Exception:
                 connection.rollback()

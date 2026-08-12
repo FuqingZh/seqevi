@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import logging
 import json
+import threading
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -31,6 +32,7 @@ from sqlalchemy.engine import Connection
 from seqevi.annotate import run_annotation
 from seqevi.errors import (
     ClaimReceiptCapacityError,
+    EvidenceClaimLostError,
     EvidenceConflictError,
     StoreError,
     StoreIntegrityError,
@@ -595,6 +597,61 @@ def test_http_receipt_capacity_restarts_acquire_with_new_request_id() -> None:
     assert acquire_ids[0] != acquire_ids[1]
 
 
+def test_http_heartbeat_renews_before_request_deadline() -> None:
+    renewed = threading.Event()
+    now = datetime.now(UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 0.5,
+                },
+            )
+        if request.url.path.endswith("/renew"):
+            renewed.set()
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        session = store.claim_session()
+        assert renewed.wait(1.0)
+        session.close()
+
+
 def test_shared_store_configuration_requires_postgres_and_postgres_engine(
     tmp_path: Path,
 ) -> None:
@@ -836,6 +893,77 @@ def test_claim_session_malformed_bodies_remain_422(tmp_path: Path, route: str) -
     with TestClient(app) as service:
         response = service.post(f"/v1/internal/claim-sessions/{route}", json={})
     assert response.status_code == 422
+
+
+def test_claim_session_open_terminal_receipt_is_412(tmp_path: Path) -> None:
+    class TerminalOpenPersistence(MemoryPersistence):
+        @property
+        def supports_claim_sessions(self) -> bool:
+            return True
+
+        def open_claim_session(self, **_kwargs):
+            raise EvidenceClaimLostError("ClaimSession open receipt is terminal")
+
+    now = datetime.now(UTC)
+    app = create_service_app(
+        _settings(tmp_path),
+        persistence=cast(ServicePersistence, TerminalOpenPersistence()),
+    )
+    with TestClient(app) as service:
+        response = service.post(
+            "/v1/internal/claim-sessions/open",
+            json={
+                "open_request_id": "terminal-open",
+                "server_time": now.isoformat(),
+                "open_not_after": (now + timedelta(seconds=30)).isoformat(),
+            },
+        )
+    assert response.status_code == 412
+
+
+def test_claim_session_finalize_invalid_artifact_reference_is_422(
+    tmp_path: Path,
+) -> None:
+    commit = _hit_commit(tmp_path / "sources", "MINVALIDARTIFACT")
+    model = CommitModel.from_domain(commit).model_dump(mode="json")
+    assert model["normalized_artifact"] is not None
+    model["normalized_artifact"]["digest"] = "f" * 64
+    app = create_service_app(_settings(tmp_path), persistence=_memory_persistence())
+    with TestClient(app) as service:
+        response = service.post(
+            "/v1/internal/claim-sessions/finalize",
+            json={
+                "session_id": "session",
+                "owner_token": "owner",
+                "generation": 1,
+                "finalize_request_id": "invalid-artifact",
+                "commits": [{"commit": model, "claim_generation": 1}],
+            },
+        )
+    assert response.status_code == 422
+
+
+def test_claim_session_sweeper_retries_after_connection_failure(tmp_path: Path) -> None:
+    class RecoveringPersistence(MemoryPersistence):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sweeps = 0
+            self.recovered = threading.Event()
+
+        def sweep_claim_sessions(self) -> int:
+            self.sweeps += 1
+            if self.sweeps == 1:
+                raise StoreError("connection lost")
+            self.recovered.set()
+            return 0
+
+    persistence = RecoveringPersistence()
+    app = create_service_app(
+        _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
+    )
+    with TestClient(app):
+        assert persistence.recovered.wait(2.0)
+    assert persistence.sweeps >= 2
 
 
 @contextmanager
@@ -1386,6 +1514,55 @@ def test_postgres_renew_and_close_statement_counts_are_o1(
             persistence.close()
         assert renew_count == 5
         assert close_count == 5
+
+
+@pytest.mark.requires_postgres
+def test_postgres_renew_uses_live_clock_and_sweeper_skips_locked_session() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-renew-sweep-interleave",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        renew_statements: list[str] = []
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            renew_statements.append(statement)
+
+        event.listen(persistence.engine, "before_cursor_execute", record_statement)
+        try:
+            persistence.renew_claim_session(authority)
+        finally:
+            event.remove(persistence.engine, "before_cursor_execute", record_statement)
+        assert any(
+            "UPDATE claim_sessions" in statement
+            and statement.count("clock_timestamp()") >= 2
+            for statement in renew_statements
+        )
+
+        with persistence.engine.begin() as blocker:
+            blocker.execute(
+                select(claim_sessions.c.session_id)
+                .where(claim_sessions.c.session_id == authority.session_id)
+                .with_for_update()
+            )
+            blocker.execute(
+                claim_sessions.update()
+                .where(claim_sessions.c.session_id == authority.session_id)
+                .values(state="closing")
+            )
+            assert persistence.sweep_claim_sessions() == 0
+        assert persistence.sweep_claim_sessions() >= 0
+        persistence.close()
 
 
 @pytest.mark.requires_postgres

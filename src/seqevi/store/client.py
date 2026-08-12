@@ -434,7 +434,7 @@ class _HttpClaimSession:
             with self._lock:
                 delay = min(
                     self._authority.heartbeat_after_seconds,
-                    max(self._renew_deadline - time.monotonic(), 0.0),
+                    max(self._renew_deadline - time.monotonic() - 1.0, 0.0),
                 )
             if self._stop.wait(delay):
                 return
