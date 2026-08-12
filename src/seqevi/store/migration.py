@@ -86,6 +86,7 @@ def upgrade_database(engine: Engine, store_root: Path) -> None:
                 )
             if revision != _AUTOMATIC_EXISTING_CEILING:
                 command.upgrade(_configure(connection), _AUTOMATIC_EXISTING_CEILING)
+                connection.commit()
             raise RuntimeError(
                 "existing Store requires the explicit ClaimSession 0004 maintenance upgrade"
             )
@@ -115,6 +116,7 @@ def upgrade_postgres_database(engine: Engine) -> None:
             else:
                 if revision != _AUTOMATIC_EXISTING_CEILING:
                     command.upgrade(_configure(connection), _AUTOMATIC_EXISTING_CEILING)
+                    connection.commit()
                 raise RuntimeError(
                     "existing Store requires the explicit ClaimSession 0004 maintenance upgrade"
                 )
@@ -195,6 +197,17 @@ def _run_maintenance_upgrade(
     if revision != _AUTOMATIC_EXISTING_CEILING:
         connection.rollback()
         raise RuntimeError("maintenance upgrade requires revision 0003")
+    clock = (
+        "clock_timestamp()"
+        if connection.dialect.name == "postgresql"
+        else "CURRENT_TIMESTAMP"
+    )
+    live_claims = connection.execute(
+        text(f"SELECT count(*) FROM evidence_claim WHERE expires_at > {clock}")  # noqa: S608
+    ).scalar_one()
+    if live_claims:
+        connection.rollback()
+        raise RuntimeError("maintenance upgrade refuses unexpired evidence claims")
     _remaining(deadline)
     command.upgrade(_configure(connection), _CURRENT_REVISION)
     _remaining(deadline)

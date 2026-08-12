@@ -19,6 +19,7 @@ from uuid import uuid4
 import httpx
 
 from seqevi.errors import (
+    ClaimReceiptCapacityError,
     EvidenceClaimLostError,
     EvidenceConflictError,
     StoreError,
@@ -146,7 +147,10 @@ class HttpEvidenceStore:
     def claim_session(self) -> _HttpClaimSession:
         if self._claim_session_capabilities is None:
             raise StoreError("shared Store does not support ClaimSession")
-        return _HttpClaimSession(self, self._claim_session_capabilities)
+        response = self._request("GET", "/v1/internal/claim-sessions/capabilities")
+        capabilities = ClaimSessionCapabilitiesResponse.model_validate(response.json())
+        self._claim_session_capabilities = capabilities
+        return _HttpClaimSession(self, capabilities)
 
     def close(self) -> None:
         self._closing.set()
@@ -467,21 +471,30 @@ class _HttpClaimSession:
         for offset in range(0, len(requested), maximum):
             chunk = requested[offset : offset + maximum]
             models = [EvidenceQueryModel.from_domain(query) for query in chunk]
-            started = time.monotonic()
-            request = ClaimSessionAcquireRequest.model_validate(
-                {
-                    **self._authority_request(),
-                    "acquire_request_id": uuid4().hex,
-                    "query_digest": canonical_query_digest(models),
-                    "queries": [model.model_dump(mode="json") for model in models],
-                }
-            )
-            response = self._request_until(
-                "POST",
-                "/v1/internal/claim-sessions/acquire",
-                deadline=min(started + 30.0, self._renew_deadline),
-                json=request.model_dump(mode="json"),
-            )
+            while True:
+                started = time.monotonic()
+                request = ClaimSessionAcquireRequest.model_validate(
+                    {
+                        **self._authority_request(),
+                        "acquire_request_id": uuid4().hex,
+                        "query_digest": canonical_query_digest(models),
+                        "queries": [model.model_dump(mode="json") for model in models],
+                    }
+                )
+                try:
+                    response = self._request_until(
+                        "POST",
+                        "/v1/internal/claim-sessions/acquire",
+                        deadline=min(started + 30.0, self._renew_deadline),
+                        json=request.model_dump(mode="json"),
+                    )
+                    break
+                except ClaimReceiptCapacityError:
+                    delay = min(1.0, self._renew_deadline - time.monotonic())
+                    if delay <= 0 or self._stop.wait(delay):
+                        raise EvidenceClaimLostError(
+                            "ClaimSession authority runway expired during receipt admission"
+                        )
             payload = ClaimSessionAcquireResponse.model_validate(response.json())
             if len(payload.results) != len(chunk):
                 raise StoreIntegrityError(
@@ -515,6 +528,15 @@ class _HttpClaimSession:
     ) -> tuple[CommitOutcome, ...]:
         self.raise_if_lost()
         commits = tuple(proposed)
+        maximum = min(
+            self.capabilities.maximum_batch_size, self.store.maximum_batch_size
+        )
+        if len(commits) > maximum:
+            return tuple(
+                outcome
+                for offset in range(0, len(commits), maximum)
+                for outcome in self.finalize_many(commits[offset : offset + maximum])
+            )
         for commit in commits:
             for payload in (commit.normalized_artifact, commit.raw_artifact):
                 if (
@@ -535,29 +557,63 @@ class _HttpClaimSession:
                 )
             )
         started = time.monotonic()
-        request = ClaimSessionFinalizeRequest.model_validate(
-            {
-                **self._authority_request(),
-                "finalize_request_id": uuid4().hex,
-                "commits": [item.model_dump(mode="json") for item in items],
-            }
-        )
-        response = self._request_until(
-            "POST",
-            "/v1/internal/claim-sessions/finalize",
-            deadline=min(started + 30.0, self._renew_deadline),
-            json=request.model_dump(mode="json"),
-        )
-        outcomes = tuple(
-            ClaimSessionFinalizeResponse.model_validate(response.json()).outcomes
-        )
-        if len(outcomes) != len(commits):
-            raise StoreIntegrityError(
-                "shared Store returned incomplete finalize outcomes"
+        deadline = min(started + 30.0, self._renew_deadline)
+        request_id = uuid4().hex
+        pending = list(zip(commits, items, strict=True))
+        resolved: dict[EvidenceKey, CommitOutcome] = {}
+        while pending:
+            request = ClaimSessionFinalizeRequest.model_validate(
+                {
+                    **self._authority_request(),
+                    "finalize_request_id": request_id,
+                    "commits": [item.model_dump(mode="json") for _, item in pending],
+                }
             )
+            try:
+                response = self._request_until(
+                    "POST",
+                    "/v1/internal/claim-sessions/finalize",
+                    deadline=deadline,
+                    json=request.model_dump(mode="json"),
+                )
+                returned = tuple(
+                    ClaimSessionFinalizeResponse.model_validate(
+                        response.json()
+                    ).outcomes
+                )
+                if len(returned) != len(pending):
+                    raise StoreIntegrityError(
+                        "shared Store returned incomplete finalize outcomes"
+                    )
+                resolved.update(
+                    (commit.key, outcome)
+                    for (commit, _item), outcome in zip(pending, returned, strict=True)
+                )
+                break
+            except (StoreError, ValueError) as error:
+                found = self.store.lookup_many(
+                    EvidenceQuery(commit.identity, commit.key) for commit, _ in pending
+                )
+                remaining = []
+                for commit, item in pending:
+                    record = found.get(commit.key)
+                    if record is None:
+                        remaining.append((commit, item))
+                        continue
+                    if not _record_matches_commit(record, commit):
+                        raise EvidenceConflictError(
+                            "finalize readback found conflicting immutable evidence"
+                        ) from error
+                    resolved[commit.key] = CommitOutcome.EXISTING
+                    self._claims.pop(commit.key, None)
+                if not remaining:
+                    break
+                if len(remaining) == len(pending) or time.monotonic() >= deadline:
+                    raise
+                pending = remaining
         for commit in commits:
             self._claims.pop(commit.key, None)
-        return outcomes
+        return tuple(resolved[commit.key] for commit in commits)
 
     def _request_until(
         self, method: str, path: str, *, deadline: float, **kwargs: Any
@@ -574,6 +630,8 @@ class _HttpClaimSession:
                 response = None
             if response is not None and response.status_code == 412:
                 raise EvidenceClaimLostError(response.text)
+            if response is not None and _is_receipt_capacity(response):
+                raise ClaimReceiptCapacityError("claim_receipt_capacity")
             if response is not None and response.status_code != 503:
                 _raise_for_store_status(response)
                 return response
@@ -589,7 +647,7 @@ class _HttpClaimSession:
         if self._stop.is_set():
             return
         self._stop.set()
-        self._thread.join()
+        self._thread.join(timeout=min(self.store._timeout_seconds, 5.0))
         try:
             request = ClaimSessionCloseRequest.model_validate(self._authority_request())
             self.store.client.request(
@@ -618,6 +676,32 @@ def _claim_retry_delay(response: httpx.Response) -> float:
     base = max(0.01, base)
     jitter = base * _CLAIM_RETRY_JITTER_RATIO
     return base + random.uniform(0.0, jitter)
+
+
+def _is_receipt_capacity(response: httpx.Response) -> bool:
+    if response.status_code != 503:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    detail = payload.get("detail", payload) if isinstance(payload, dict) else None
+    return isinstance(detail, dict) and detail.get("code") == "claim_receipt_capacity"
+
+
+def _record_matches_commit(record: EvidenceRecord, commit: EvidenceCommit) -> bool:
+    return (
+        record.status == commit.status
+        and record.payload_digest == commit.payload_digest
+        and record.normalized_artifact_digest
+        == (
+            None
+            if commit.normalized_artifact is None
+            else commit.normalized_artifact.digest
+        )
+        and record.raw_artifact_digest
+        == (None if commit.raw_artifact is None else commit.raw_artifact.digest)
+    )
 
 
 def _file_chunks(path: Path) -> Iterator[bytes]:

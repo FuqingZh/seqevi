@@ -609,6 +609,53 @@ def serve_command(
         raise typer.Exit(code=1) from error
 
 
+@app.command("store-maintenance-upgrade")
+def store_maintenance_upgrade_command(
+    database_url: Annotated[
+        str,
+        typer.Option("--database-url", envvar="SEQEVI_DATABASE_URL"),
+    ],
+    acknowledge_database: Annotated[
+        str,
+        typer.Option("--acknowledge-database"),
+    ],
+    acknowledge_revision: Annotated[
+        str,
+        typer.Option("--acknowledge-revision"),
+    ] = "0003_evidence_claim_leases",
+    store_root: Annotated[
+        Path | None,
+        typer.Option("--store-root", file_okay=False, resolve_path=True),
+    ] = None,
+) -> None:
+    """Run the acknowledgement-bound, fail-closed ClaimSession Store upgrade."""
+
+    try:
+        from sqlalchemy import create_engine
+
+        from .store.migration import (
+            MaintenanceAcknowledgement,
+            maintenance_upgrade_database,
+        )
+
+        engine = create_engine(database_url)
+        try:
+            maintenance_upgrade_database(
+                engine,
+                store_root,
+                MaintenanceAcknowledgement(
+                    database_identity=acknowledge_database,
+                    expected_revision=acknowledge_revision,
+                ),
+            )
+        finally:
+            engine.dispose()
+    except Exception as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo("Store maintenance upgrade completed at 0004_claim_sessions")
+
+
 def main() -> None:
     """Run the SeqEvi CLI."""
 

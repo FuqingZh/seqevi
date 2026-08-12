@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
+import json
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -64,6 +65,7 @@ from seqevi.store.schema import (
     evidence_claim_generations,
 )
 from seqevi.store.transport import (
+    ClaimSessionFinalizeItem,
     CommitModel,
     EvidenceQueryModel,
     canonical_query_digest,
@@ -514,6 +516,83 @@ def _claim_health(maximum_batch_size: int = 1000) -> dict[str, object]:
         "maximum_batch_size": maximum_batch_size,
         "maximum_artifact_bytes": 1024,
     }
+
+
+def test_http_receipt_capacity_restarts_acquire_with_new_request_id() -> None:
+    identity, key = _key("MCAPACITYCLIENT")
+    query = EvidenceQuery(identity, key)
+    acquire_ids: list[str] = []
+    now = datetime.now(UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            payload = json.loads(request.content)
+            acquire_ids.append(payload["acquire_request_id"])
+            if len(acquire_ids) == 1:
+                return httpx.Response(
+                    503,
+                    json={
+                        "detail": {
+                            "code": "claim_receipt_capacity",
+                            "detail": "wait",
+                        }
+                    },
+                    headers={"Retry-After": "0"},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        session = store.claim_session()
+        assert (
+            session.acquire_many((query,))[0].disposition is ClaimDisposition.ACQUIRED
+        )
+        session.close()
+    assert len(acquire_ids) == 2
+    assert acquire_ids[0] != acquire_ids[1]
 
 
 def test_shared_store_configuration_requires_postgres_and_postgres_engine(
@@ -1163,6 +1242,55 @@ def test_postgres_acquire_receipt_replays_fixed_width_result(tmp_path: Path) -> 
                 )
         finally:
             persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_finalize_rejects_conflicting_artifact_metadata(
+    tmp_path: Path,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        commit = _hit_commit(tmp_path / "artifact-conflict", "MARTIFACTCONFLICT")
+        query = EvidenceQuery(commit.identity, commit.key)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-artifact-conflict",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        claim = persistence.acquire_claim_session(
+            authority,
+            acquire_request_id="acquire-artifact-conflict",
+            query_digest=canonical_query_digest(
+                [EvidenceQueryModel.from_domain(query)]
+            ),
+            queries=(query,),
+        )[0].claim
+        assert claim is not None and commit.normalized_artifact is not None
+        artifact = commit.normalized_artifact
+        with persistence.engine.begin() as connection:
+            connection.execute(
+                artifacts.insert().values(
+                    digest=artifact.digest,
+                    media_type="application/conflict",
+                    byte_size=artifact.byte_size,
+                    relative_path="conflict/path",
+                )
+            )
+        item = ClaimSessionFinalizeItem(
+            commit=CommitModel.from_domain(commit), claim_generation=claim.generation
+        )
+        stored = {
+            artifact.digest: StoredArtifact(
+                artifact.digest,
+                artifact.media_type,
+                artifact.byte_size,
+                "expected/path",
+            )
+        }
+        with pytest.raises(StoreIntegrityError, match="artifact metadata conflict"):
+            persistence.finalize_claim_session(authority, (item,), stored)
+        persistence.close()
 
 
 @pytest.mark.requires_postgres

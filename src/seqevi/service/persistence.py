@@ -265,6 +265,16 @@ class PostgresEvidencePersistence:
     ) -> ClaimSessionAuthority:
         request_digest = hashlib.sha256(b"claim-session-v1").hexdigest()
         with self._transaction() as connection:
+            connection.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {
+                    "lock_id": int.from_bytes(
+                        hashlib.sha256(open_request_id.encode()).digest()[:8],
+                        "big",
+                        signed=True,
+                    )
+                },
+            )
             existing = (
                 connection.execute(
                     select(claim_session_open_receipts)
@@ -501,26 +511,6 @@ class PostgresEvidencePersistence:
             raise ValueError("acquire batch contains a duplicate evidence key")
         results: dict[EvidenceKey, SessionClaimAcquireResult] = {}
         with self._transaction() as connection:
-            receipt = (
-                connection.execute(
-                    select(claim_session_acquire_receipts).where(
-                        claim_session_acquire_receipts.c.session_id
-                        == authority.session_id,
-                        claim_session_acquire_receipts.c.request_id
-                        == acquire_request_id,
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if receipt is not None:
-                if receipt["query_digest"] != query_digest:
-                    raise EvidenceConflictError(
-                        "acquire request ID was reused with another query digest"
-                    )
-                return _replay_acquire_receipt(
-                    connection, requested, authority.session_id, acquire_request_id
-                )
             header_count, item_count = connection.execute(
                 select(
                     select(func.count())
@@ -573,6 +563,26 @@ class PostgresEvidencePersistence:
                 or _as_utc(requester["expires_at"]) <= now
             ):
                 raise EvidenceClaimLostError("ClaimSession authority was lost")
+            receipt = (
+                connection.execute(
+                    select(claim_session_acquire_receipts).where(
+                        claim_session_acquire_receipts.c.session_id
+                        == authority.session_id,
+                        claim_session_acquire_receipts.c.request_id
+                        == acquire_request_id,
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if receipt is not None:
+                if receipt["query_digest"] != query_digest:
+                    raise EvidenceConflictError(
+                        "acquire request ID was reused with another query digest"
+                    )
+                return _replay_acquire_receipt(
+                    connection, requested, authority.session_id, acquire_request_id
+                )
             owner_by_id = {row["session_id"]: row for row in locked}
             identities = {
                 query.identity.sequence_id: query.identity for query in requested

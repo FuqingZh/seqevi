@@ -694,8 +694,9 @@ class _LocalClaimSession:
             deadline = time.monotonic() + 90.0
             while not self._stop.is_set():
                 try:
-                    now = datetime.now(UTC)
-                    with self.store.engine.begin() as connection:
+                    with self.store.engine.connect() as connection:
+                        connection.exec_driver_sql("BEGIN IMMEDIATE")
+                        now = datetime.now(UTC)
                         result = connection.execute(
                             update(claim_sessions)
                             .where(
@@ -713,6 +714,7 @@ class _LocalClaimSession:
                                 updated_at=now,
                             )
                         )
+                        connection.commit()
                     if result.rowcount != 1:
                         raise EvidenceClaimLostError("ClaimSession renewal was fenced")
                     break
@@ -735,10 +737,10 @@ class _LocalClaimSession:
         digest = canonical_query_digest(
             [EvidenceQueryModel.from_domain(query) for query in queries]
         )
-        now = datetime.now(UTC)
         with self.store.engine.connect() as connection:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             try:
+                now = datetime.now(UTC)
                 _require_local_session(connection, self, now)
                 header_count, item_count = connection.execute(
                     select(
@@ -900,10 +902,10 @@ class _LocalClaimSession:
             for digest, value in payloads.items()
         }
         outcomes: dict[EvidenceKey, CommitOutcome] = {}
-        now = datetime.now(UTC)
         with self.store.engine.connect() as connection:
             connection.exec_driver_sql("BEGIN IMMEDIATE")
             try:
+                now = datetime.now(UTC)
                 _require_local_session(connection, self, now)
                 for commit in sorted(
                     commits, key=lambda item: _key_sort_value(item.key)

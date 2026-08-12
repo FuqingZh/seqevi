@@ -122,10 +122,38 @@ def create_service_app(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        if _claim_operation(request.url.path) is not None:
+        operation = _claim_operation(request.url.path)
+        if operation is not None:
             request.state.seqevi_claim_request_id = uuid4().hex
             request.state.seqevi_claim_started = perf_counter()
-        return await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            if operation is not None:
+                _log_claim_request(
+                    operation,
+                    batch_size=0,
+                    outcome="error",
+                    status_code=500,
+                    request_id=request.state.seqevi_claim_request_id,
+                    duration_ms=round(
+                        (perf_counter() - request.state.seqevi_claim_started) * 1000,
+                        3,
+                    ),
+                )
+            raise
+        if operation is not None:
+            _log_claim_request(
+                operation,
+                batch_size=0,
+                outcome="ok" if response.status_code < 400 else "http_error",
+                status_code=response.status_code,
+                request_id=request.state.seqevi_claim_request_id,
+                duration_ms=round(
+                    (perf_counter() - request.state.seqevi_claim_started) * 1000, 3
+                ),
+            )
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def claim_request_validation_error(
@@ -201,6 +229,8 @@ def create_service_app(
             raise HTTPException(
                 status.HTTP_412_PRECONDITION_FAILED, str(error)
             ) from error
+        except EvidenceConflictError as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         except StoreBackpressureError as error:
             raise _backpressure_error(error) from error
         return ClaimSessionRenewResponse.model_validate(_authority_payload(renewed))
@@ -217,6 +247,8 @@ def create_service_app(
             raise HTTPException(
                 status.HTTP_412_PRECONDITION_FAILED, str(error)
             ) from error
+        except EvidenceConflictError as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         except StoreBackpressureError as error:
             raise _backpressure_error(error) from error
         return ClaimSessionCloseResponse(
@@ -248,6 +280,8 @@ def create_service_app(
             raise HTTPException(
                 status.HTTP_412_PRECONDITION_FAILED, str(error)
             ) from error
+        except EvidenceConflictError as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         except StoreBackpressureError as error:
             raise _backpressure_error(error) from error
         return ClaimSessionAcquireResponse(

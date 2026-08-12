@@ -99,10 +99,12 @@ jobs:
             test "${attempt}" -lt 30
             sleep 1
           done
+          expected_revision="$(docker run --rm --entrypoint python seqevi:ci -c \
+            'from seqevi.store.migration import _CURRENT_REVISION; print(_CURRENT_REVISION)')"
           docker exec "${{ job.services.postgres.id }}" \
             psql -U postgres -d seqevi_image -Atc \
             "select version_num from alembic_version" \
-            | grep -Fx "0003_evidence_claim_leases"
+            | grep -Fx "${expected_revision}"
           docker restart seqevi-ci
           for attempt in $(seq 1 30); do
             curl --fail --silent http://127.0.0.1:18081/health && break

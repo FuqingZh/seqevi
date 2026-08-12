@@ -10,6 +10,14 @@ import pytest
 ROOT = Path(__file__).parents[1]
 
 
+def test_ci_image_migration_check_uses_installed_internal_revision() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "from seqevi.store.migration import _CURRENT_REVISION" in workflow
+    assert 'grep -Fx "${expected_revision}"' in workflow
+    assert 'grep -Fx "0003_evidence_claim_leases"' not in workflow
+
+
 def test_publish_workflow_preserves_trusted_publisher_boundaries() -> None:
     workflow = (ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8")
 
