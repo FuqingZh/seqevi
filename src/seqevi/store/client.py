@@ -627,12 +627,46 @@ class _HttpClaimSession:
                 }
             )
             try:
-                response = self._request_until(
-                    "POST",
-                    "/v1/internal/claim-sessions/finalize",
-                    deadline=deadline,
-                    json=request.model_dump(mode="json"),
-                )
+                attempt_error: BaseException | None = None
+                response: httpx.Response | None = None
+                remaining_time = deadline - time.monotonic()
+                if remaining_time <= 0:
+                    raise EvidenceClaimLostError(
+                        "ClaimSession finalization deadline expired"
+                    )
+                try:
+                    response = self.store.client.request(
+                        "POST",
+                        "/v1/internal/claim-sessions/finalize",
+                        timeout=httpx.Timeout(remaining_time),
+                        json=request.model_dump(mode="json"),
+                    )
+                except httpx.HTTPError as error:
+                    unknown_outcome = True
+                    attempt_error = StoreError(
+                        "ClaimSession finalize transport outcome is unknown"
+                    )
+                    attempt_error.__cause__ = error
+                else:
+                    if (
+                        response.status_code in {412, 503}
+                        or response.status_code >= 500
+                    ):
+                        unknown_outcome = True
+                        attempt_error = _StoreResponseError(
+                            response.status_code, response.text
+                        )
+                    else:
+                        _raise_for_store_status(response)
+                if attempt_error is not None:
+                    delay = min(0.25, deadline - time.monotonic())
+                    if delay <= 0:
+                        raise attempt_error
+                    if self._stop.wait(delay):
+                        raise StoreError("ClaimSession closed during finalize recovery")
+                    # Reconcile this observed attempt before any same-ID retry.
+                    raise attempt_error
+                assert response is not None
                 returned = tuple(
                     ClaimSessionFinalizeResponse.model_validate(
                         response.json()

@@ -4,6 +4,7 @@ import os
 import logging
 import json
 import threading
+import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -28,6 +29,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import DBAPIError
 
 from seqevi.annotate import run_annotation
 from seqevi.errors import (
@@ -709,8 +711,10 @@ def test_http_acquire_replays_malformed_success_with_same_request_id(
     assert acquire_ids[0] == acquire_ids[1]
 
 
+@pytest.mark.parametrize("first_outcome", ["transport", "503"])
 def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
     tmp_path: Path,
+    first_outcome: str,
 ) -> None:
     commit = _hit_commit(tmp_path / "source", "MUNKNOWNTHENSUCCESS")
     query = EvidenceQuery(commit.identity, commit.key)
@@ -766,7 +770,9 @@ def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
         if request.url.path.endswith("/finalize"):
             finalize_calls += 1
             if finalize_calls == 1:
-                return httpx.Response(500, text="response lost")
+                if first_outcome == "transport":
+                    raise httpx.ReadError("response lost")
+                return httpx.Response(503, text="temporarily unavailable")
             return httpx.Response(200, json={"outcomes": ["created"]})
         if request.url.path.endswith("/authority"):
             return httpx.Response(200, json={"live": True})
@@ -2009,6 +2015,68 @@ def test_postgres_open_receipt_rejects_changed_timing_fields() -> None:
                 open_not_after=server_time + timedelta(seconds=29),
             )
         persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_http_open_receipt_changed_timing_is_409(tmp_path: Path) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        app = create_service_app(_settings(tmp_path), persistence=persistence)
+        server_time = persistence.database_time()
+        payload = {
+            "open_request_id": "http-timing-bound-open",
+            "server_time": server_time.isoformat(),
+            "open_not_after": (server_time + timedelta(seconds=30)).isoformat(),
+        }
+        with TestClient(app) as service:
+            assert (
+                service.post(
+                    "/v1/internal/claim-sessions/open", json=payload
+                ).status_code
+                == 200
+            )
+            changed = {
+                **payload,
+                "open_not_after": (server_time + timedelta(seconds=29)).isoformat(),
+            }
+            assert (
+                service.post(
+                    "/v1/internal/claim-sessions/open", json=changed
+                ).status_code
+                == 409
+            )
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_watchdog_remains_armed_through_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0003_evidence_claim_leases",
+        )
+        original_upgrade = store_migration.command.upgrade
+
+        def stalled_upgrade(*args, **kwargs):
+            time.sleep(0.15)
+            return original_upgrade(*args, **kwargs)
+
+        monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(store_migration.command, "upgrade", stalled_upgrade)
+        with pytest.raises((TimeoutError, DBAPIError)):
+            store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        engine.dispose()
 
 
 @pytest.mark.requires_postgres

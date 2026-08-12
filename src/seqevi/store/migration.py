@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Callable, Iterator, cast
 
 from alembic import command
 from alembic.config import Config
@@ -33,6 +33,33 @@ _CLAIM_SESSION_TABLES = {
 
 class _AmbiguousMaintenanceCommit(RuntimeError):
     pass
+
+
+class _MaintenanceWatchdog:
+    def __init__(self, connection: Connection, deadline: float) -> None:
+        self.connection = connection
+        self.expired = threading.Event()
+        raw = cast(Any, connection.connection.driver_connection)
+
+        def cancel_stalled_operation() -> None:
+            self.expired.set()
+            try:
+                raw.cancel()
+            except BaseException:
+                connection.invalidate()
+
+        self.timer = threading.Timer(_remaining(deadline), cancel_stalled_operation)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def cancel_precommit(self) -> None:
+        self.timer.cancel()
+        if self.expired.is_set():
+            self.connection.invalidate()
+            raise TimeoutError("ClaimSession maintenance exceeded its deadline")
+
+    def cancel(self) -> None:
+        self.timer.cancel()
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +318,7 @@ def _run_maintenance_upgrade(
     connection: Connection,
     acknowledgement: MaintenanceAcknowledgement,
     deadline: float,
+    before_commit: Callable[[], None] | None = None,
 ) -> None:
     revision = _revision(connection)
     if revision != acknowledgement.expected_revision:
@@ -313,6 +341,8 @@ def _run_maintenance_upgrade(
     _remaining(deadline)
     command.upgrade(_configure(connection), _CURRENT_REVISION)
     _remaining(deadline)
+    if before_commit is not None:
+        before_commit()
     try:
         connection.commit()
     except DBAPIError as error:
@@ -323,6 +353,7 @@ def _run_maintenance_downgrade(
     connection: Connection,
     acknowledgement: MaintenanceAcknowledgement,
     deadline: float,
+    before_commit: Callable[[], None] | None = None,
 ) -> None:
     revision = _revision(connection)
     if revision != acknowledgement.expected_revision or revision != _CURRENT_REVISION:
@@ -331,6 +362,8 @@ def _run_maintenance_downgrade(
     _remaining(deadline)
     command.downgrade(_configure(connection), _AUTOMATIC_EXISTING_CEILING)
     _remaining(deadline)
+    if before_commit is not None:
+        before_commit()
     try:
         connection.commit()
     except DBAPIError as error:
@@ -360,8 +393,9 @@ def _maintenance_upgrade_postgres(
                 if not acquired:
                     time.sleep(min(random.uniform(1.0, 5.0), _remaining(deadline)))
             while True:
+                watchdog: _MaintenanceWatchdog | None = None
                 try:
-                    _arm_postgres_transaction_timeout(connection, deadline)
+                    watchdog = _arm_postgres_transaction_timeout(connection, deadline)
                     connection.exec_driver_sql("BEGIN")
                     lock_ms = max(min(int(_remaining(deadline) * 1000), 5000), 1)
                     connection.exec_driver_sql(
@@ -379,10 +413,18 @@ def _maintenance_upgrade_postgres(
                     _remaining(deadline)
                     if downgrade:
                         _run_maintenance_downgrade(
-                            connection, acknowledgement, deadline
+                            connection,
+                            acknowledgement,
+                            deadline,
+                            watchdog.cancel_precommit,
                         )
                     else:
-                        _run_maintenance_upgrade(connection, acknowledgement, deadline)
+                        _run_maintenance_upgrade(
+                            connection,
+                            acknowledgement,
+                            deadline,
+                            watchdog.cancel_precommit,
+                        )
                     break
                 except DBAPIError as error:
                     connection.rollback()
@@ -392,6 +434,9 @@ def _maintenance_upgrade_postgres(
                     if sqlstate not in {"40P01", "55P03"}:
                         raise
                     time.sleep(min(random.uniform(1.0, 5.0), _remaining(deadline)))
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
         except BaseException as error:
             primary = error
         finally:
@@ -418,32 +463,23 @@ def _maintenance_upgrade_postgres(
             raise cleanup
 
 
-def _arm_postgres_transaction_timeout(connection: Connection, deadline: float) -> None:
+def _arm_postgres_transaction_timeout(
+    connection: Connection, deadline: float
+) -> _MaintenanceWatchdog:
     """Arm the remaining whole-transaction budget across an autocommit Sync."""
 
     remaining_ms = max(int(_remaining(deadline) * 1000), 1)
     autocommit = connection.execution_options(isolation_level="AUTOCOMMIT")
-    expired = threading.Event()
-    raw = cast(Any, connection.connection.driver_connection)
-
-    def cancel_stalled_setup() -> None:
-        expired.set()
-        try:
-            raw.cancel()
-        except BaseException:
-            connection.invalidate()
-
-    timer = threading.Timer(_remaining(deadline), cancel_stalled_setup)
-    timer.daemon = True
-    timer.start()
+    watchdog = _MaintenanceWatchdog(connection, deadline)
     try:
         autocommit.exec_driver_sql(f"SET transaction_timeout = '{remaining_ms}ms'")
         configured = str(
             autocommit.exec_driver_sql("SHOW transaction_timeout").scalar_one()
         )
-    finally:
-        timer.cancel()
-    if expired.is_set():
+    except BaseException:
+        watchdog.cancel()
+        raise
+    if watchdog.expired.is_set():
         connection.invalidate()
         raise TimeoutError("ClaimSession maintenance timeout setup exceeded deadline")
     if configured not in {f"{remaining_ms}ms", f"{remaining_ms / 1000:g}s"}:
@@ -451,6 +487,7 @@ def _arm_postgres_transaction_timeout(connection: Connection, deadline: float) -
             "transaction_timeout setup readback did not match remaining budget"
         )
     _remaining(deadline)
+    return watchdog
 
 
 def _reset_postgres_transaction_timeout(connection: Connection) -> None:

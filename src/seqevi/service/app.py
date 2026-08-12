@@ -220,6 +220,8 @@ def create_service_app(
             raise HTTPException(
                 status.HTTP_412_PRECONDITION_FAILED, str(error)
             ) from error
+        except EvidenceConflictError as error:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         except StoreBackpressureError as error:
             raise _backpressure_error(error) from error
         return ClaimSessionOpenResponse.model_validate(_authority_payload(authority))
