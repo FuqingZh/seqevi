@@ -41,6 +41,15 @@ def test_systemd_unit_is_loopback_only_and_mount_guarded() -> None:
     assert "--cap-drop ALL" in unit
     assert "--security-opt no-new-privileges" in unit
     assert "--env SEQEVI_DATABASE_URL" in unit
+    for setting in (
+        "SEQEVI_DATABASE_POOL_SIZE",
+        "SEQEVI_DATABASE_MAX_OVERFLOW",
+        "SEQEVI_DATABASE_POOL_TIMEOUT_SECONDS",
+        "SEQEVI_DATABASE_LOCK_TIMEOUT_SECONDS",
+        "SEQEVI_DATABASE_STATEMENT_TIMEOUT_SECONDS",
+        "SEQEVI_DATABASE_TRANSACTION_TIMEOUT_SECONDS",
+    ):
+        assert f"--env {setting}" in unit
     assert "EnvironmentFile=%h/.config/seqevi/seqevi-store.env" in unit
 
 

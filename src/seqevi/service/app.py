@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from seqevi.errors import (
     EvidenceClaimLostError,
     EvidenceConflictError,
+    StoreBackpressureError,
     StoreIntegrityError,
 )
 from seqevi.evidence import EvidenceKey
@@ -68,7 +69,15 @@ def create_service_app(
 ) -> FastAPI:
     """Construct a bounded v1 Store API without annotation scheduling."""
 
-    database = persistence or PostgresEvidencePersistence.open(settings.database_url)
+    database = persistence or PostgresEvidencePersistence.open(
+        settings.database_url,
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        pool_timeout_seconds=settings.database_pool_timeout_seconds,
+        lock_timeout_seconds=settings.database_lock_timeout_seconds,
+        statement_timeout_seconds=settings.database_statement_timeout_seconds,
+        transaction_timeout_seconds=settings.database_transaction_timeout_seconds,
+    )
     artifact_store = PosixArtifactStore(settings.artifacts_dir)
 
     @asynccontextmanager
@@ -157,6 +166,8 @@ def create_service_app(
                     (query.to_domain() for query in request.queries),
                     owner_token=request.owner_token,
                 )
+            except StoreBackpressureError as error:
+                raise _backpressure_error(error) from error
             except StoreIntegrityError as error:
                 raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
             except ValueError as error:
@@ -185,6 +196,8 @@ def create_service_app(
                 renewed = database.renew_many(
                     claim.to_domain() for claim in request.claims
                 )
+            except StoreBackpressureError as error:
+                raise _backpressure_error(error) from error
             except EvidenceClaimLostError as error:
                 raise HTTPException(
                     status.HTTP_412_PRECONDITION_FAILED, str(error)
@@ -209,6 +222,8 @@ def create_service_app(
             )
             try:
                 database.release_many(claim.to_domain() for claim in request.claims)
+            except StoreBackpressureError as error:
+                raise _backpressure_error(error) from error
             except EvidenceClaimLostError as error:
                 raise HTTPException(
                     status.HTTP_412_PRECONDITION_FAILED, str(error)
@@ -229,6 +244,8 @@ def create_service_app(
             records = database.lookup_many(
                 query.to_domain() for query in request.queries
             )
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
         except StoreIntegrityError as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         return LookupResponse(
@@ -240,7 +257,10 @@ def create_service_app(
 
     @app.post("/v1/evidence/fetch", response_model=FetchResponse)
     def fetch(request: FetchRequest) -> FetchResponse:
-        record = database.fetch_record(request.key.to_domain())
+        try:
+            record = database.fetch_record(request.key.to_domain())
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
         return FetchResponse(
             record=None if record is None else EvidenceRecordModel.from_domain(record)
         )
@@ -249,7 +269,10 @@ def create_service_app(
     def fetch_many(request: FetchManyRequest) -> FetchManyResponse:
         _check_batch_size(len(request.keys), settings.maximum_batch_size)
         keys = [key.to_domain() for key in request.keys]
-        records = database.fetch_many(keys)
+        try:
+            records = database.fetch_many(keys)
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
         return FetchManyResponse(
             records=[
                 EvidenceRecordModel.from_domain(records[key])
@@ -294,7 +317,10 @@ def create_service_app(
 
     @app.get("/v1/artifacts/{digest}")
     def download_artifact(digest: str) -> StreamingResponse:
-        artifact = database.artifact_metadata(digest)
+        try:
+            artifact = database.artifact_metadata(digest)
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
         if artifact is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact is not registered")
         return StreamingResponse(
@@ -335,6 +361,8 @@ def create_service_app(
                         byte_size=reference.byte_size,
                     )
             outcomes = database.commit_many(request.commits, stored)
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
         except EvidenceConflictError as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         except (StoreIntegrityError, ValueError) as error:
@@ -378,6 +406,8 @@ def create_service_app(
                                 byte_size=reference.byte_size,
                             )
                 outcomes = database.finalize_many(request.commits, stored)
+            except StoreBackpressureError as error:
+                raise _backpressure_error(error) from error
             except EvidenceClaimLostError as error:
                 raise HTTPException(
                     status.HTTP_412_PRECONDITION_FAILED, str(error)
@@ -410,6 +440,14 @@ def _check_batch_size(size: int, maximum: int) -> None:
             status.HTTP_413_CONTENT_TOO_LARGE,
             f"batch contains {size} entries; maximum is {maximum}",
         )
+
+
+def _backpressure_error(error: StoreBackpressureError) -> HTTPException:
+    return HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        str(error),
+        headers={"Retry-After": "1"},
+    )
 
 
 @contextmanager
