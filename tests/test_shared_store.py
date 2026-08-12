@@ -827,6 +827,17 @@ def test_v020_request_contract_uses_only_released_legacy_routes(tmp_path: Path) 
     assert all(response.status_code == 404 for response in removed)
 
 
+@pytest.mark.parametrize(
+    "route",
+    ("open", "renew", "close", "acquire", "finalize"),
+)
+def test_claim_session_malformed_bodies_remain_422(tmp_path: Path, route: str) -> None:
+    app = create_service_app(_settings(tmp_path), persistence=_memory_persistence())
+    with TestClient(app) as service:
+        response = service.post(f"/v1/internal/claim-sessions/{route}", json={})
+    assert response.status_code == 422
+
+
 @contextmanager
 def _isolated_postgres_url() -> Iterator[str]:
     database_url = os.environ.get("SEQEVI_TEST_POSTGRES_URL")
@@ -1012,6 +1023,36 @@ def test_postgres_maintenance_upgrade_arms_syncs_resets_and_preserves_rows() -> 
             assert connection.exec_driver_sql(
                 "SHOW transaction_timeout"
             ).scalar_one() in {"0", "0ms"}
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_fenced_downgrade_recreates_empty_0003_coordination() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        persistence = PostgresEvidencePersistence.open(database_url)
+        persistence.close()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0004_claim_sessions",
+        )
+        store_migration.maintenance_downgrade_database(engine, None, acknowledgement)
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == "0003_evidence_claim_leases"
+            )
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM evidence_claim")
+                ).scalar_one()
+                == 0
+            )
+            tables = set(inspect(connection).get_table_names())
+            assert "claim_sessions" not in tables
+            assert "evidence_claim" in tables
         engine.dispose()
 
 

@@ -620,10 +620,10 @@ def _claim_batch_size(operation: str, body: object) -> int | None:
         return None
     field = {
         "acquire": "queries",
-        "renew": "claims",
-        "release": "claims",
         "finalize": "commits",
-    }[operation]
+    }.get(operation)
+    if field is None:
+        return None
     values = body.get(field)
     if isinstance(values, list):
         return len(values)

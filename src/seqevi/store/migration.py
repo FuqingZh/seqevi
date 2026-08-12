@@ -162,6 +162,36 @@ def maintenance_upgrade_database(
     _maintenance_upgrade_postgres(engine, acknowledgement, deadline)
 
 
+def maintenance_downgrade_database(
+    engine: Engine,
+    store_root: Path | None,
+    acknowledgement: MaintenanceAcknowledgement,
+) -> None:
+    """Downgrade 0004 to empty 0003 coordination under the same bounded fence."""
+
+    if acknowledgement.database_identity != _database_identity(engine):
+        raise RuntimeError("maintenance acknowledgement targets another database")
+    deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
+    if engine.dialect.name == "sqlite":
+        if store_root is None:
+            raise ValueError("SQLite maintenance requires the Store root")
+        with _bounded_file_lock(store_root, deadline), engine.connect() as connection:
+            connection.exec_driver_sql(
+                f"PRAGMA busy_timeout={max(int(_remaining(deadline) * 1000), 1)}"
+            )
+            raw = cast(Any, connection.connection.driver_connection)
+            raw.set_progress_handler(
+                lambda: 1 if time.monotonic() >= deadline else 0, 1000
+            )
+            try:
+                connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                _run_maintenance_downgrade(connection, acknowledgement, deadline)
+            finally:
+                raw.set_progress_handler(None, 0)
+        return
+    _maintenance_upgrade_postgres(engine, acknowledgement, deadline, downgrade=True)
+
+
 @contextmanager
 def _bounded_file_lock(store_root: Path, deadline: float) -> Iterator[None]:
     lock_path = store_root / ".migration.lock"
@@ -214,10 +244,27 @@ def _run_maintenance_upgrade(
     connection.commit()
 
 
+def _run_maintenance_downgrade(
+    connection: Connection,
+    acknowledgement: MaintenanceAcknowledgement,
+    deadline: float,
+) -> None:
+    revision = _revision(connection)
+    if revision != acknowledgement.expected_revision or revision != _CURRENT_REVISION:
+        connection.rollback()
+        raise RuntimeError("maintenance downgrade requires acknowledged revision 0004")
+    _remaining(deadline)
+    command.downgrade(_configure(connection), _AUTOMATIC_EXISTING_CEILING)
+    _remaining(deadline)
+    connection.commit()
+
+
 def _maintenance_upgrade_postgres(
     engine: Engine,
     acknowledgement: MaintenanceAcknowledgement,
     deadline: float,
+    *,
+    downgrade: bool = False,
 ) -> None:
     with engine.connect() as connection:
         acquired = False
@@ -242,12 +289,22 @@ def _maintenance_upgrade_postgres(
                     connection.exec_driver_sql(
                         f"SET LOCAL lock_timeout = '{lock_ms}ms'"
                     )
-                    connection.exec_driver_sql(
-                        "LOCK TABLE sequence, evidence_claim, artifact, evidence "
-                        "IN ACCESS EXCLUSIVE MODE"
+                    lock_tables = (
+                        "LOCK TABLE sequence, claim_sessions, session_claims, "
+                        "evidence_claim_generations, claim_session_open_receipts, "
+                        "claim_session_acquire_receipts, "
+                        "claim_session_acquire_receipt_items, artifact, evidence "
+                        if downgrade
+                        else "LOCK TABLE sequence, evidence_claim, artifact, evidence "
                     )
+                    connection.exec_driver_sql(lock_tables + "IN ACCESS EXCLUSIVE MODE")
                     _remaining(deadline)
-                    _run_maintenance_upgrade(connection, acknowledgement, deadline)
+                    if downgrade:
+                        _run_maintenance_downgrade(
+                            connection, acknowledgement, deadline
+                        )
+                    else:
+                        _run_maintenance_upgrade(connection, acknowledgement, deadline)
                     break
                 except DBAPIError as error:
                     connection.rollback()

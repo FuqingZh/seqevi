@@ -511,26 +511,6 @@ class PostgresEvidencePersistence:
             raise ValueError("acquire batch contains a duplicate evidence key")
         results: dict[EvidenceKey, SessionClaimAcquireResult] = {}
         with self._transaction() as connection:
-            header_count, item_count = connection.execute(
-                select(
-                    select(func.count())
-                    .select_from(claim_session_acquire_receipts)
-                    .where(
-                        claim_session_acquire_receipts.c.session_id
-                        == authority.session_id
-                    )
-                    .scalar_subquery(),
-                    select(func.count())
-                    .select_from(claim_session_acquire_receipt_items)
-                    .where(
-                        claim_session_acquire_receipt_items.c.session_id
-                        == authority.session_id
-                    )
-                    .scalar_subquery(),
-                )
-            ).one()
-            if header_count >= 1000 or item_count + len(requested) > 32000:
-                raise ClaimReceiptCapacityError("claim_receipt_capacity")
             _lock_evidence_keys(connection, (query.key for query in requested))
             owner_ids = set(
                 connection.execute(
@@ -583,6 +563,57 @@ class PostgresEvidencePersistence:
                 return _replay_acquire_receipt(
                     connection, requested, authority.session_id, acquire_request_id
                 )
+            cutoff = now - timedelta(seconds=60)
+            expired_items = (
+                select(*claim_session_acquire_receipt_items.primary_key.columns)
+                .join(claim_session_acquire_receipts)
+                .where(
+                    claim_session_acquire_receipts.c.session_id == authority.session_id,
+                    claim_session_acquire_receipts.c.created_at <= cutoff,
+                )
+                .limit(1000)
+            )
+            connection.execute(
+                delete(claim_session_acquire_receipt_items).where(
+                    tuple_(
+                        *claim_session_acquire_receipt_items.primary_key.columns
+                    ).in_(expired_items)
+                )
+            )
+            connection.execute(
+                delete(claim_session_acquire_receipts).where(
+                    claim_session_acquire_receipts.c.session_id == authority.session_id,
+                    claim_session_acquire_receipts.c.created_at <= cutoff,
+                    ~select(claim_session_acquire_receipt_items.c.input_index)
+                    .where(
+                        claim_session_acquire_receipt_items.c.session_id
+                        == claim_session_acquire_receipts.c.session_id,
+                        claim_session_acquire_receipt_items.c.request_id
+                        == claim_session_acquire_receipts.c.request_id,
+                    )
+                    .exists(),
+                )
+            )
+            header_count, item_count = connection.execute(
+                select(
+                    select(func.count())
+                    .select_from(claim_session_acquire_receipts)
+                    .where(
+                        claim_session_acquire_receipts.c.session_id
+                        == authority.session_id
+                    )
+                    .scalar_subquery(),
+                    select(func.count())
+                    .select_from(claim_session_acquire_receipt_items)
+                    .where(
+                        claim_session_acquire_receipt_items.c.session_id
+                        == authority.session_id
+                    )
+                    .scalar_subquery(),
+                )
+            ).one()
+            if header_count >= 1000 or item_count + len(requested) > 32000:
+                raise ClaimReceiptCapacityError("claim_receipt_capacity")
             owner_by_id = {row["session_id"]: row for row in locked}
             identities = {
                 query.identity.sequence_id: query.identity for query in requested

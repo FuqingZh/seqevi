@@ -608,8 +608,11 @@ class _HttpClaimSession:
                     self._claims.pop(commit.key, None)
                 if not remaining:
                     break
-                if len(remaining) == len(pending) or time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     raise
+                if len(remaining) == len(pending):
+                    if self._stop.wait(min(0.25, deadline - time.monotonic())):
+                        raise StoreError("ClaimSession closed during finalize recovery")
                 pending = remaining
         for commit in commits:
             self._claims.pop(commit.key, None)
@@ -693,14 +696,6 @@ def _record_matches_commit(record: EvidenceRecord, commit: EvidenceCommit) -> bo
     return (
         record.status == commit.status
         and record.payload_digest == commit.payload_digest
-        and record.normalized_artifact_digest
-        == (
-            None
-            if commit.normalized_artifact is None
-            else commit.normalized_artifact.digest
-        )
-        and record.raw_artifact_digest
-        == (None if commit.raw_artifact is None else commit.raw_artifact.digest)
     )
 
 
