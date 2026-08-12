@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -844,7 +844,9 @@ def test_http_acquire_replays_malformed_success_with_same_request_id(
     assert acquire_ids[0] == acquire_ids[1]
 
 
-@pytest.mark.parametrize("first_outcome", ["transport", "503"])
+@pytest.mark.parametrize(
+    "first_outcome", ["transport", "503", "412", "transport-then-412"]
+)
 def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
     tmp_path: Path,
     first_outcome: str,
@@ -903,9 +905,13 @@ def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
         if request.url.path.endswith("/finalize"):
             finalize_calls += 1
             if finalize_calls == 1:
-                if first_outcome == "transport":
+                if first_outcome in {"transport", "transport-then-412"}:
                     raise httpx.ReadError("response lost")
+                if first_outcome == "412":
+                    return httpx.Response(412, text="authority uncertain")
                 return httpx.Response(503, text="temporarily unavailable")
+            if first_outcome == "transport-then-412":
+                return httpx.Response(412, text="authority uncertain")
             return httpx.Response(200, json={"outcomes": ["created"]})
         if request.url.path.endswith("/authority"):
             return httpx.Response(200, json={"live": True})
@@ -947,6 +953,82 @@ def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
             assert session.finalize_many((commit,)) == (CommitOutcome.EXISTING,)
     assert finalize_calls == 2
     assert lookup_calls == 3
+
+
+def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
+    tmp_path: Path,
+) -> None:
+    commit = _hit_commit(tmp_path / "source", "MSTALLEDREADBACK")
+    query = EvidenceQuery(commit.identity, commit.key)
+    now = datetime.now(UTC)
+    lookup_timeouts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            return httpx.Response(503, text="unknown")
+        if request.url.path.endswith("/lookup"):
+            lookup_timeouts.append(request.extensions["timeout"]["read"])
+            raise httpx.ReadTimeout("stalled")
+        return httpx.Response(200, json={"live": True})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            session.acquire_many((query,))
+            store._uploaded_artifact_digests.update(
+                payload.digest
+                for payload in (commit.normalized_artifact, commit.raw_artifact)
+                if payload is not None
+            )
+            session._renew_deadline = time.monotonic() + 0.4
+            with pytest.raises(StoreError):
+                session.finalize_many((commit,))
+    assert lookup_timeouts
+    assert all(0 < timeout <= 0.4 for timeout in lookup_timeouts)
 
 
 def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> None:
@@ -1082,6 +1164,54 @@ def test_http_heartbeat_renews_before_request_deadline() -> None:
         session = store.claim_session()
         assert renewed.wait(1.0)
         session.close()
+
+
+def test_http_heartbeat_applies_deterministic_session_jitter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renewed = threading.Event()
+    now = datetime.now(UTC)
+    started = time.monotonic()
+    monkeypatch.setattr("seqevi.store.client.random.uniform", lambda _a, _b: 0.8)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open") or request.url.path.endswith("/renew"):
+            if request.url.path.endswith("/renew"):
+                renewed.set()
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 0.2,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        session = store.claim_session()
+        assert renewed.wait(1.0)
+        session.close()
+    assert time.monotonic() - started < 0.5
 
 
 def test_shared_store_configuration_requires_postgres_and_postgres_engine(
@@ -2210,6 +2340,111 @@ def test_postgres_maintenance_watchdog_remains_armed_through_ddl(
         with pytest.raises((TimeoutError, DBAPIError)):
             store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
         engine.dispose()
+
+
+def test_maintenance_timeout_show_mismatch_discards_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timers = []
+
+    class FakeTimer:
+        daemon = False
+
+        def __init__(self, _delay, _callback):
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one(self):
+            return self.value
+
+    class Raw:
+        def cancel(self):
+            pass
+
+    class Holder:
+        driver_connection = Raw()
+
+    class FakeConnection:
+        connection = Holder()
+
+        def __init__(self):
+            self.invalidated = False
+
+        def execution_options(self, **_kwargs):
+            return self
+
+        def exec_driver_sql(self, statement):
+            return Result("wrong" if statement == "SHOW transaction_timeout" else None)
+
+        def invalidate(self):
+            self.invalidated = True
+
+    monkeypatch.setattr(store_migration.threading, "Timer", FakeTimer)
+    connection = FakeConnection()
+    with pytest.raises(RuntimeError, match="setup readback"):
+        store_migration._arm_postgres_transaction_timeout(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, connection), time.monotonic() + 10
+        )
+    assert connection.invalidated
+    assert timers[0].cancelled
+
+
+def test_maintenance_watchdog_classifies_expiry_during_commit_as_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTimer:
+        daemon = False
+
+        def __init__(self, _delay, _callback):
+            self.cancelled = False
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    class Raw:
+        def cancel(self):
+            pass
+
+    class Holder:
+        driver_connection = Raw()
+
+    class FakeConnection:
+        connection = Holder()
+
+        def __init__(self):
+            self.invalidated = False
+            self.watchdog: Any = None
+
+        def commit(self):
+            self.watchdog.expired.set()
+
+        def invalidate(self):
+            self.invalidated = True
+
+    monkeypatch.setattr(store_migration.threading, "Timer", FakeTimer)
+    connection = FakeConnection()
+    watchdog = store_migration._MaintenanceWatchdog(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, connection), time.monotonic() + 10
+    )
+    connection.watchdog = watchdog
+    with pytest.raises(
+        store_migration._AmbiguousMaintenanceCommit  # pyright: ignore[reportPrivateUsage]
+    ):
+        watchdog.commit()
+    assert connection.invalidated
 
 
 @pytest.mark.requires_postgres

@@ -391,6 +391,7 @@ class _HttpClaimSession:
         self._lock = threading.Lock()
         self._lost: BaseException | None = None
         self._claims: dict[EvidenceKey, SessionEvidenceClaim] = {}
+        self._heartbeat_jitter = random.uniform(0.8, 1.2)
         request_started = time.monotonic()
         open_deadline = request_started + 30.0
         request = ClaimSessionOpenRequest(
@@ -469,7 +470,7 @@ class _HttpClaimSession:
         while True:
             with self._lock:
                 delay = min(
-                    self._authority.heartbeat_after_seconds,
+                    self._authority.heartbeat_after_seconds * self._heartbeat_jitter,
                     max(self._renew_deadline - time.monotonic() - 1.0, 0.0),
                 )
             if self._stop.wait(delay):
@@ -705,16 +706,55 @@ class _HttpClaimSession:
                     "finalize response requires terminal evidence reconciliation"
                 )
             except (StoreError, ValueError) as error:
-                if isinstance(error, _StoreResponseError) and error.status_code < 500:
+                if (
+                    isinstance(error, _StoreResponseError)
+                    and error.status_code < 500
+                    and error.status_code != 412
+                    and not unknown_outcome
+                ):
                     raise
                 unknown_outcome = True
                 recovery_error = error
             while True:
                 try:
-                    found = self.store.lookup_many(
+                    remaining_time = deadline - time.monotonic()
+                    if remaining_time <= 0:
+                        raise EvidenceClaimLostError(
+                            "ClaimSession finalize readback deadline expired"
+                        )
+                    queries = tuple(
                         EvidenceQuery(commit.identity, commit.key)
                         for commit, _ in pending
                     )
+                    lookup_request = LookupRequest(
+                        queries=[
+                            EvidenceQueryModel.from_domain(query) for query in queries
+                        ]
+                    )
+                    try:
+                        lookup_response = self.store.client.request(
+                            "POST",
+                            "/v1/evidence/lookup",
+                            timeout=httpx.Timeout(remaining_time),
+                            json=lookup_request.model_dump(mode="json"),
+                        )
+                    except httpx.HTTPError as error:
+                        raise StoreError(
+                            "finalize evidence readback transport failed"
+                        ) from error
+                    _raise_for_store_status(lookup_response)
+                    lookup_payload = LookupResponse.model_validate(
+                        lookup_response.json()
+                    )
+                    expected = {query.key for query in queries}
+                    found = {}
+                    for model in lookup_payload.records:
+                        record = model.to_domain()
+                        if record.key not in expected or record.key in found:
+                            raise StoreIntegrityError(
+                                "shared Store returned unexpected lookup records"
+                            )
+                        found[record.key] = record
                     break
                 except StoreError:
                     remaining_time = deadline - time.monotonic()

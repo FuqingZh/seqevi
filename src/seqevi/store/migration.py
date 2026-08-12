@@ -52,11 +52,24 @@ class _MaintenanceWatchdog:
         self.timer.daemon = True
         self.timer.start()
 
-    def cancel_precommit(self) -> None:
-        self.timer.cancel()
+    def require_precommit_budget(self) -> None:
         if self.expired.is_set():
             self.connection.invalidate()
             raise TimeoutError("ClaimSession maintenance exceeded its deadline")
+
+    def commit(self) -> None:
+        self.require_precommit_budget()
+        try:
+            self.connection.commit()
+        except DBAPIError as error:
+            raise _AmbiguousMaintenanceCommit from error
+        finally:
+            self.timer.cancel()
+        if self.expired.is_set():
+            self.connection.invalidate()
+            raise _AmbiguousMaintenanceCommit(
+                "maintenance commit exceeded its client deadline"
+            )
 
     def cancel(self) -> None:
         self.timer.cancel()
@@ -318,7 +331,7 @@ def _run_maintenance_upgrade(
     connection: Connection,
     acknowledgement: MaintenanceAcknowledgement,
     deadline: float,
-    before_commit: Callable[[], None] | None = None,
+    commit: Callable[[], None] | None = None,
 ) -> None:
     revision = _revision(connection)
     if revision != acknowledgement.expected_revision:
@@ -341,19 +354,20 @@ def _run_maintenance_upgrade(
     _remaining(deadline)
     command.upgrade(_configure(connection), _CURRENT_REVISION)
     _remaining(deadline)
-    if before_commit is not None:
-        before_commit()
-    try:
-        connection.commit()
-    except DBAPIError as error:
-        raise _AmbiguousMaintenanceCommit from error
+    if commit is not None:
+        commit()
+    else:
+        try:
+            connection.commit()
+        except DBAPIError as error:
+            raise _AmbiguousMaintenanceCommit from error
 
 
 def _run_maintenance_downgrade(
     connection: Connection,
     acknowledgement: MaintenanceAcknowledgement,
     deadline: float,
-    before_commit: Callable[[], None] | None = None,
+    commit: Callable[[], None] | None = None,
 ) -> None:
     revision = _revision(connection)
     if revision != acknowledgement.expected_revision or revision != _CURRENT_REVISION:
@@ -362,12 +376,13 @@ def _run_maintenance_downgrade(
     _remaining(deadline)
     command.downgrade(_configure(connection), _AUTOMATIC_EXISTING_CEILING)
     _remaining(deadline)
-    if before_commit is not None:
-        before_commit()
-    try:
-        connection.commit()
-    except DBAPIError as error:
-        raise _AmbiguousMaintenanceCommit from error
+    if commit is not None:
+        commit()
+    else:
+        try:
+            connection.commit()
+        except DBAPIError as error:
+            raise _AmbiguousMaintenanceCommit from error
 
 
 def _maintenance_upgrade_postgres(
@@ -416,14 +431,14 @@ def _maintenance_upgrade_postgres(
                             connection,
                             acknowledgement,
                             deadline,
-                            watchdog.cancel_precommit,
+                            watchdog.commit,
                         )
                     else:
                         _run_maintenance_upgrade(
                             connection,
                             acknowledgement,
                             deadline,
-                            watchdog.cancel_precommit,
+                            watchdog.commit,
                         )
                     break
                 except DBAPIError as error:
@@ -483,6 +498,8 @@ def _arm_postgres_transaction_timeout(
         connection.invalidate()
         raise TimeoutError("ClaimSession maintenance timeout setup exceeded deadline")
     if configured not in {f"{remaining_ms}ms", f"{remaining_ms / 1000:g}s"}:
+        watchdog.cancel()
+        connection.invalidate()
         raise RuntimeError(
             "transaction_timeout setup readback did not match remaining budget"
         )
