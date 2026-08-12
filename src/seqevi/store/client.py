@@ -477,17 +477,32 @@ class _HttpClaimSession:
                 return
             started = time.monotonic()
             try:
-                response = self._request_until(
-                    "POST",
-                    "/v1/internal/claim-sessions/renew",
-                    deadline=self._renew_deadline,
-                    json=ClaimSessionRenewRequest.model_validate(
-                        self._authority_request()
-                    ).model_dump(mode="json"),
+                authority_request, renew_deadline = (
+                    self._authority_request_and_deadline()
                 )
-                renewed = ClaimSessionRenewResponse.model_validate(
-                    response.json()
-                ).to_domain()
+                renew_json = ClaimSessionRenewRequest.model_validate(
+                    authority_request
+                ).model_dump(mode="json")
+                while True:
+                    response = self._request_until(
+                        "POST",
+                        "/v1/internal/claim-sessions/renew",
+                        deadline=renew_deadline,
+                        json=renew_json,
+                    )
+                    try:
+                        renewed = ClaimSessionRenewResponse.model_validate(
+                            response.json()
+                        ).to_domain()
+                        break
+                    except (ValueError, StoreIntegrityError):
+                        remaining = renew_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise
+                        if self._stop.wait(min(0.25, remaining)):
+                            raise StoreError(
+                                "ClaimSession closed during renewal recovery"
+                            )
                 with self._lock:
                     self._authority = renewed
                     self._renew_deadline = self._authority_deadline(renewed, started)
@@ -501,6 +516,8 @@ class _HttpClaimSession:
     ) -> tuple[SessionClaimAcquireResult, ...]:
         self.raise_if_lost()
         requested = tuple(requested_queries)
+        if len({query.key for query in requested}) != len(requested):
+            raise ValueError("acquire batch contains a duplicate evidence key")
         results: list[SessionClaimAcquireResult] = []
         maximum = min(
             self.capabilities.maximum_batch_size, self.store.maximum_batch_size
@@ -756,7 +773,7 @@ class _HttpClaimSession:
                             )
                         found[record.key] = record
                     break
-                except StoreError:
+                except (StoreError, ValueError):
                     remaining_time = deadline - time.monotonic()
                     if remaining_time <= 0:
                         raise

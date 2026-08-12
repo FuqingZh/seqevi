@@ -398,13 +398,25 @@ def _maintenance_upgrade_postgres(
         cleanup: BaseException | None = None
         try:
             while not acquired:
-                acquired = bool(
-                    connection.exec_driver_sql(
-                        "SELECT pg_try_advisory_lock(%s)",
-                        (_POSTGRES_MIGRATION_LOCK_ID,),
-                    ).scalar_one()
-                )
-                connection.commit()
+                lock_watchdog = _MaintenanceWatchdog(connection, deadline)
+                try:
+                    acquired = bool(
+                        connection.exec_driver_sql(
+                            "SELECT pg_try_advisory_lock(%s)",
+                            (_POSTGRES_MIGRATION_LOCK_ID,),
+                        ).scalar_one()
+                    )
+                    connection.commit()
+                except BaseException:
+                    connection.invalidate()
+                    raise
+                finally:
+                    lock_watchdog.cancel()
+                if lock_watchdog.expired.is_set():
+                    connection.invalidate()
+                    raise TimeoutError(
+                        "ClaimSession maintenance advisory lock exceeded deadline"
+                    )
                 if not acquired:
                     time.sleep(min(random.uniform(1.0, 5.0), _remaining(deadline)))
             while True:

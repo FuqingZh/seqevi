@@ -18,6 +18,7 @@ from .adapters.base import AdapterBatchResult, AnnotationAdapter
 from .errors import AnnotationError, OutputPackageError
 from .evidence import (
     ClaimDisposition,
+    CommitOutcome,
     EvidenceCommit,
     EvidenceQuery,
     EvidenceSource,
@@ -478,7 +479,12 @@ def _run_annotation_batch(
             batches += 1
         else:
             claim_session.raise_if_lost()
-            claim_session.finalize_many(commit_batch)
+            outcomes = claim_session.finalize_many(commit_batch)
+            peer_completed_sequence_ids.update(
+                commit.identity.sequence_id
+                for commit, outcome in zip(commit_batch, outcomes, strict=True)
+                if outcome is CommitOutcome.EXISTING
+            )
             batches += 1
     return _BatchMetrics(
         commit_batches=batches,

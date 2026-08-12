@@ -192,12 +192,15 @@ def create_service_app(
     def claim_session_capabilities() -> ClaimSessionCapabilitiesResponse:
         if not database.supports_claim_sessions:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "ClaimSession unsupported")
-        return ClaimSessionCapabilitiesResponse(
-            maximum_batch_size=min(
-                settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE
-            ),
-            server_time=database.database_time(),
-        )
+        try:
+            return ClaimSessionCapabilitiesResponse(
+                maximum_batch_size=min(
+                    settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE
+                ),
+                server_time=database.database_time(),
+            )
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
 
     @app.post(
         "/v1/internal/claim-sessions/open", response_model=ClaimSessionOpenResponse

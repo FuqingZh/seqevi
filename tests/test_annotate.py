@@ -96,6 +96,32 @@ class _CloseFailingStore(_CountingStore):
         return CloseFailingSession()  # type: ignore[return-value]
 
 
+class _PeerWinningStore(_CountingStore):
+    def claim_session(self) -> ClaimSession:
+        delegate = self.delegate.claim_session()
+        store = self.delegate
+
+        class PeerWinningSession:
+            def __enter__(self):
+                delegate.__enter__()
+                return self
+
+            def __exit__(self, *_error):
+                return delegate.__exit__(*_error)
+
+            def finalize_many(
+                self, commits: Iterable[EvidenceCommit]
+            ) -> tuple[CommitOutcome, ...]:
+                proposed = tuple(commits)
+                store.commit_many(proposed)
+                return delegate.finalize_many(proposed)
+
+            def __getattr__(self, name):
+                return getattr(delegate, name)
+
+        return PeerWinningSession()  # type: ignore[return-value]
+
+
 class _FailSecondBatchAdapter:
     def __init__(self, delegate: FixtureAdapter) -> None:
         self.delegate = delegate
@@ -461,6 +487,31 @@ def test_completed_batch_is_reused_after_later_tool_batch_fails(
     assert recovered.cache_hits == 2
     assert recovered.computed == 1
     assert recovered.metrics.tool_batches == 1
+
+
+def test_annotation_classifies_finalize_peer_winner_as_cache_hit(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+
+    with LocalStore.open(tmp_path / "store") as delegate:
+        summary = run_annotation(
+            fasta_path=fasta,
+            output_dir=tmp_path / "output",
+            adapter=adapter,
+            store=_PeerWinningStore(delegate),
+        )
+
+    assert summary.cache_hits == 1
+    assert summary.computed == 0
+    assert read_result_table(summary.output_dir, "main.sequence_map").get_column(
+        "EvidenceSource"
+    ).to_list() == ["cache"]
 
 
 @pytest.mark.parametrize(
