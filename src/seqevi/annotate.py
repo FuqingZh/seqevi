@@ -146,6 +146,7 @@ def run_annotation(
     adapter_seconds = 0.0
     store_commit_seconds = 0.0
     claim_session: ClaimSession | None = None
+    primary_failure: BaseException | None = None
     try:
         keys_by_sequence_id = {}
         computed_ids: set[str] = set()
@@ -340,6 +341,7 @@ def run_annotation(
         )
         package_seconds = time.perf_counter() - package_started
     except BaseException as error:
+        primary_failure = error
         if not isinstance(error, Exception):
             raise
         raise AnnotationError(
@@ -349,7 +351,14 @@ def run_annotation(
         shutil.rmtree(work_dir, ignore_errors=True)
     finally:
         if claim_session is not None:
-            claim_session.__exit__(None, None, None)
+            try:
+                claim_session.__exit__(None, None, None)
+            except BaseException as close_error:
+                if primary_failure is None:
+                    raise
+                primary_failure.add_note(
+                    f"ClaimSession cleanup also failed: {close_error!r}"
+                )
         shutil.rmtree(stage.root, ignore_errors=True)
 
     statuses = [fetched.record.status for fetched in fetched_by_sequence_id.values()]

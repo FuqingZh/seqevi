@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 from collections import defaultdict
 from collections.abc import Iterable
@@ -269,7 +270,19 @@ class PostgresEvidencePersistence:
     def open_claim_session(
         self, *, open_request_id: str, server_time: datetime, open_not_after: datetime
     ) -> ClaimSessionAuthority:
-        request_digest = hashlib.sha256(b"claim-session-v1").hexdigest()
+        server_time = _as_utc(server_time)
+        open_not_after = _as_utc(open_not_after)
+        request_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "protocol": "claim-session-v1",
+                    "server_time": server_time.isoformat(),
+                    "open_not_after": open_not_after.isoformat(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         with self._transaction() as connection:
             connection.execute(
                 text("SELECT pg_advisory_xact_lock(:lock_id)"),
@@ -295,8 +308,8 @@ class PostgresEvidencePersistence:
             now = _database_now(connection)
             if existing is not None:
                 if existing["request_digest"] != request_digest:
-                    raise EvidenceClaimLostError(
-                        "ClaimSession open receipt is terminal"
+                    raise EvidenceConflictError(
+                        "open_request_id was reused with different timing fields"
                     )
                 session = (
                     connection.execute(
@@ -316,8 +329,6 @@ class PostgresEvidencePersistence:
                         "ClaimSession open receipt is terminal"
                     )
                 return _session_authority_from_receipt(existing, now)
-            server_time = _as_utc(server_time)
-            open_not_after = _as_utc(open_not_after)
             if (
                 server_time > now
                 or open_not_after <= now

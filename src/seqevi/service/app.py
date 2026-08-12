@@ -316,12 +316,15 @@ def create_service_app(
     def claim_session_authority(
         request: ClaimSessionAuthorityCheckRequest,
     ) -> ClaimSessionAuthorityCheckResponse:
-        return ClaimSessionAuthorityCheckResponse(
-            live=database.claim_session_authority_is_live(
-                _request_authority(request),
-                (claim.to_domain() for claim in request.claims),
+        try:
+            return ClaimSessionAuthorityCheckResponse(
+                live=database.claim_session_authority_is_live(
+                    _request_authority(request),
+                    (claim.to_domain() for claim in request.claims),
+                )
             )
-        )
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
 
     @app.post(
         "/v1/internal/claim-sessions/finalize",

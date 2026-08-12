@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import random
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,6 +29,10 @@ _CLAIM_SESSION_TABLES = {
     "claim_session_acquire_receipts",
     "claim_session_acquire_receipt_items",
 }
+
+
+class _AmbiguousMaintenanceCommit(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,25 +157,31 @@ def maintenance_upgrade_database(
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
-        with _bounded_file_lock(store_root, deadline), engine.connect() as connection:
-            remaining = _remaining(deadline)
-            connection.exec_driver_sql(
-                f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
-            )
-            raw = cast(Any, connection.connection.driver_connection)
-            raw.set_progress_handler(
-                lambda: 1 if time.monotonic() >= deadline else 0, 1000
-            )
-            try:
-                connection.exec_driver_sql("BEGIN EXCLUSIVE")
-                _run_maintenance_upgrade(connection, acknowledgement, deadline)
-            finally:
-                raw.set_progress_handler(None, 0)
+        try:
+            with (
+                _bounded_file_lock(store_root, deadline),
+                engine.connect() as connection,
+            ):
+                remaining = _remaining(deadline)
+                connection.exec_driver_sql(
+                    f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
+                )
+                raw = cast(Any, connection.connection.driver_connection)
+                raw.set_progress_handler(
+                    lambda: 1 if time.monotonic() >= deadline else 0, 1000
+                )
+                try:
+                    connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                    _run_maintenance_upgrade(connection, acknowledgement, deadline)
+                finally:
+                    raw.set_progress_handler(None, 0)
+        except _AmbiguousMaintenanceCommit as error:
+            _classify_ambiguous_maintenance(engine, _CURRENT_REVISION, error)
         _verify_maintenance_completion(engine, _CURRENT_REVISION)
         return
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline)
-    except DBAPIError as error:
+    except _AmbiguousMaintenanceCommit as error:
         _classify_ambiguous_maintenance(engine, _CURRENT_REVISION, error)
     _verify_maintenance_completion(engine, _CURRENT_REVISION)
 
@@ -188,24 +199,30 @@ def maintenance_downgrade_database(
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
-        with _bounded_file_lock(store_root, deadline), engine.connect() as connection:
-            connection.exec_driver_sql(
-                f"PRAGMA busy_timeout={max(int(_remaining(deadline) * 1000), 1)}"
-            )
-            raw = cast(Any, connection.connection.driver_connection)
-            raw.set_progress_handler(
-                lambda: 1 if time.monotonic() >= deadline else 0, 1000
-            )
-            try:
-                connection.exec_driver_sql("BEGIN EXCLUSIVE")
-                _run_maintenance_downgrade(connection, acknowledgement, deadline)
-            finally:
-                raw.set_progress_handler(None, 0)
+        try:
+            with (
+                _bounded_file_lock(store_root, deadline),
+                engine.connect() as connection,
+            ):
+                connection.exec_driver_sql(
+                    f"PRAGMA busy_timeout={max(int(_remaining(deadline) * 1000), 1)}"
+                )
+                raw = cast(Any, connection.connection.driver_connection)
+                raw.set_progress_handler(
+                    lambda: 1 if time.monotonic() >= deadline else 0, 1000
+                )
+                try:
+                    connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                    _run_maintenance_downgrade(connection, acknowledgement, deadline)
+                finally:
+                    raw.set_progress_handler(None, 0)
+        except _AmbiguousMaintenanceCommit as error:
+            _classify_ambiguous_maintenance(engine, _AUTOMATIC_EXISTING_CEILING, error)
         _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING)
         return
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline, downgrade=True)
-    except DBAPIError as error:
+    except _AmbiguousMaintenanceCommit as error:
         _classify_ambiguous_maintenance(engine, _AUTOMATIC_EXISTING_CEILING, error)
     _verify_maintenance_completion(engine, _AUTOMATIC_EXISTING_CEILING)
 
@@ -296,7 +313,10 @@ def _run_maintenance_upgrade(
     _remaining(deadline)
     command.upgrade(_configure(connection), _CURRENT_REVISION)
     _remaining(deadline)
-    connection.commit()
+    try:
+        connection.commit()
+    except DBAPIError as error:
+        raise _AmbiguousMaintenanceCommit from error
 
 
 def _run_maintenance_downgrade(
@@ -311,7 +331,10 @@ def _run_maintenance_downgrade(
     _remaining(deadline)
     command.downgrade(_configure(connection), _AUTOMATIC_EXISTING_CEILING)
     _remaining(deadline)
-    connection.commit()
+    try:
+        connection.commit()
+    except DBAPIError as error:
+        raise _AmbiguousMaintenanceCommit from error
 
 
 def _maintenance_upgrade_postgres(
@@ -400,10 +423,29 @@ def _arm_postgres_transaction_timeout(connection: Connection, deadline: float) -
 
     remaining_ms = max(int(_remaining(deadline) * 1000), 1)
     autocommit = connection.execution_options(isolation_level="AUTOCOMMIT")
-    autocommit.exec_driver_sql(f"SET transaction_timeout = '{remaining_ms}ms'")
-    configured = str(
-        autocommit.exec_driver_sql("SHOW transaction_timeout").scalar_one()
-    )
+    expired = threading.Event()
+    raw = cast(Any, connection.connection.driver_connection)
+
+    def cancel_stalled_setup() -> None:
+        expired.set()
+        try:
+            raw.cancel()
+        except BaseException:
+            connection.invalidate()
+
+    timer = threading.Timer(_remaining(deadline), cancel_stalled_setup)
+    timer.daemon = True
+    timer.start()
+    try:
+        autocommit.exec_driver_sql(f"SET transaction_timeout = '{remaining_ms}ms'")
+        configured = str(
+            autocommit.exec_driver_sql("SHOW transaction_timeout").scalar_one()
+        )
+    finally:
+        timer.cancel()
+    if expired.is_set():
+        connection.invalidate()
+        raise TimeoutError("ClaimSession maintenance timeout setup exceeded deadline")
     if configured not in {f"{remaining_ms}ms", f"{remaining_ms / 1000:g}s"}:
         raise RuntimeError(
             "transaction_timeout setup readback did not match remaining budget"

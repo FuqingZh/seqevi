@@ -35,6 +35,7 @@ from seqevi.errors import (
     EvidenceClaimLostError,
     EvidenceConflictError,
     StoreError,
+    StoreBackpressureError,
     StoreIntegrityError,
 )
 from seqevi.evidence import (
@@ -69,6 +70,7 @@ from seqevi.store.schema import (
 from seqevi.store.transport import (
     ClaimSessionFinalizeItem,
     CommitModel,
+    EvidenceRecordModel,
     EvidenceQueryModel,
     canonical_query_digest,
 )
@@ -598,9 +600,11 @@ def test_http_receipt_capacity_restarts_acquire_with_new_request_id() -> None:
     assert acquire_ids[0] != acquire_ids[1]
 
 
-@pytest.mark.parametrize("first_results", [None, []])
+@pytest.mark.parametrize(
+    "malformation", ["missing", "wrong-count", "wrong-key", "wrong-disposition"]
+)
 def test_http_acquire_replays_malformed_success_with_same_request_id(
-    first_results: list[object] | None,
+    malformation: str,
 ) -> None:
     identity, key = _key("MAMBIGUOUSACQUIRE")
     query = EvidenceQuery(identity, key)
@@ -637,9 +641,43 @@ def test_http_acquire_replays_malformed_success_with_same_request_id(
         if request.url.path.endswith("/acquire"):
             acquire_ids.append(json.loads(request.content)["acquire_request_id"])
             if len(acquire_ids) == 1:
+                wrong_identity, wrong_key = _key("MOTHERACQUIREKEY")
+                malformed = {
+                    "missing": {},
+                    "wrong-count": {"results": []},
+                    "wrong-key": {
+                        "results": [
+                            {
+                                "disposition": "acquired",
+                                "claim": {
+                                    "key": EvidenceQueryModel.from_domain(
+                                        EvidenceQuery(wrong_identity, wrong_key)
+                                    ).key.model_dump(mode="json"),
+                                    "generation": 1,
+                                },
+                            }
+                        ]
+                    },
+                    "wrong-disposition": {
+                        "results": [
+                            {
+                                "disposition": "acquired",
+                                "busy": {
+                                    "key": EvidenceQueryModel.from_domain(
+                                        query
+                                    ).key.model_dump(mode="json"),
+                                    "expires_at": (
+                                        now + timedelta(seconds=30)
+                                    ).isoformat(),
+                                    "retry_after_seconds": 1,
+                                },
+                            }
+                        ]
+                    },
+                }[malformation]
                 return httpx.Response(
                     200,
-                    json={} if first_results is None else {"results": first_results},
+                    json=malformed,
                 )
             return httpx.Response(
                 200,
@@ -669,6 +707,107 @@ def test_http_acquire_replays_malformed_success_with_same_request_id(
             )
     assert len(acquire_ids) == 2
     assert acquire_ids[0] == acquire_ids[1]
+
+
+def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
+    tmp_path: Path,
+) -> None:
+    commit = _hit_commit(tmp_path / "source", "MUNKNOWNTHENSUCCESS")
+    query = EvidenceQuery(commit.identity, commit.key)
+    now = datetime.now(UTC)
+    finalize_calls = 0
+    lookup_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal finalize_calls, lookup_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            finalize_calls += 1
+            if finalize_calls == 1:
+                return httpx.Response(500, text="response lost")
+            return httpx.Response(200, json={"outcomes": ["created"]})
+        if request.url.path.endswith("/authority"):
+            return httpx.Response(200, json={"live": True})
+        if request.url.path.endswith("/lookup"):
+            lookup_calls += 1
+            if lookup_calls == 1:
+                return httpx.Response(503, text="transient readback")
+            records = []
+            if lookup_calls == 3:
+                records = [
+                    EvidenceRecordModel.from_domain(
+                        EvidenceRecord(
+                            key=commit.key,
+                            status=commit.status,
+                            payload_digest=commit.payload_digest,
+                            normalized_artifact_digest=commit.normalized_artifact.digest
+                            if commit.normalized_artifact
+                            else None,
+                            raw_artifact_digest=commit.raw_artifact.digest
+                            if commit.raw_artifact
+                            else None,
+                            created_at=now,
+                        )
+                    ).model_dump(mode="json")
+                ]
+            return httpx.Response(200, json={"records": records})
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            session.acquire_many((query,))
+            store._uploaded_artifact_digests.update(
+                payload.digest
+                for payload in (commit.normalized_artifact, commit.raw_artifact)
+                if payload is not None
+            )
+            assert session.finalize_many((commit,)) == (CommitOutcome.EXISTING,)
+    assert finalize_calls == 2
+    assert lookup_calls == 3
 
 
 def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> None:
@@ -1120,6 +1259,28 @@ def test_claim_session_sweeper_retries_after_connection_failure(tmp_path: Path) 
     assert persistence.sweeps >= 2
 
 
+def test_claim_session_authority_backpressure_is_503(tmp_path: Path) -> None:
+    class BackpressuredAuthorityPersistence(MemoryPersistence):
+        def claim_session_authority_is_live(self, _authority, _claims):
+            raise StoreBackpressureError("busy")
+
+    app = create_service_app(
+        _settings(tmp_path),
+        persistence=cast(ServicePersistence, BackpressuredAuthorityPersistence()),
+    )
+    with TestClient(app) as service:
+        response = service.post(
+            "/v1/internal/claim-sessions/authority",
+            json={
+                "session_id": "session",
+                "owner_token": "owner",
+                "generation": 1,
+                "claims": [],
+            },
+        )
+    assert response.status_code == 503
+
+
 @contextmanager
 def _isolated_postgres_url() -> Iterator[str]:
     database_url = os.environ.get("SEQEVI_TEST_POSTGRES_URL")
@@ -1335,6 +1496,45 @@ def test_postgres_fenced_downgrade_recreates_empty_0003_coordination() -> None:
             tables = set(inspect(connection).get_table_names())
             assert "claim_sessions" not in tables
             assert "evidence_claim" in tables
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_upgrade_stale_ack_on_0004_is_not_reconciled_as_success() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        persistence.close()
+        engine = create_engine(database_url)
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0003_evidence_claim_leases",
+        )
+        with pytest.raises(Exception):
+            store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_downgrade_stale_ack_on_0003_is_not_reconciled_as_success() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0004_claim_sessions",
+        )
+        with pytest.raises(Exception):
+            store_migration.maintenance_downgrade_database(
+                engine, None, acknowledgement
+            )
         engine.dispose()
 
 
@@ -1789,6 +1989,25 @@ def test_postgres_exact_session_and_claim_authority_readback() -> None:
         assert not persistence.claim_session_authority_is_live(
             authority, (acquired.claim,)
         )
+        persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_open_receipt_rejects_changed_timing_fields() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        persistence.open_claim_session(
+            open_request_id="timing-bound-open",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        with pytest.raises(EvidenceConflictError):
+            persistence.open_claim_session(
+                open_request_id="timing-bound-open",
+                server_time=server_time,
+                open_not_after=server_time + timedelta(seconds=29),
+            )
         persistence.close()
 
 

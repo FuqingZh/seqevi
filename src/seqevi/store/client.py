@@ -439,6 +439,17 @@ class _HttpClaimSession:
                 "generation": self._authority.generation,
             }
 
+    def _authority_request_and_deadline(self) -> tuple[dict[str, object], float]:
+        with self._lock:
+            return (
+                {
+                    "session_id": self._authority.session_id,
+                    "owner_token": self._authority.owner_token,
+                    "generation": self._authority.generation,
+                },
+                self._renew_deadline,
+            )
+
     def _heartbeat(self) -> None:
         while True:
             with self._lock:
@@ -483,16 +494,20 @@ class _HttpClaimSession:
             models = [EvidenceQueryModel.from_domain(query) for query in chunk]
             while True:
                 started = time.monotonic()
-                deadline = min(started + 30.0, self._renew_deadline)
+                authority_request, renew_deadline = (
+                    self._authority_request_and_deadline()
+                )
+                deadline = min(started + 30.0, renew_deadline)
                 request = ClaimSessionAcquireRequest.model_validate(
                     {
-                        **self._authority_request(),
+                        **authority_request,
                         "acquire_request_id": uuid4().hex,
                         "query_digest": canonical_query_digest(models),
                         "queries": [model.model_dump(mode="json") for model in models],
                     }
                 )
                 payload: ClaimSessionAcquireResponse | None = None
+                staged: list[SessionClaimAcquireResult] | None = None
                 while True:
                     try:
                         response = self._request_until(
@@ -508,6 +523,37 @@ class _HttpClaimSession:
                             raise StoreIntegrityError(
                                 "shared Store returned incomplete acquire results"
                             )
+                        staged = []
+                        for query, model in zip(chunk, payload.results, strict=True):
+                            record = (
+                                None
+                                if model.record is None
+                                else model.record.to_domain()
+                            )
+                            claim = (
+                                None if model.claim is None else model.claim.to_domain()
+                            )
+                            busy = (
+                                None if model.busy is None else model.busy.to_domain()
+                            )
+                            result = SessionClaimAcquireResult(
+                                model.disposition,
+                                record=record,
+                                claim=claim,
+                                busy=busy,
+                            )
+                            result_key = (
+                                record.key
+                                if record is not None
+                                else claim.key
+                                if claim is not None
+                                else busy.key  # type: ignore[union-attr]
+                            )
+                            if result_key != query.key:
+                                raise StoreIntegrityError(
+                                    "shared Store returned a mismatched acquire result"
+                                )
+                            staged.append(result)
                         break
                     except ClaimReceiptCapacityError:
                         delay = min(1.0, self._renew_deadline - time.monotonic())
@@ -524,28 +570,11 @@ class _HttpClaimSession:
                                 "ClaimSession closed during acquire recovery"
                             )
                         continue
-                if payload is not None:
+                if staged is not None:
                     break
-            for query, model in zip(chunk, payload.results, strict=True):
-                record = None if model.record is None else model.record.to_domain()
-                claim = None if model.claim is None else model.claim.to_domain()
-                busy = None if model.busy is None else model.busy.to_domain()
-                result = SessionClaimAcquireResult(
-                    model.disposition, record=record, claim=claim, busy=busy
-                )
-                if record is not None:
-                    key = record.key
-                elif claim is not None:
-                    key = claim.key
-                else:
-                    assert busy is not None
-                    key = busy.key
-                if key != query.key:
-                    raise StoreIntegrityError(
-                        "shared Store returned a mismatched acquire result"
-                    )
-                if claim is not None:
-                    self._claims[claim.key] = claim
+            for result in staged:
+                if result.claim is not None:
+                    self._claims[result.claim.key] = result.claim
                 results.append(result)
         return tuple(results)
 
@@ -583,14 +612,16 @@ class _HttpClaimSession:
                 )
             )
         started = time.monotonic()
-        deadline = min(started + 30.0, self._renew_deadline)
+        authority_request, renew_deadline = self._authority_request_and_deadline()
+        deadline = min(started + 30.0, renew_deadline)
         request_id = uuid4().hex
         pending = list(zip(commits, items, strict=True))
         resolved: dict[EvidenceKey, CommitOutcome] = {}
+        unknown_outcome = False
         while pending:
             request = ClaimSessionFinalizeRequest.model_validate(
                 {
-                    **self._authority_request(),
+                    **authority_request,
                     "finalize_request_id": request_id,
                     "commits": [item.model_dump(mode="json") for _, item in pending],
                 }
@@ -611,60 +642,78 @@ class _HttpClaimSession:
                     raise StoreIntegrityError(
                         "shared Store returned incomplete finalize outcomes"
                     )
-                resolved.update(
-                    (commit.key, outcome)
-                    for (commit, _item), outcome in zip(pending, returned, strict=True)
+                if not unknown_outcome:
+                    resolved.update(
+                        (commit.key, outcome)
+                        for (commit, _item), outcome in zip(
+                            pending, returned, strict=True
+                        )
+                    )
+                    break
+                recovery_error: BaseException = StoreError(
+                    "finalize response requires terminal evidence reconciliation"
                 )
-                break
             except (StoreError, ValueError) as error:
                 if isinstance(error, _StoreResponseError) and error.status_code < 500:
                     raise
-                found = self.store.lookup_many(
-                    EvidenceQuery(commit.identity, commit.key) for commit, _ in pending
-                )
-                remaining = []
-                for commit, item in pending:
-                    record = found.get(commit.key)
-                    if record is None:
-                        remaining.append((commit, item))
-                        continue
-                    if not _record_matches_commit(record, commit):
-                        raise EvidenceConflictError(
-                            "finalize readback found conflicting immutable evidence"
-                        ) from error
-                    resolved[commit.key] = CommitOutcome.EXISTING
-                    self._claims.pop(commit.key, None)
-                if not remaining:
+                unknown_outcome = True
+                recovery_error = error
+            while True:
+                try:
+                    found = self.store.lookup_many(
+                        EvidenceQuery(commit.identity, commit.key)
+                        for commit, _ in pending
+                    )
                     break
-                authority_check = ClaimSessionAuthorityCheckRequest.model_validate(
-                    {
-                        **self._authority_request(),
-                        "claims": [
-                            SessionEvidenceClaimModel.from_domain(
-                                self._claims[commit.key]
-                            ).model_dump(mode="json")
-                            for commit, _item in remaining
-                        ],
-                    }
-                )
-                authority_response = self._request_until(
-                    "POST",
-                    "/v1/internal/claim-sessions/authority",
-                    deadline=deadline,
-                    json=authority_check.model_dump(mode="json"),
-                )
-                if not ClaimSessionAuthorityCheckResponse.model_validate(
-                    authority_response.json()
-                ).live:
-                    raise EvidenceClaimLostError(
-                        "exact ClaimSession finalization authority was lost"
-                    ) from error
-                if time.monotonic() >= deadline:
-                    raise
-                if len(remaining) == len(pending):
-                    if self._stop.wait(min(0.25, deadline - time.monotonic())):
-                        raise StoreError("ClaimSession closed during finalize recovery")
-                pending = remaining
+                except StoreError:
+                    remaining_time = deadline - time.monotonic()
+                    if remaining_time <= 0:
+                        raise
+                    if self._stop.wait(min(0.25, remaining_time)):
+                        raise StoreError("ClaimSession closed during finalize readback")
+            remaining = []
+            for commit, item in pending:
+                record = found.get(commit.key)
+                if record is None:
+                    remaining.append((commit, item))
+                    continue
+                if not _record_matches_commit(record, commit):
+                    raise EvidenceConflictError(
+                        "finalize readback found conflicting immutable evidence"
+                    ) from recovery_error
+                resolved[commit.key] = CommitOutcome.EXISTING
+                self._claims.pop(commit.key, None)
+            if not remaining:
+                break
+            authority_check = ClaimSessionAuthorityCheckRequest.model_validate(
+                {
+                    **self._authority_request(),
+                    "claims": [
+                        SessionEvidenceClaimModel.from_domain(
+                            self._claims[commit.key]
+                        ).model_dump(mode="json")
+                        for commit, _item in remaining
+                    ],
+                }
+            )
+            authority_response = self._request_until(
+                "POST",
+                "/v1/internal/claim-sessions/authority",
+                deadline=deadline,
+                json=authority_check.model_dump(mode="json"),
+            )
+            if not ClaimSessionAuthorityCheckResponse.model_validate(
+                authority_response.json()
+            ).live:
+                raise EvidenceClaimLostError(
+                    "exact ClaimSession finalization authority was lost"
+                ) from recovery_error
+            if time.monotonic() >= deadline:
+                raise recovery_error
+            if len(remaining) == len(pending):
+                if self._stop.wait(min(0.25, deadline - time.monotonic())):
+                    raise StoreError("ClaimSession closed during finalize recovery")
+            pending = remaining
         for commit in commits:
             self._claims.pop(commit.key, None)
         return tuple(resolved[commit.key] for commit in commits)

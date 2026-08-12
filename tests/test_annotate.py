@@ -25,7 +25,7 @@ from seqevi.evidence import (
     FetchedEvidence,
 )
 from seqevi.sequence import identify_protein_sequence
-from seqevi.store import LocalStore
+from seqevi.store import ClaimSession, LocalStore
 
 from .support import (
     FixtureAdapter,
@@ -49,7 +49,7 @@ class _CountingStore:
     def supports_claim_sessions(self) -> bool:
         return self.delegate.supports_claim_sessions
 
-    def claim_session(self):
+    def claim_session(self) -> ClaimSession:
         return self.delegate.claim_session()
 
     def lookup_many(
@@ -75,6 +75,25 @@ class _CountingStore:
 
     def fetch(self, key: EvidenceKey) -> FetchedEvidence | None:
         return self.delegate.fetch(key)
+
+
+class _CloseFailingStore(_CountingStore):
+    def claim_session(self) -> ClaimSession:
+        delegate = self.delegate.claim_session()
+
+        class CloseFailingSession:
+            def __enter__(self):
+                delegate.__enter__()
+                return self
+
+            def __exit__(self, *_error):
+                delegate.__exit__(*_error)
+                raise RuntimeError("injected close failure")
+
+            def __getattr__(self, name):
+                return getattr(delegate, name)
+
+        return CloseFailingSession()  # type: ignore[return-value]
 
 
 class _FailSecondBatchAdapter:
@@ -481,3 +500,44 @@ def test_cancellation_stops_renewal_and_releases_active_claims(
 
     assert reacquired is not None
     assert reacquired.generation == 2
+
+
+def test_annotation_preserves_primary_failure_when_session_close_also_fails(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    delegate = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    cancellation = KeyboardInterrupt()
+    with LocalStore.open(tmp_path / "store") as local:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=tmp_path / "output",
+                adapter=_CancelAdapter(delegate, cancellation),
+                store=_CloseFailingStore(local),
+            )
+    assert raised.value is cancellation
+    assert any("cleanup also failed" in note for note in raised.value.__notes__)
+
+
+def test_annotation_surfaces_session_close_failure_after_success(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    with LocalStore.open(tmp_path / "store") as local:
+        with pytest.raises(RuntimeError, match="injected close failure"):
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=tmp_path / "output",
+                adapter=adapter,
+                store=_CloseFailingStore(local),
+            )
