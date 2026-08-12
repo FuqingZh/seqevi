@@ -234,11 +234,11 @@ OpaqueId = Annotated[str, Field(min_length=1, max_length=64)]
 
 
 class ClaimSessionCapabilitiesResponse(TransportModel):
-    protocol: Literal["claim-session-v1"] = "claim-session-v1"
+    protocol: Literal["claim-session-v1"]
     maximum_batch_size: Annotated[int, Field(ge=1, le=1000, strict=True)]
-    retention_seconds: Literal[60] = 60
-    maximum_session_receipt_headers: Literal[1000] = 1000
-    maximum_session_receipt_items: Literal[32000] = 32000
+    retention_seconds: Literal[60]
+    maximum_session_receipt_headers: Literal[1000]
+    maximum_session_receipt_items: Literal[32000]
     server_time: datetime
 
 
@@ -364,7 +364,7 @@ class ClaimSessionFinalizeItem(TransportModel):
 
 class ClaimSessionFinalizeRequest(ClaimSessionAuthorityModel):
     finalize_request_id: OpaqueId
-    commits: list[ClaimSessionFinalizeItem]
+    commits: Annotated[list[ClaimSessionFinalizeItem], Field(min_length=1)]
 
     @model_validator(mode="after")
     def validate_unique_keys(self) -> ClaimSessionFinalizeRequest:

@@ -129,13 +129,15 @@ def create_service_app(
         if operation is not None:
             request.state.seqevi_claim_request_id = uuid4().hex
             request.state.seqevi_claim_started = perf_counter()
+            request.state.seqevi_claim_batch_size = None
+            request.state.seqevi_claim_logged = False
         try:
             response = await call_next(request)
         except Exception:
-            if operation is not None:
+            if operation is not None and not request.state.seqevi_claim_logged:
                 _log_claim_request(
                     operation,
-                    batch_size=0,
+                    batch_size=request.state.seqevi_claim_batch_size,
                     outcome="error",
                     status_code=500,
                     request_id=request.state.seqevi_claim_request_id,
@@ -145,10 +147,10 @@ def create_service_app(
                     ),
                 )
             raise
-        if operation is not None:
+        if operation is not None and not request.state.seqevi_claim_logged:
             _log_claim_request(
                 operation,
-                batch_size=0,
+                batch_size=request.state.seqevi_claim_batch_size,
                 outcome="ok" if response.status_code < 400 else "http_error",
                 status_code=response.status_code,
                 request_id=request.state.seqevi_claim_request_id,
@@ -165,6 +167,7 @@ def create_service_app(
         operation = _claim_operation(request.url.path)
         if operation is not None:
             started = getattr(request.state, "seqevi_claim_started", perf_counter())
+            request.state.seqevi_claim_logged = True
             _log_claim_request(
                 operation,
                 batch_size=_claim_batch_size(operation, error.body),
@@ -194,9 +197,13 @@ def create_service_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "ClaimSession unsupported")
         try:
             return ClaimSessionCapabilitiesResponse(
+                protocol="claim-session-v1",
                 maximum_batch_size=min(
                     settings.maximum_batch_size, _CLAIM_MAXIMUM_BATCH_SIZE
                 ),
+                retention_seconds=60,
+                maximum_session_receipt_headers=1000,
+                maximum_session_receipt_items=32000,
                 server_time=database.database_time(),
             )
         except StoreBackpressureError as error:
@@ -273,7 +280,9 @@ def create_service_app(
     )
     def acquire_claim_session(
         request: ClaimSessionAcquireRequest,
+        http_request: Request,
     ) -> ClaimSessionAcquireResponse:
+        http_request.state.seqevi_claim_batch_size = len(request.queries)
         _check_batch_size(len(request.queries), min(settings.maximum_batch_size, 1000))
         try:
             results = database.acquire_claim_session(
@@ -337,7 +346,9 @@ def create_service_app(
     )
     def finalize_claim_session(
         request: ClaimSessionFinalizeRequest,
+        http_request: Request,
     ) -> ClaimSessionFinalizeResponse:
+        http_request.state.seqevi_claim_batch_size = len(request.commits)
         _check_batch_size(len(request.commits), min(settings.maximum_batch_size, 1000))
         stored = {}
         references: dict[str, ArtifactReferenceModel] = {}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 import logging
 import json
@@ -512,6 +513,105 @@ def test_configure_claim_logging_attaches_an_info_handler() -> None:
         logger.propagate = propagate
 
 
+def test_claim_request_logging_uses_validated_batch_size_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ObservedPersistence(MemoryPersistence):
+        finalize_calls = 0
+
+        @property
+        def supports_claim_sessions(self) -> bool:
+            return True
+
+        def acquire_claim_session(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, _authority, **_kwargs
+        ):
+            return ()
+
+        def finalize_claim_session(self, _authority, commits, _stored_artifacts):
+            proposed = tuple(commits)
+            self.finalize_calls += 1
+            return (CommitOutcome.CREATED,) * len(proposed)
+
+    observed: list[tuple[str, int | None, int]] = []
+    service_app_module = importlib.import_module("seqevi.service.app")
+
+    def record(operation: str, **fields: object) -> None:
+        observed.append(
+            (
+                operation,
+                cast(int | None, fields["batch_size"]),
+                cast(int, fields["status_code"]),
+            )
+        )
+
+    monkeypatch.setattr(service_app_module, "_log_claim_request", record)
+    persistence = ObservedPersistence()
+    app = create_service_app(
+        _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
+    )
+    identity, key = _key("MOBSERVEDCLAIMBATCH")
+    query = EvidenceQuery(identity, key)
+    commit = _hit_commit(tmp_path / "source", "MOBSERVEDCLAIMBATCH")
+    authority = {"session_id": "session", "owner_token": "owner", "generation": 1}
+
+    with TestClient(app) as client:
+        acquire = client.post(
+            "/v1/internal/claim-sessions/acquire",
+            json={
+                **authority,
+                "acquire_request_id": "acquire-observed",
+                "query_digest": canonical_query_digest(
+                    [EvidenceQueryModel.from_domain(query)]
+                ),
+                "queries": [
+                    EvidenceQueryModel.from_domain(query).model_dump(mode="json")
+                ],
+            },
+        )
+        empty = client.post(
+            "/v1/internal/claim-sessions/finalize",
+            json={
+                **authority,
+                "finalize_request_id": "finalize-empty",
+                "commits": [],
+            },
+        )
+        for artifact in (commit.normalized_artifact, commit.raw_artifact):
+            assert artifact is not None
+            uploaded = client.put(
+                f"/v1/artifacts/{artifact.digest}",
+                headers={
+                    "X-Artifact-Media-Type": artifact.media_type,
+                    "X-Artifact-Byte-Size": str(artifact.byte_size),
+                },
+                content=artifact.path.read_bytes(),
+            )
+            assert uploaded.status_code == 200
+        finalized = client.post(
+            "/v1/internal/claim-sessions/finalize",
+            json={
+                **authority,
+                "finalize_request_id": "finalize-observed",
+                "commits": [
+                    ClaimSessionFinalizeItem(
+                        commit=CommitModel.from_domain(commit), claim_generation=1
+                    ).model_dump(mode="json")
+                ],
+            },
+        )
+
+    assert acquire.status_code == 200
+    assert empty.status_code == 422
+    assert finalized.status_code == 200
+    assert persistence.finalize_calls == 1
+    assert [item for item in observed if item[0] in {"acquire", "finalize"}] == [
+        ("acquire", 1, 200),
+        ("finalize", 0, 422),
+        ("finalize", 1, 200),
+    ]
+
+
 def _claim_mock_client(handler: httpx.MockTransport) -> httpx.Client:
     return httpx.Client(transport=handler, base_url="http://testserver")
 
@@ -539,6 +639,7 @@ def test_http_claim_session_refresh_uses_bounded_capability_timeout() -> None:
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -569,6 +670,42 @@ def test_http_claim_session_refresh_uses_bounded_capability_timeout() -> None:
     assert capability_timeouts == [30.0, 30.0]
 
 
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "protocol",
+        "maximum_batch_size",
+        "retention_seconds",
+        "maximum_session_receipt_headers",
+        "maximum_session_receipt_items",
+        "server_time",
+    ],
+)
+def test_http_claim_session_rejects_partial_capability_advertisement(
+    missing: str,
+) -> None:
+    payload = {
+        "protocol": "claim-session-v1",
+        "maximum_batch_size": 1000,
+        "retention_seconds": 60,
+        "maximum_session_receipt_headers": 1000,
+        "maximum_session_receipt_items": 32000,
+        "server_time": datetime.now(UTC).isoformat(),
+    }
+    del payload[missing]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        return httpx.Response(200, json=payload)
+
+    with pytest.raises(ValidationError):
+        HttpEvidenceStore(
+            "http://testserver",
+            client=_claim_mock_client(httpx.MockTransport(handler)),
+        )
+
+
 def test_http_open_replays_malformed_success_with_same_request_id() -> None:
     now = datetime.now(UTC)
     open_ids: list[str] = []
@@ -582,6 +719,7 @@ def test_http_open_replays_malformed_success_with_same_request_id() -> None:
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -628,6 +766,7 @@ def test_http_empty_finalize_is_a_noop() -> None:
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -676,6 +815,7 @@ def test_http_finalize_rejects_logical_duplicate_before_chunk_or_upload(
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -748,6 +888,7 @@ def test_http_receipt_capacity_restarts_acquire_with_new_request_id() -> None:
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -830,6 +971,7 @@ def test_http_acquire_replays_malformed_success_with_same_request_id(
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -935,6 +1077,7 @@ def test_http_acquire_rejects_duplicate_keys_before_logical_batch_chunking() -> 
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -994,6 +1137,7 @@ def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -1107,6 +1251,7 @@ def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -1186,6 +1331,7 @@ def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> N
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -1264,6 +1410,7 @@ def test_http_heartbeat_renews_before_request_deadline() -> None:
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -1306,7 +1453,10 @@ def test_http_heartbeat_renews_before_request_deadline() -> None:
         session.close()
 
 
-def test_http_heartbeat_malformed_success_is_terminal_session_loss() -> None:
+@pytest.mark.parametrize("renewal_failure", ["malformed", "authority-switch"])
+def test_http_heartbeat_invalid_success_is_terminal_session_loss(
+    renewal_failure: str,
+) -> None:
     malformed = threading.Event()
     now = datetime.now(UTC)
     renewal_payloads: list[dict[str, object]] = []
@@ -1320,6 +1470,7 @@ def test_http_heartbeat_malformed_success_is_terminal_session_loss() -> None:
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),
@@ -1341,7 +1492,20 @@ def test_http_heartbeat_malformed_success_is_terminal_session_loss() -> None:
         if request.url.path.endswith("/renew"):
             renewal_payloads.append(json.loads(request.content))
             malformed.set()
-            return httpx.Response(200, json={})
+            if renewal_failure == "malformed":
+                return httpx.Response(200, json={})
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "other-session",
+                    "owner_token": "other-owner",
+                    "generation": 2,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
@@ -1374,6 +1538,7 @@ def test_http_heartbeat_applies_deterministic_session_jitter(
                 json={
                     "protocol": "claim-session-v1",
                     "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
                     "maximum_session_receipt_headers": 1000,
                     "maximum_session_receipt_items": 32000,
                     "server_time": now.isoformat(),

@@ -492,6 +492,14 @@ class _HttpClaimSession:
                 renewed = ClaimSessionRenewResponse.model_validate(
                     response.json()
                 ).to_domain()
+                if (
+                    renewed.session_id != authority_request["session_id"]
+                    or renewed.owner_token != authority_request["owner_token"]
+                    or renewed.generation != authority_request["generation"]
+                ):
+                    raise StoreIntegrityError(
+                        "renewal response switched ClaimSession authority"
+                    )
                 with self._lock:
                     self._authority = renewed
                     self._renew_deadline = self._authority_deadline(renewed, started)
