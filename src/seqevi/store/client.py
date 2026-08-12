@@ -21,6 +21,7 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from queue import PriorityQueue
 from typing import Any
@@ -760,10 +761,23 @@ class HttpEvidenceStore:
         )
         for offset in range(0, len(items), maximum):
             chunk = items[offset : offset + maximum]
-            request = ClaimFinalizeRequest(
-                commits=[ClaimedCommitModel.from_domain(item) for item in chunk]
+            # Artifact uploads happen before the claim request. A background
+            # renewer can therefore have replaced the server expiry while the
+            # immutable handles in ``proposed`` still carry the old deadline.
+            # Refresh this chunk after uploads so both the transport budget and
+            # the finalize payload reflect current authority.
+            refreshed = self._refresh_claims_for_finalize(
+                tuple(item.claim for item in chunk)
             )
-            claim_budget = _claim_request_budget(tuple(item.claim for item in chunk))
+            refreshed_by_key = {claim.key: claim for claim in refreshed}
+            current = tuple(
+                ClaimedEvidenceCommit(item.commit, refreshed_by_key[item.claim.key])
+                for item in chunk
+            )
+            request = ClaimFinalizeRequest(
+                commits=[ClaimedCommitModel.from_domain(item) for item in current]
+            )
+            claim_budget = _claim_request_budget(refreshed)
             if claim_budget <= 0:
                 raise EvidenceClaimLostError(
                     "claim finalization could not start before its authority runway"
@@ -781,6 +795,26 @@ class HttpEvidenceStore:
                 )
             outcomes.extend(returned)
         return tuple(outcomes)
+
+    def _refresh_claims_for_finalize(
+        self, claims: tuple[EvidenceClaim, ...]
+    ) -> tuple[EvidenceClaim, ...]:
+        """Refresh claims after artifact transfer without stale deadlines."""
+
+        maximum = min(
+            self._claim_capabilities.maximum_batch_size,  # type: ignore[union-attr]
+            self.maximum_batch_size,
+            _CLAIM_MUTATION_CHUNK_SIZE,
+        )
+        refreshed: list[EvidenceClaim] = []
+        for offset in range(0, len(claims), maximum):
+            refreshed.extend(
+                self._renew_claim_chunk(
+                    claims[offset : offset + maximum],
+                    enforce_authority_budget=False,
+                )
+            )
+        return tuple(refreshed)
 
     def fetch(self, key: EvidenceKey) -> FetchedEvidence | None:
         return self.fetch_many((key,)).get(key)
@@ -965,11 +999,15 @@ class HttpEvidenceStore:
         return index, self._renew_claim_chunk(chunk)
 
     def _renew_claim_chunk(
-        self, chunk: tuple[EvidenceClaim, ...]
+        self,
+        chunk: tuple[EvidenceClaim, ...],
+        *,
+        enforce_authority_budget: bool = True,
     ) -> tuple[EvidenceClaim, ...]:
-        timeout = min(
-            self._timeout_seconds,
-            _claim_request_budget(chunk),
+        timeout = (
+            min(self._timeout_seconds, _claim_request_budget(chunk))
+            if enforce_authority_budget
+            else self._timeout_seconds
         )
         if timeout <= 0:
             raise EvidenceClaimLostError(
@@ -1166,7 +1204,14 @@ def _claim_retry_delay(response: httpx.Response) -> float:
     try:
         base = float(raw) if raw is not None else _DEFAULT_CLAIM_RETRY_SECONDS
     except ValueError:
-        base = _DEFAULT_CLAIM_RETRY_SECONDS
+        try:
+            retry_at = parsedate_to_datetime(raw or "")
+        except (TypeError, ValueError, OverflowError):
+            base = _DEFAULT_CLAIM_RETRY_SECONDS
+        else:
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            base = (retry_at - datetime.now(retry_at.tzinfo)).total_seconds()
     base = max(0.01, base)
     jitter = base * _CLAIM_RETRY_JITTER_RATIO
     return base + random.uniform(0.0, jitter)

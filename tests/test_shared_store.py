@@ -9,6 +9,7 @@ from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
 from typing import Literal, cast
 
@@ -1022,10 +1023,11 @@ def test_http_finalize_uses_claim_authority_budget(
         key,
         "owner",
         1,
-        datetime.now(UTC) + timedelta(seconds=20),
+        datetime.now(UTC) - timedelta(seconds=1),
         5.0,
     )
     captured: dict[str, object] = {}
+    paths: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
@@ -1036,6 +1038,23 @@ def test_http_finalize_uses_claim_authority_budget(
 
     def claim_request(method: str, path: str, **kwargs: object) -> httpx.Response:
         assert method == "POST"
+        paths.append(path)
+        if path.endswith("/renew"):
+            renewed = EvidenceClaim(
+                claim.key,
+                claim.owner_token,
+                claim.generation,
+                datetime.now(UTC) + timedelta(seconds=20),
+                claim.renewal_after_seconds,
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "claims": [
+                        EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
+                    ]
+                },
+            )
         assert path.endswith("/finalize")
         captured.update(kwargs)
         return httpx.Response(200, json={"outcomes": ["created"]})
@@ -1051,6 +1070,22 @@ def test_http_finalize_uses_claim_authority_budget(
     timeout = captured["timeout"]
     assert isinstance(timeout, float)
     assert 0 < timeout < 20
+    assert paths == ["/v1/evidence/claims/renew", "/v1/evidence/claims/finalize"]
+
+
+def test_http_claim_retry_after_http_date_is_a_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retry_at = datetime.now(UTC) + timedelta(seconds=30)
+    monkeypatch.setattr(client_module.random, "uniform", lambda _low, _high: 0.0)
+    response = httpx.Response(
+        503,
+        headers={"Retry-After": format_datetime(retry_at, usegmt=True)},
+    )
+
+    delay = client_module._claim_retry_delay(response)  # pyright: ignore[reportPrivateUsage]
+
+    assert 28.0 <= delay <= 30.0
 
 
 def test_http_claim_scheduler_recomputes_timeout_after_queueing(
