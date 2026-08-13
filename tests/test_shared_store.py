@@ -2374,6 +2374,41 @@ def test_sqlite_maintenance_revalidates_target_after_file_fence(
     engine.dispose()
 
 
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+def test_sqlite_maintenance_pins_acknowledged_file_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, direction: str
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    replacement_path = tmp_path / "replacement.sqlite3"
+    for path in (database_path, replacement_path):
+        path.touch()
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        store_migration._database_identity(engine, store_root),  # pyright: ignore[reportPrivateUsage]
+        "0003_evidence_claim_leases"
+        if direction == "upgrade"
+        else "0004_claim_sessions",
+    )
+    original_pin = store_migration._pinned_sqlite_database  # pyright: ignore[reportPrivateUsage]
+
+    def replace_before_pin(path: Path, identity: tuple[int, int]):
+        database_path.replace(tmp_path / "acknowledged.sqlite3")
+        replacement_path.replace(database_path)
+        return original_pin(path, identity)
+
+    monkeypatch.setattr(store_migration, "_pinned_sqlite_database", replace_before_pin)
+    operation = (
+        store_migration.maintenance_upgrade_database
+        if direction == "upgrade"
+        else store_migration.maintenance_downgrade_database
+    )
+    with pytest.raises(RuntimeError, match="changed while opening"):
+        operation(engine, store_root, acknowledgement)
+    engine.dispose()
+
+
 def test_sqlite_maintenance_discards_stale_pooled_database_handle(
     tmp_path: Path,
 ) -> None:

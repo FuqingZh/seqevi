@@ -160,13 +160,19 @@ def _sqlite_file_identity(path_or_fd: Path | int) -> tuple[int, int]:
 
 
 @contextmanager
-def _pinned_sqlite_database(path: Path) -> Iterator[int]:
+def _pinned_sqlite_database(
+    path: Path, acknowledged_identity: tuple[int, int]
+) -> Iterator[int]:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags)
     try:
-        if _sqlite_file_identity(path) != _sqlite_file_identity(descriptor):
+        descriptor_identity = _sqlite_file_identity(descriptor)
+        if (
+            _sqlite_file_identity(path) != descriptor_identity
+            or descriptor_identity != acknowledged_identity
+        ):
             raise RuntimeError("SQLite maintenance database changed while opening")
         yield descriptor
     finally:
@@ -264,15 +270,20 @@ def maintenance_upgrade_database(
 ) -> None:
     """Apply 0004 under a bounded persistence fence after operator quiescence."""
 
-    if acknowledgement.database_identity != _database_identity(engine, store_root):
-        raise RuntimeError("maintenance acknowledgement targets another database")
     deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
         database_path = _canonical_sqlite_database_path(engine, store_root)
+        if acknowledgement.database_identity != engine.url.set(
+            database=str(database_path)
+        ).render_as_string(hide_password=True):
+            raise RuntimeError("maintenance acknowledgement targets another database")
+        acknowledged_identity = _sqlite_file_identity(database_path)
         engine.dispose()
-        with _pinned_sqlite_database(database_path) as pinned_descriptor:
+        with _pinned_sqlite_database(
+            database_path, acknowledged_identity
+        ) as pinned_descriptor:
             try:
                 with (
                     _bounded_file_lock(store_root, deadline),
@@ -313,6 +324,8 @@ def maintenance_upgrade_database(
                 sqlite_binding=(database_path, pinned_descriptor),
             )
         return
+    if acknowledgement.database_identity != _database_identity(engine, store_root):
+        raise RuntimeError("maintenance acknowledgement targets another database")
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline)
     except _AmbiguousMaintenanceCommit as error:
@@ -330,15 +343,20 @@ def maintenance_downgrade_database(
 ) -> None:
     """Downgrade 0004 to empty 0003 coordination under the same bounded fence."""
 
-    if acknowledgement.database_identity != _database_identity(engine, store_root):
-        raise RuntimeError("maintenance acknowledgement targets another database")
     deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
         database_path = _canonical_sqlite_database_path(engine, store_root)
+        if acknowledgement.database_identity != engine.url.set(
+            database=str(database_path)
+        ).render_as_string(hide_password=True):
+            raise RuntimeError("maintenance acknowledgement targets another database")
+        acknowledged_identity = _sqlite_file_identity(database_path)
         engine.dispose()
-        with _pinned_sqlite_database(database_path) as pinned_descriptor:
+        with _pinned_sqlite_database(
+            database_path, acknowledged_identity
+        ) as pinned_descriptor:
             try:
                 with (
                     _bounded_file_lock(store_root, deadline),
@@ -380,6 +398,8 @@ def maintenance_downgrade_database(
                 sqlite_binding=(database_path, pinned_descriptor),
             )
         return
+    if acknowledgement.database_identity != _database_identity(engine, store_root):
+        raise RuntimeError("maintenance acknowledgement targets another database")
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline, downgrade=True)
     except _AmbiguousMaintenanceCommit as error:
