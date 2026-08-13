@@ -753,20 +753,7 @@ class _HttpClaimSession:
                     payload is not None
                     and payload.digest not in self.store._uploaded_artifact_digests
                 ):
-                    upload_started = time.monotonic()
-                    _authority, upload_authority_deadline = (
-                        self._authority_request_and_deadline()
-                    )
-                    upload_deadline = min(
-                        upload_started + 30.0,
-                        upload_authority_deadline
-                        - _FINALIZE_RECONCILIATION_RUNWAY_SECONDS,
-                    )
-                    if upload_deadline <= upload_started:
-                        raise EvidenceClaimLostError(
-                            "ClaimSession artifact upload has no reconciliation runway"
-                        )
-                    self._upload_until(payload, deadline=upload_deadline)
+                    self._upload_artifact(payload)
                     self.store._uploaded_artifact_digests.add(payload.digest)
         items = []
         for commit in commits:
@@ -1048,6 +1035,19 @@ class _HttpClaimSession:
         )
         if uploaded != expected:
             raise StoreIntegrityError("shared Store returned wrong artifact metadata")
+
+    def _upload_artifact(self, payload: ArtifactFile) -> None:
+        upload_started = time.monotonic()
+        _authority, authority_deadline = self._authority_request_and_deadline()
+        upload_deadline = min(
+            upload_started + 30.0,
+            authority_deadline - _FINALIZE_RECONCILIATION_RUNWAY_SECONDS,
+        )
+        if upload_deadline <= upload_started:
+            raise EvidenceClaimLostError(
+                "ClaimSession artifact upload has no reconciliation runway"
+            )
+        self._upload_until(payload, deadline=upload_deadline)
 
     def close(self) -> None:
         if self._stop.is_set():

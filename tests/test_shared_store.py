@@ -803,6 +803,62 @@ def test_async_artifact_read_does_not_block_other_requests(
     runtime.close()
 
 
+def test_claim_artifact_upload_reserves_reconciliation_runway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    payload = write_artifact_file(
+        tmp_path / "artifact", b"payload", "application/octet-stream"
+    )
+    session = object.__new__(store_client_module._HttpClaimSession)
+    authority_deadline = 105.0
+    observed: list[float] = []
+    monkeypatch.setattr(store_client_module.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        session,
+        "_authority_request_and_deadline",
+        lambda: ({}, authority_deadline),
+    )
+    monkeypatch.setattr(
+        session,
+        "_upload_until",
+        lambda _payload, *, deadline: observed.append(deadline),
+    )
+
+    session._upload_artifact(payload)
+
+    assert observed == [
+        authority_deadline - store_client_module._FINALIZE_RECONCILIATION_RUNWAY_SECONDS
+    ]
+
+
+def test_claim_artifact_upload_rejects_insufficient_runway_before_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    payload = write_artifact_file(
+        tmp_path / "artifact", b"payload", "application/octet-stream"
+    )
+    session = object.__new__(store_client_module._HttpClaimSession)
+    upload_called = False
+    monkeypatch.setattr(store_client_module.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        session,
+        "_authority_request_and_deadline",
+        lambda: ({}, 100.5),
+    )
+
+    def record_upload(_payload: object, *, deadline: float) -> None:
+        nonlocal upload_called
+        upload_called = True
+
+    monkeypatch.setattr(session, "_upload_until", record_upload)
+
+    with pytest.raises(EvidenceClaimLostError, match="no reconciliation runway"):
+        session._upload_artifact(payload)
+    assert not upload_called
+
+
 def test_slow_renew_body_promptly_publishes_session_loss() -> None:
     now = datetime.now(UTC)
     renew_body = _BlockingAsyncBody()
