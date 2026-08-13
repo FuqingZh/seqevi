@@ -660,8 +660,10 @@ def test_http_store_released_constructor_compatibility_boundary() -> None:
 class _BlockingAsyncBody(httpx.AsyncByteStream):
     def __init__(self) -> None:
         self.cancelled = threading.Event()
+        self.started = threading.Event()
 
     async def __aiter__(self):
+        self.started.set()
         yield b"{"
         try:
             await asyncio.Event().wait()
@@ -904,6 +906,146 @@ def test_claim_transport_request_close_admission_race_does_not_strand() -> None:
     runtime.close()
 
 
+def test_claim_resolver_normal_result_shape() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://127.0.0.1", 10.0, httpx.MockTransport(lambda _: httpx.Response(200))
+    )
+    resolved = runtime.run(runtime._loop.getaddrinfo(b"localhost", 443, type=1))
+    runtime.close()
+    assert resolved
+    assert all(len(item) == 5 and isinstance(item[4], tuple) for item in resolved)
+
+
+def test_claim_resolver_close_kills_and_reaps_stalled_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    pid_file = tmp_path / "resolver.pid"
+    monkeypatch.setattr(
+        store_client_module,
+        "_resolver_command",
+        lambda *_args: (
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,signal,sys;"
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()),encoding='ascii');"
+                "signal.pause()"
+            ),
+            str(pid_file),
+        ),
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.get_running_loop().getaddrinfo(b"stalled.invalid", 443)
+        return httpx.Response(200)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://127.0.0.1", 10.0, httpx.MockTransport(handler)
+    )
+    errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    close_done = threading.Event()
+
+    def resolve() -> None:
+        try:
+            runtime.request("GET", "/resolve", deadline=time.monotonic() + 0.2)
+        except BaseException as error:
+            errors.append(error)
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    worker = threading.Thread(target=resolve)
+    worker.start()
+    for _attempt in range(50):
+        if pid_file.exists():
+            break
+        time.sleep(0.01)
+    resolver_pid = int(pid_file.read_text(encoding="ascii"))
+    closer = threading.Thread(target=close_runtime)
+    closer.start()
+    worker.join(1.0)
+    closer.join(1.0)
+    assert len(errors) == 1 and isinstance(errors[0], TimeoutError)
+    assert not close_errors
+    assert not worker.is_alive()
+    assert not closer.is_alive()
+    assert close_done.is_set()
+    with pytest.raises(ProcessLookupError):
+        os.kill(resolver_pid, 0)
+
+
+def test_claim_transport_concurrent_close_waits_for_owner() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://127.0.0.1", 10.0, httpx.MockTransport(lambda _: httpx.Response(200))
+    )
+    operation_started = threading.Event()
+    release = threading.Event()
+
+    def operation() -> None:
+        with runtime.operation():
+            operation_started.set()
+            release.wait()
+
+    worker = threading.Thread(target=operation)
+    worker.start()
+    assert operation_started.wait(0.2)
+    closed: list[int] = []
+    close_errors: list[BaseException] = []
+
+    def close_runtime(index: int) -> None:
+        try:
+            runtime.close()
+            closed.append(index)
+        except BaseException as error:
+            close_errors.append(error)
+
+    closers = [
+        threading.Thread(target=close_runtime, args=(index,)) for index in range(2)
+    ]
+    for closer in closers:
+        closer.start()
+    time.sleep(0.05)
+    assert not closed
+    release.set()
+    for closer in closers:
+        closer.join(0.5)
+    worker.join(0.5)
+    assert not worker.is_alive()
+    assert all(not closer.is_alive() for closer in closers)
+    assert not close_errors
+    assert sorted(closed) == [0, 1]
+
+
+def test_claim_transport_aclose_failure_still_joins_runtime() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+
+    class FailingCloseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            del request
+            return httpx.Response(200)
+
+        async def aclose(self) -> None:
+            raise RuntimeError("close failed")
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://127.0.0.1", 10.0, FailingCloseTransport()
+    )
+    with pytest.raises(RuntimeError, match="close failed"):
+        runtime.close()
+    assert not runtime._thread.is_alive()
+    with pytest.raises(RuntimeError, match="close failed"):
+        runtime.close()
+
+
 def test_claim_artifact_upload_reserves_reconciliation_runway(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1091,20 +1233,52 @@ def test_finalize_commit_then_slow_body_reconciles_inside_original_budget(
             200, json={"session_id": "slow-finalize", "generation": 1}
         )
 
-    with HttpEvidenceStore(
+    store = HttpEvidenceStore(
         "http://testserver",
         maximum_artifact_bytes=1024,
         maximum_batch_size=1000,
         _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
         _async_transport=httpx.MockTransport(handler),
-    ) as store:
-        with store.claim_session() as session:
-            session.acquire_many((query,))
-            store._uploaded_artifact_digests.update(
-                (normalized_artifact.digest, raw_artifact.digest)
-            )
-            session._renew_deadline = time.monotonic() + 1.3
-            assert session.finalize_many((commit,)) == (CommitOutcome.EXISTING,)
+    )
+    session = store.claim_session()
+    session.acquire_many((query,))
+    store._uploaded_artifact_digests.update(
+        (normalized_artifact.digest, raw_artifact.digest)
+    )
+    session._renew_deadline = time.monotonic() + 1.3
+    outcomes: list[tuple[CommitOutcome, ...]] = []
+    errors: list[BaseException] = []
+
+    def finalize_once() -> None:
+        try:
+            outcomes.append(session.finalize_many((commit,)))
+        except BaseException as error:
+            errors.append(error)
+
+    def close_once() -> None:
+        try:
+            store.close()
+            closed.set()
+        except BaseException as error:
+            errors.append(error)
+
+    finalize = threading.Thread(target=finalize_once)
+    finalize.start()
+    assert slow_body.started.wait(0.5)
+    closed = threading.Event()
+    close = threading.Thread(target=close_once)
+    close.start()
+    time.sleep(0.05)
+    assert not closed.is_set()
+    finalize.join(2.0)
+    close.join(2.0)
+    session._stop.set()
+    session._thread.join(0.5)
+    assert outcomes == [(CommitOutcome.EXISTING,)]
+    assert not finalize.is_alive()
+    assert not close.is_alive()
+    assert not errors
+    assert closed.is_set()
     assert slow_body.cancelled.is_set()
     assert lookup_remaining and all(
         0 < remaining <= 1.0 for remaining in lookup_remaining

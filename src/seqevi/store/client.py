@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import math
 import os
@@ -100,6 +101,28 @@ def _artifact_reader_command(path: Path) -> tuple[str, ...]:
     return (sys.executable, "-m", "seqevi.store._artifact_reader", str(path))
 
 
+def _resolver_command(
+    host: str | bytes,
+    port: int,
+    family: int,
+    socktype: int,
+    proto: int,
+    flags: int,
+) -> tuple[str, ...]:
+    resolver_host = host.decode("ascii") if isinstance(host, bytes) else host
+    return (
+        sys.executable,
+        "-m",
+        "seqevi.store._resolver",
+        resolver_host,
+        str(port),
+        str(family),
+        str(socktype),
+        str(proto),
+        str(flags),
+    )
+
+
 class _ClaimTransportRuntime:
     """Store-owned async client whose loop makes request cancellation joinable."""
 
@@ -112,7 +135,12 @@ class _ClaimTransportRuntime:
         self._loop = asyncio.new_event_loop()
         self._started = threading.Event()
         self._closing = threading.Event()
+        self._closed = threading.Event()
         self._admission_lock = threading.Lock()
+        self._operation_condition = threading.Condition(self._admission_lock)
+        self._operation_local = threading.local()
+        self._active_operations = 0
+        self._close_error: BaseException | None = None
         self._requests: set[asyncio.Task[object]] = set()
         self._thread = threading.Thread(
             target=self._run,
@@ -127,9 +155,61 @@ class _ClaimTransportRuntime:
 
     def _run(self) -> None:
         asyncio.set_event_loop(self._loop)
+        self._loop.getaddrinfo = self._getaddrinfo  # type: ignore[method-assign]
         self._started.set()
         self._loop.run_forever()
         self._loop.close()
+
+    async def _getaddrinfo(
+        self, host: str | bytes, port: int, *args: int, **kwargs: int
+    ) -> list[tuple[int, int, int, str, tuple[object, ...]]]:
+        family = int(kwargs.get("family", args[0] if len(args) > 0 else 0))
+        socktype = int(kwargs.get("type", args[1] if len(args) > 1 else 0))
+        proto = int(kwargs.get("proto", args[2] if len(args) > 2 else 0))
+        flags = int(kwargs.get("flags", args[3] if len(args) > 3 else 0))
+        process = await asyncio.create_subprocess_exec(
+            *_resolver_command(host, port, family, socktype, proto, flags),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await process.communicate()
+        except asyncio.CancelledError:
+            await _stop_subprocess(process, cancel=True)
+            raise
+        if process.returncode != 0:
+            raise OSError(stderr[:4096].decode("utf-8", errors="replace"))
+        import json
+
+        payload = json.loads(stdout)
+        return [
+            (family, socktype, proto, canonname, tuple(sockaddr))
+            for family, socktype, proto, canonname, sockaddr in payload
+        ]
+
+    @contextlib.contextmanager
+    def operation(self) -> Iterator[None]:
+        depth = getattr(self._operation_local, "depth", 0)
+        if depth:
+            self._operation_local.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._operation_local.depth -= 1
+            return
+        with self._operation_condition:
+            if self._closing.is_set():
+                raise RuntimeError("ClaimSession transport is closing")
+            self._active_operations += 1
+            self._operation_local.depth = 1
+        try:
+            yield
+        finally:
+            self._operation_local.depth = 0
+            with self._operation_condition:
+                self._active_operations -= 1
+                self._operation_condition.notify_all()
 
     @staticmethod
     async def _create_client(
@@ -150,19 +230,15 @@ class _ClaimTransportRuntime:
     def request(
         self, method: str, path: str, *, deadline: float, **kwargs: Any
     ) -> httpx.Response:
-        with self._admission_lock:
-            if self._closing.is_set():
-                raise RuntimeError("ClaimSession transport is closed")
+        with self.operation():
             future: Future[httpx.Response] = asyncio.run_coroutine_threadsafe(
                 self._request(method, path, deadline=deadline, **kwargs), self._loop
             )
-        return future.result()
+            return future.result()
 
     async def _request(
         self, method: str, path: str, *, deadline: float, **kwargs: Any
     ) -> httpx.Response:
-        if self._closing.is_set():
-            raise RuntimeError("ClaimSession transport is closed")
         task = asyncio.current_task()
         assert task is not None
         self._requests.add(task)
@@ -180,24 +256,48 @@ class _ClaimTransportRuntime:
             self._requests.discard(task)
 
     async def _shutdown(self) -> None:
-        requests = tuple(self._requests)
-        for task in requests:
-            task.cancel()
-        if requests:
-            await asyncio.gather(*requests, return_exceptions=True)
         await self._client.aclose()
 
     def close(self) -> None:
-        if not self._thread.is_alive():
-            return
-        with self._admission_lock:
-            if self._closing.is_set():
+        if getattr(self._operation_local, "depth", 0):
+            raise RuntimeError("cannot close ClaimSession transport from an operation")
+        owner = False
+        with self._operation_condition:
+            if self._closed.is_set():
+                if self._close_error is not None:
+                    raise RuntimeError(
+                        "ClaimSession transport close failed"
+                    ) from self._close_error
                 return
+            if not self._closing.is_set():
+                owner = True
+                self._closing.set()
+            if not owner:
+                while not self._closed.is_set():
+                    self._operation_condition.wait()
+                if self._close_error is not None:
+                    raise RuntimeError(
+                        "ClaimSession transport close failed"
+                    ) from self._close_error
+                return
+            while self._active_operations:
+                self._operation_condition.wait()
+        error: BaseException | None = None
+        try:
             self._closing.set()
             shutdown = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
-        shutdown.result()
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join()
+            shutdown.result()
+        except BaseException as caught:
+            error = caught
+        finally:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join()
+            with self._operation_condition:
+                self._close_error = error
+                self._closed.set()
+                self._operation_condition.notify_all()
+        if error is not None:
+            raise error
 
 
 class HttpEvidenceStore:
@@ -286,6 +386,10 @@ class HttpEvidenceStore:
         return self._claim_session_capabilities is not None
 
     def claim_session(self) -> _HttpClaimSession:
+        with self._claim_transport.operation():
+            return self._claim_session()
+
+    def _claim_session(self) -> _HttpClaimSession:
         if self._claim_session_capabilities is None:
             raise StoreError("shared Store does not support ClaimSession")
         deadline = time.monotonic() + min(self._timeout_seconds, 30.0)
@@ -616,38 +720,44 @@ class _HttpClaimSession:
                 return
             started = time.monotonic()
             try:
-                authority_request, renew_deadline = (
-                    self._authority_request_and_deadline()
-                )
-                renew_json = ClaimSessionRenewRequest.model_validate(
-                    authority_request
-                ).model_dump(mode="json")
-                response = self._request_until(
-                    "POST",
-                    "/v1/internal/claim-sessions/renew",
-                    deadline=renew_deadline,
-                    json=renew_json,
-                )
-                renewed = ClaimSessionRenewResponse.model_validate(
-                    response.json()
-                ).to_domain()
-                if (
-                    renewed.session_id != authority_request["session_id"]
-                    or renewed.owner_token != authority_request["owner_token"]
-                    or renewed.generation != authority_request["generation"]
-                ):
-                    raise StoreIntegrityError(
-                        "renewal response switched ClaimSession authority"
-                    )
-                with self._lock:
-                    self._authority = renewed
-                    self._renew_deadline = self._authority_deadline(renewed, started)
+                with self.store._claim_transport.operation():
+                    self._heartbeat_once(started)
             except BaseException as error:
                 self._lost = error
                 self.cancellation_signal.set()
                 return
 
+    def _heartbeat_once(self, started: float) -> None:
+        authority_request, renew_deadline = self._authority_request_and_deadline()
+        renew_json = ClaimSessionRenewRequest.model_validate(
+            authority_request
+        ).model_dump(mode="json")
+        response = self._request_until(
+            "POST",
+            "/v1/internal/claim-sessions/renew",
+            deadline=renew_deadline,
+            json=renew_json,
+        )
+        renewed = ClaimSessionRenewResponse.model_validate(response.json()).to_domain()
+        if (
+            renewed.session_id != authority_request["session_id"]
+            or renewed.owner_token != authority_request["owner_token"]
+            or renewed.generation != authority_request["generation"]
+        ):
+            raise StoreIntegrityError(
+                "renewal response switched ClaimSession authority"
+            )
+        with self._lock:
+            self._authority = renewed
+            self._renew_deadline = self._authority_deadline(renewed, started)
+
     def acquire_many(
+        self, requested_queries: Iterable[EvidenceQuery]
+    ) -> tuple[SessionClaimAcquireResult, ...]:
+        with self.store._claim_transport.operation():
+            return self._acquire_many(requested_queries)
+
+    def _acquire_many(
         self, requested_queries: Iterable[EvidenceQuery]
     ) -> tuple[SessionClaimAcquireResult, ...]:
         self.raise_if_lost()
@@ -749,6 +859,12 @@ class _HttpClaimSession:
         return tuple(results)
 
     def finalize_many(
+        self, proposed: Iterable[EvidenceCommit]
+    ) -> tuple[CommitOutcome, ...]:
+        with self.store._claim_transport.operation():
+            return self._finalize_many(proposed)
+
+    def _finalize_many(
         self, proposed: Iterable[EvidenceCommit]
     ) -> tuple[CommitOutcome, ...]:
         self.raise_if_lost()
@@ -1069,6 +1185,10 @@ class _HttpClaimSession:
         self._upload_until(payload, deadline=upload_deadline)
 
     def close(self) -> None:
+        with self.store._claim_transport.operation():
+            self._close()
+
+    def _close(self) -> None:
         if self._stop.is_set():
             return
         self._stop.set()
@@ -1173,6 +1293,21 @@ async def _async_file_chunks(path: Path) -> Any:
 async def _stop_artifact_reader(
     process: asyncio.subprocess.Process, *, cancel: bool
 ) -> None:
+    await _stop_subprocess(process, cancel=cancel)
+    if not cancel and process.returncode != 0:
+        stderr = b""
+        if process.stderr is not None:
+            stderr = await process.stderr.read(4096)
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise StoreIntegrityError(
+            f"artifact reader exited with status {process.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+
+
+async def _stop_subprocess(
+    process: asyncio.subprocess.Process, *, cancel: bool
+) -> None:
     wait_task = asyncio.create_task(process.wait())
     if cancel and process.returncode is None:
         try:
@@ -1190,16 +1325,7 @@ async def _stop_artifact_reader(
                 pass
     # Deliberately unbounded for Linux D-state: this synchronous owner may not
     # claim deadline completion while its reader still exists.
-    returncode = await wait_task
-    if not cancel and returncode != 0:
-        stderr = b""
-        if process.stderr is not None:
-            stderr = await process.stderr.read(4096)
-        detail = stderr.decode("utf-8", errors="replace").strip()
-        raise StoreIntegrityError(
-            f"artifact reader exited with status {returncode}"
-            + (f": {detail}" if detail else "")
-        )
+    await wait_task
 
 
 def _raise_for_store_status(
