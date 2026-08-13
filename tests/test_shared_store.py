@@ -4766,6 +4766,149 @@ def test_postgres_maintenance_uses_environment_attempts_and_prefer_standby(
 
 
 @pytest.mark.parametrize("source", ["parameter", "environment"])
+def test_postgres_maintenance_counts_hostless_prefer_standby(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    cparams: dict[str, Any] = {}
+    if source == "parameter":
+        cparams["target_session_attrs"] = "prefer-standby"
+    else:
+        monkeypatch.setenv("PGTARGETSESSIONATTRS", "prefer-standby")
+    bounded, attempts = store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
+        cparams, time.monotonic() + 10
+    )
+    assert bounded["target_session_attrs"] == "prefer-standby"
+    assert "host" not in bounded and "hostaddr" not in bounded
+    assert attempts == 2
+
+
+def test_postgres_maintenance_resolves_mixed_explicit_and_default_ports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, int]] = []
+
+    def resolve(host: str, port: int, _deadline: float) -> tuple[str, ...]:
+        observed.append((host, port))
+        return ("192.0.2.1" if host == "one" else "192.0.2.2",)
+
+    monkeypatch.setattr(store_migration, "_resolve_postgres_host", resolve)
+    bounded, attempts = store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
+        {"host": "one,two", "port": "5433,"}, time.monotonic() + 10
+    )
+    assert attempts == 2
+    assert observed == [("one", 5433), ("two", 5432)]
+    assert bounded["port"] == "5433,"
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_deadline_cancels_first_connect_initialization() -> None:
+    with _isolated_postgres_url() as database_url:
+        database_url = (
+            make_url(database_url)
+            .set(host="127.0.0.1")
+            .render_as_string(hide_password=False)
+        )
+        engine = create_engine(database_url)
+
+        @event.listens_for(engine, "connect", insert=True)
+        def stall_first_connect(dbapi_connection, _connection_record) -> None:
+            with dbapi_connection.cursor() as cursor:
+                cursor.execute("SELECT pg_sleep(10)")
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="initialization exceeded deadline"):
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, started + 2.25
+            ):
+                pytest.fail("stalled first-connect initialization succeeded")
+        assert 2.0 <= time.monotonic() - started < 3.0
+        assert cast(Any, engine.pool).checkedout() == 0
+        assert not any(
+            thread.name == "seqevi-postgres-acquisition-watchdog" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_discards_connection_returned_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    psycopg = pytest.importorskip("psycopg")
+    with _isolated_postgres_url() as database_url:
+        direct_url = database_url.replace("postgresql+psycopg://", "postgresql://")
+        late_raw = psycopg.connect(direct_url)
+        engine = create_engine(database_url)
+
+        def delayed_connect(*_args: Any, **_kwargs: Any) -> Any:
+            time.sleep(2.5)
+            return late_raw
+
+        monkeypatch.setattr(engine.dialect, "connect", delayed_connect)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="initialization exceeded deadline"):
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, started + 2.25
+            ):
+                pytest.fail("late physical connection was accepted")
+        assert late_raw.closed
+        assert time.monotonic() - started < 3.0
+        assert cast(Any, engine.pool).checkedout() == 0
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_expiry_before_initialization_query_is_irreversible() -> (
+    None
+):
+    with _isolated_postgres_url() as database_url:
+        database_url = (
+            make_url(database_url)
+            .set(host="127.0.0.1")
+            .render_as_string(hide_password=False)
+        )
+        engine = create_engine(database_url)
+
+        @event.listens_for(engine, "connect", insert=True)
+        def start_initialization_after_expiry(
+            dbapi_connection, _connection_record
+        ) -> None:
+            time.sleep(2.35)
+            with dbapi_connection.cursor() as cursor:
+                cursor.execute("SELECT pg_sleep(10)")
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="initialization exceeded deadline"):
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, started + 2.25
+            ):
+                pytest.fail("initialization began after acquisition expiry")
+        assert 2.0 <= time.monotonic() - started < 3.0
+        assert cast(Any, engine.pool).checkedout() == 0
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_preserves_stricter_statement_timeout() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(
+            database_url,
+            connect_args={"options": "-c statement_timeout=1250ms"},
+        )
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ) as connection:
+            assert connection.execute(text("SHOW statement_timeout")).scalar_one() == (
+                "1250ms"
+            )
+        assert not any(
+            thread.name == "seqevi-postgres-acquisition-watchdog" and thread.is_alive()
+            for thread in threading.enumerate()
+        )
+        engine.dispose()
+
+
+@pytest.mark.parametrize("source", ["parameter", "environment"])
 def test_postgres_maintenance_rejects_service_derived_targets(
     monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
