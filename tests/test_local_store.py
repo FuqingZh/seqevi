@@ -449,6 +449,20 @@ def test_sweeper_close_is_bounded_by_writer_contention_and_recovers_next_open(
             )
 
 
+def test_sweeper_close_is_bounded_when_foreground_pool_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    store = LocalStore.open(tmp_path / "store")
+    foreground_connections = [store.engine.connect() for _ in range(15)]
+    try:
+        started = time.monotonic()
+        store.close()
+        assert time.monotonic() - started < 2.5
+    finally:
+        for connection in foreground_connections:
+            connection.close()
+
+
 def test_sweeper_restores_foreground_sqlite_busy_timeout(tmp_path: Path) -> None:
     with LocalStore.open(tmp_path / "store") as store:
         commit_timeouts: list[int] = []
@@ -458,11 +472,15 @@ def test_sweeper_restores_foreground_sqlite_busy_timeout(tmp_path: Path) -> None
                 connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
             )
 
-        event.listen(store.engine, "commit", record_commit_timeout)
+        event.listen(store._sweep_engine, "commit", record_commit_timeout)  # pyright: ignore[reportPrivateUsage]
         try:
             store._sweep_once()  # pyright: ignore[reportPrivateUsage]
         finally:
-            event.remove(store.engine, "commit", record_commit_timeout)
+            event.remove(
+                store._sweep_engine,  # pyright: ignore[reportPrivateUsage]
+                "commit",
+                record_commit_timeout,
+            )
         assert commit_timeouts == [100]
         with store.engine.connect() as connection:
             assert (

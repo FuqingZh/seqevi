@@ -16,6 +16,7 @@ from sqlalchemy import and_, create_engine, delete, event, select, tuple_, updat
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping, URL
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import NullPool
 
 from seqevi.errors import (
     EvidenceClaimLostError,
@@ -118,11 +119,13 @@ class LocalStore:
         *,
         root: Path,
         engine: Engine,
+        sweep_engine: Engine,
         artifact_store: PosixArtifactStore,
     ) -> None:
         self.root = root
         self.database_path = root / "store.sqlite3"
         self.engine = engine
+        self._sweep_engine = sweep_engine
         self.artifact_store = artifact_store
         self._sweeper_stop = threading.Event()
         self._sweeper_wake = threading.Event()
@@ -148,6 +151,11 @@ class LocalStore:
         engine = create_engine(url, connect_args={"timeout": 30.0})
         event.listen(engine, "connect", _configure_sqlite)
         event.listen(engine, "checkin", _reset_sqlite_after_sweep)
+        sweep_engine = create_engine(
+            url, connect_args={"timeout": 30.0}, poolclass=NullPool
+        )
+        event.listen(sweep_engine, "connect", _configure_sqlite)
+        event.listen(sweep_engine, "checkin", _reset_sqlite_after_sweep)
 
         try:
             upgrade_database(engine, root)
@@ -162,12 +170,14 @@ class LocalStore:
             store = cls(
                 root=root,
                 engine=engine,
+                sweep_engine=sweep_engine,
                 artifact_store=PosixArtifactStore(root / "artifacts"),
             )
             store._drain_coordination(time.monotonic() + _SWEEP_DRAIN_SECONDS)
             store._sweeper.start()
             return store
         except Exception:
+            sweep_engine.dispose()
             engine.dispose()
             raise
 
@@ -177,6 +187,7 @@ class LocalStore:
         self._sweeper.join(timeout=_SWEEP_SHUTDOWN_SECONDS)
         if not self._sweeper.is_alive():
             self._drain_coordination(time.monotonic() + _SWEEP_DRAIN_SECONDS)
+        self._sweep_engine.dispose()
         self.engine.dispose()
 
     def _sweep_loop(self) -> None:
@@ -220,7 +231,7 @@ class LocalStore:
         )
         now = datetime.now(UTC)
         removed = 0
-        with self.engine.begin() as connection:
+        with self._sweep_engine.begin() as connection:
             connection.exec_driver_sql(f"PRAGMA busy_timeout={busy_timeout_ms}")
             raw = cast(Any, connection.connection.driver_connection)
             raw.set_progress_handler(
