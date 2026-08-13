@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
+import sqlite3
 import threading
 import time
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
+from sqlalchemy.exc import OperationalError
 
 from seqevi.errors import (
     EvidenceClaimLostError,
@@ -407,3 +410,103 @@ def test_concurrent_identical_commits_are_idempotent(tmp_path: Path) -> None:
         outcomes = list(executor.map(lambda _index: commit_once(), range(2)))
 
     assert sorted(outcomes) == [CommitOutcome.CREATED, CommitOutcome.EXISTING]
+
+
+def test_sweeper_close_is_bounded_by_writer_contention_and_recovers_next_open(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "store"
+    store = LocalStore.open(root)
+    with store.engine.begin() as connection:
+        connection.execute(
+            claim_sessions.insert().values(
+                session_id="stale-session",
+                owner_token="owner",
+                generation=1,
+                state="closing",
+                expires_at=datetime.now(UTC),
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    blocker = store.engine.connect()
+    blocker.exec_driver_sql("BEGIN IMMEDIATE")
+    store._sweeper_wake.set()  # pyright: ignore[reportPrivateUsage]
+    time.sleep(0.05)
+    started = time.monotonic()
+    store.close()
+    assert time.monotonic() - started < 2.5
+    blocker.rollback()
+    blocker.close()
+
+    with LocalStore.open(root) as recovered:
+        with recovered.engine.connect() as connection:
+            assert (
+                connection.execute(
+                    select(func.count()).select_from(claim_sessions)
+                ).scalar_one()
+                == 0
+            )
+
+
+def test_sweeper_close_is_bounded_when_foreground_pool_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    store = LocalStore.open(tmp_path / "store")
+    foreground_connections = [store.engine.connect() for _ in range(15)]
+    try:
+        started = time.monotonic()
+        store.close()
+        assert time.monotonic() - started < 2.5
+    finally:
+        for connection in foreground_connections:
+            connection.close()
+
+
+def test_sweeper_restores_foreground_sqlite_busy_timeout(tmp_path: Path) -> None:
+    with LocalStore.open(tmp_path / "store") as store:
+        commit_timeouts: list[int] = []
+
+        def record_commit_timeout(connection) -> None:
+            commit_timeouts.append(
+                connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+            )
+
+        event.listen(store._sweep_engine, "commit", record_commit_timeout)  # pyright: ignore[reportPrivateUsage]
+        try:
+            store._sweep_once()  # pyright: ignore[reportPrivateUsage]
+        finally:
+            event.remove(
+                store._sweep_engine,  # pyright: ignore[reportPrivateUsage]
+                "commit",
+                record_commit_timeout,
+            )
+        assert commit_timeouts == [100]
+        with store.engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 30000
+            )
+
+
+def test_sweeper_deadline_interrupts_work_inside_transaction(tmp_path: Path) -> None:
+    with LocalStore.open(tmp_path / "store") as store:
+        with pytest.raises(TimeoutError, match="exceeded its deadline"):
+            store._sweep_once(  # pyright: ignore[reportPrivateUsage]
+                deadline=time.monotonic() - 1.0
+            )
+        with store.engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 30000
+            )
+
+
+def test_sweeper_checkin_reset_tolerates_invalidated_connection() -> None:
+    local_module._reset_sqlite_after_sweep(None, object())  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("code", [261, 517, 773, 262])
+def test_sweeper_classifies_extended_sqlite_contention_codes(code: int) -> None:
+    original = sqlite3.OperationalError("database is locked")
+    original.sqlite_errorcode = code
+    error = OperationalError("statement", {}, original)
+    assert local_module._sqlite_is_busy(error)  # pyright: ignore[reportPrivateUsage]

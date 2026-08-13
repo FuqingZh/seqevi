@@ -10,11 +10,13 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import and_, create_engine, delete, event, select, tuple_, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping, URL
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import NullPool
 
 from seqevi.errors import (
     EvidenceClaimLostError,
@@ -57,6 +59,9 @@ _LOOKUP_CHUNK_SIZE = 400
 _CLAIM_LEASE_SECONDS = 120.0
 _CLAIM_RENEWAL_SECONDS = 30.0
 _CLAIM_RETRY_SECONDS = 1.0
+_SWEEP_BUSY_TIMEOUT_MS = 100
+_SWEEP_SHUTDOWN_SECONDS = 1.0
+_SWEEP_DRAIN_SECONDS = 1.0
 
 
 def resolve_store_path(
@@ -93,6 +98,19 @@ def _configure_sqlite(dbapi_connection: Any, _connection_record: Any) -> None:
         cursor.close()
 
 
+def _reset_sqlite_after_sweep(
+    dbapi_connection: Any | None, _connection_record: Any
+) -> None:
+    if dbapi_connection is None:
+        return
+    dbapi_connection.set_progress_handler(None, 0)
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA busy_timeout=30000")
+    finally:
+        cursor.close()
+
+
 class LocalStore:
     """Exact immutable evidence Store for processes on one host."""
 
@@ -101,11 +119,13 @@ class LocalStore:
         *,
         root: Path,
         engine: Engine,
+        sweep_engine: Engine,
         artifact_store: PosixArtifactStore,
     ) -> None:
         self.root = root
         self.database_path = root / "store.sqlite3"
         self.engine = engine
+        self._sweep_engine = sweep_engine
         self.artifact_store = artifact_store
         self._sweeper_stop = threading.Event()
         self._sweeper_wake = threading.Event()
@@ -130,6 +150,12 @@ class LocalStore:
         url = URL.create("sqlite+pysqlite", database=str(database_path))
         engine = create_engine(url, connect_args={"timeout": 30.0})
         event.listen(engine, "connect", _configure_sqlite)
+        event.listen(engine, "checkin", _reset_sqlite_after_sweep)
+        sweep_engine = create_engine(
+            url, connect_args={"timeout": 30.0}, poolclass=NullPool
+        )
+        event.listen(sweep_engine, "connect", _configure_sqlite)
+        event.listen(sweep_engine, "checkin", _reset_sqlite_after_sweep)
 
         try:
             upgrade_database(engine, root)
@@ -144,152 +170,198 @@ class LocalStore:
             store = cls(
                 root=root,
                 engine=engine,
+                sweep_engine=sweep_engine,
                 artifact_store=PosixArtifactStore(root / "artifacts"),
             )
-            store._drain_coordination()
+            store._drain_coordination(time.monotonic() + _SWEEP_DRAIN_SECONDS)
             store._sweeper.start()
             return store
         except Exception:
+            sweep_engine.dispose()
             engine.dispose()
             raise
 
     def close(self) -> None:
         self._sweeper_stop.set()
         self._sweeper_wake.set()
-        self._sweeper.join()
-        self._drain_coordination()
+        self._sweeper.join(timeout=_SWEEP_SHUTDOWN_SECONDS)
+        if not self._sweeper.is_alive():
+            self._drain_coordination(time.monotonic() + _SWEEP_DRAIN_SECONDS)
+        self._sweep_engine.dispose()
         self.engine.dispose()
 
     def _sweep_loop(self) -> None:
         while not self._sweeper_stop.is_set():
             self._sweeper_wake.wait(timeout=1.0)
             self._sweeper_wake.clear()
-            while not self._sweeper_stop.is_set() and self._sweep_once():
+            try:
+                while not self._sweeper_stop.is_set() and self._sweep_once():
+                    pass
+            except OperationalError as error:
+                if not _sqlite_is_busy(error):
+                    raise
+
+    def _drain_coordination(self, deadline: float) -> None:
+        try:
+            while time.monotonic() < deadline and self._sweep_once(
+                deadline=deadline,
+                busy_timeout_ms=max(
+                    min(
+                        int((deadline - time.monotonic()) * 1000),
+                        _SWEEP_BUSY_TIMEOUT_MS,
+                    ),
+                    1,
+                ),
+            ):
                 pass
-
-    def _drain_coordination(self) -> None:
-        while self._sweep_once():
+        except TimeoutError:
             pass
+        except OperationalError as error:
+            if not _sqlite_is_busy(error):
+                raise
 
-    def _sweep_once(self) -> int:
+    def _sweep_once(
+        self,
+        *,
+        busy_timeout_ms: int = _SWEEP_BUSY_TIMEOUT_MS,
+        deadline: float | None = None,
+    ) -> int:
+        operation_deadline = (
+            time.monotonic() + _SWEEP_SHUTDOWN_SECONDS if deadline is None else deadline
+        )
         now = datetime.now(UTC)
         removed = 0
-        with self.engine.begin() as connection:
-            stale_sessions = select(claim_sessions.c.session_id).where(
-                (claim_sessions.c.state == "closing")
-                | (claim_sessions.c.expires_at <= now)
+        with self._sweep_engine.begin() as connection:
+            connection.exec_driver_sql(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            raw = cast(Any, connection.connection.driver_connection)
+            raw.set_progress_handler(
+                lambda: 1 if time.monotonic() >= operation_deadline else 0,
+                100,
             )
-            claim_ids = (
-                select(
-                    session_claims.c.sequence_id,
-                    session_claims.c.adapter_contract_version,
-                    session_claims.c.tool_runtime_digest,
-                    session_claims.c.resource_id,
-                    session_claims.c.semantic_parameters_hash,
+            try:
+                if time.monotonic() >= operation_deadline:
+                    raise TimeoutError(
+                        "SQLite coordination sweep exceeded its deadline"
+                    )
+                stale_sessions = select(claim_sessions.c.session_id).where(
+                    (claim_sessions.c.state == "closing")
+                    | (claim_sessions.c.expires_at <= now)
                 )
-                .where(session_claims.c.session_id.in_(stale_sessions))
-                .order_by(*session_claims.primary_key.columns)
-                .limit(1000)
-            )
-            result = connection.execute(
-                delete(session_claims).where(
-                    tuple_(*session_claims.primary_key.columns).in_(claim_ids)
+                claim_ids = (
+                    select(
+                        session_claims.c.sequence_id,
+                        session_claims.c.adapter_contract_version,
+                        session_claims.c.tool_runtime_digest,
+                        session_claims.c.resource_id,
+                        session_claims.c.semantic_parameters_hash,
+                    )
+                    .where(session_claims.c.session_id.in_(stale_sessions))
+                    .order_by(*session_claims.primary_key.columns)
+                    .limit(1000)
                 )
-            )
-            removed += result.rowcount
-            cutoff = now - timedelta(seconds=60)
-            item_ids = (
-                select(
-                    claim_session_acquire_receipt_items.c.session_id,
-                    claim_session_acquire_receipt_items.c.request_id,
-                    claim_session_acquire_receipt_items.c.input_index,
+                result = connection.execute(
+                    delete(session_claims).where(
+                        tuple_(*session_claims.primary_key.columns).in_(claim_ids)
+                    )
                 )
-                .join(claim_session_acquire_receipts)
-                .where(claim_session_acquire_receipts.c.created_at <= cutoff)
-                .order_by(
-                    claim_session_acquire_receipts.c.created_at,
-                    claim_session_acquire_receipt_items.c.session_id,
-                    claim_session_acquire_receipt_items.c.request_id,
-                    claim_session_acquire_receipt_items.c.input_index,
-                )
-                .limit(1000)
-            )
-            result = connection.execute(
-                delete(claim_session_acquire_receipt_items).where(
-                    tuple_(
+                removed += result.rowcount
+                cutoff = now - timedelta(seconds=60)
+                item_ids = (
+                    select(
                         claim_session_acquire_receipt_items.c.session_id,
                         claim_session_acquire_receipt_items.c.request_id,
                         claim_session_acquire_receipt_items.c.input_index,
-                    ).in_(item_ids)
-                )
-            )
-            removed += result.rowcount
-            header_ids = (
-                select(
-                    claim_session_acquire_receipts.c.session_id,
-                    claim_session_acquire_receipts.c.request_id,
-                )
-                .where(
-                    claim_session_acquire_receipts.c.created_at <= cutoff,
-                    ~select(claim_session_acquire_receipt_items.c.input_index)
-                    .where(
-                        claim_session_acquire_receipt_items.c.session_id
-                        == claim_session_acquire_receipts.c.session_id,
-                        claim_session_acquire_receipt_items.c.request_id
-                        == claim_session_acquire_receipts.c.request_id,
                     )
-                    .exists(),
+                    .join(claim_session_acquire_receipts)
+                    .where(claim_session_acquire_receipts.c.created_at <= cutoff)
+                    .order_by(
+                        claim_session_acquire_receipts.c.created_at,
+                        claim_session_acquire_receipt_items.c.session_id,
+                        claim_session_acquire_receipt_items.c.request_id,
+                        claim_session_acquire_receipt_items.c.input_index,
+                    )
+                    .limit(1000)
                 )
-                .limit(1000)
-            )
-            result = connection.execute(
-                delete(claim_session_acquire_receipts).where(
-                    tuple_(
+                result = connection.execute(
+                    delete(claim_session_acquire_receipt_items).where(
+                        tuple_(
+                            claim_session_acquire_receipt_items.c.session_id,
+                            claim_session_acquire_receipt_items.c.request_id,
+                            claim_session_acquire_receipt_items.c.input_index,
+                        ).in_(item_ids)
+                    )
+                )
+                removed += result.rowcount
+                header_ids = (
+                    select(
                         claim_session_acquire_receipts.c.session_id,
                         claim_session_acquire_receipts.c.request_id,
-                    ).in_(header_ids)
-                )
-            )
-            removed += result.rowcount
-            empty_sessions = (
-                select(claim_sessions.c.session_id)
-                .where(
-                    (
-                        (claim_sessions.c.state == "closing")
-                        | (claim_sessions.c.expires_at <= now)
-                    ),
-                    ~select(session_claims.c.sequence_id)
-                    .where(session_claims.c.session_id == claim_sessions.c.session_id)
-                    .exists(),
-                    ~select(claim_session_acquire_receipts.c.request_id)
+                    )
                     .where(
-                        claim_session_acquire_receipts.c.session_id
-                        == claim_sessions.c.session_id
-                    )
-                    .exists(),
-                )
-                .limit(1000)
-            )
-            result = connection.execute(
-                delete(claim_sessions).where(
-                    claim_sessions.c.session_id.in_(empty_sessions)
-                )
-            )
-            removed += result.rowcount
-            result = connection.execute(
-                delete(claim_session_open_receipts).where(
-                    claim_session_open_receipts.c.open_request_id.in_(
-                        select(claim_session_open_receipts.c.open_request_id)
+                        claim_session_acquire_receipts.c.created_at <= cutoff,
+                        ~select(claim_session_acquire_receipt_items.c.input_index)
                         .where(
-                            claim_session_open_receipts.c.created_at
-                            <= now - timedelta(seconds=120)
+                            claim_session_acquire_receipt_items.c.session_id
+                            == claim_session_acquire_receipts.c.session_id,
+                            claim_session_acquire_receipt_items.c.request_id
+                            == claim_session_acquire_receipts.c.request_id,
                         )
-                        .limit(1000)
+                        .exists(),
+                    )
+                    .limit(1000)
+                )
+                result = connection.execute(
+                    delete(claim_session_acquire_receipts).where(
+                        tuple_(
+                            claim_session_acquire_receipts.c.session_id,
+                            claim_session_acquire_receipts.c.request_id,
+                        ).in_(header_ids)
                     )
                 )
-            )
-            removed += result.rowcount
-        return removed
+                removed += result.rowcount
+                empty_sessions = (
+                    select(claim_sessions.c.session_id)
+                    .where(
+                        (
+                            (claim_sessions.c.state == "closing")
+                            | (claim_sessions.c.expires_at <= now)
+                        ),
+                        ~select(session_claims.c.sequence_id)
+                        .where(
+                            session_claims.c.session_id == claim_sessions.c.session_id
+                        )
+                        .exists(),
+                        ~select(claim_session_acquire_receipts.c.request_id)
+                        .where(
+                            claim_session_acquire_receipts.c.session_id
+                            == claim_sessions.c.session_id
+                        )
+                        .exists(),
+                    )
+                    .limit(1000)
+                )
+                result = connection.execute(
+                    delete(claim_sessions).where(
+                        claim_sessions.c.session_id.in_(empty_sessions)
+                    )
+                )
+                removed += result.rowcount
+                result = connection.execute(
+                    delete(claim_session_open_receipts).where(
+                        claim_session_open_receipts.c.open_request_id.in_(
+                            select(claim_session_open_receipts.c.open_request_id)
+                            .where(
+                                claim_session_open_receipts.c.created_at
+                                <= now - timedelta(seconds=120)
+                            )
+                            .limit(1000)
+                        )
+                    )
+                )
+                removed += result.rowcount
+                return removed
+            except BaseException:
+                raise
 
     @property
     def supports_claim_sessions(self) -> bool:
@@ -1031,6 +1103,11 @@ def _key_sort_value(key: EvidenceKey) -> tuple[str, str, str, str, str]:
         key.resource_id,
         key.semantic_parameters_hash,
     )
+
+
+def _sqlite_is_busy(error: OperationalError) -> bool:
+    code = getattr(error.orig, "sqlite_errorcode", None)
+    return isinstance(code, int) and code & 0xFF in {5, 6, 9}
 
 
 def _as_utc(value: datetime) -> datetime:

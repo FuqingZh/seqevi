@@ -9,6 +9,7 @@ import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -49,6 +50,7 @@ from seqevi.evidence import (
     EvidenceQuery,
     EvidenceRecord,
     EvidenceStatus,
+    SessionEvidenceClaim,
     StoredArtifact,
     sha256_digest,
 )
@@ -69,12 +71,14 @@ from seqevi.store.schema import (
     claim_session_acquire_receipts,
     claim_sessions,
     evidence_claim_generations,
+    session_claims,
 )
 from seqevi.store.transport import (
     ClaimSessionFinalizeItem,
     CommitModel,
     EvidenceRecordModel,
     EvidenceQueryModel,
+    SessionEvidenceClaimModel,
     canonical_query_digest,
 )
 
@@ -1910,6 +1914,31 @@ def test_claim_session_sweeper_retries_after_connection_failure(tmp_path: Path) 
     assert persistence.sweeps >= 2
 
 
+def test_claim_session_authority_preserves_inputs_larger_than_future_ceiling(
+    tmp_path: Path,
+) -> None:
+    class AuthorityPersistence(MemoryPersistence):
+        def claim_session_authority_is_live(self, _authority, claims):
+            assert len(tuple(claims)) == 1001
+            return True
+
+    _, key = _key("MAUTHORITYBOUNDARY")
+    claim = SessionEvidenceClaimModel.from_domain(SessionEvidenceClaim(key, 1))
+    payload = {
+        "session_id": "session",
+        "owner_token": "owner",
+        "generation": 1,
+        "claims": [claim.model_dump(mode="json")] * 1001,
+    }
+    persistence = AuthorityPersistence()
+    app = create_service_app(
+        _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
+    )
+    with TestClient(app) as service:
+        response = service.post("/v1/internal/claim-sessions/authority", json=payload)
+    assert response.status_code == 200
+
+
 def test_claim_session_authority_backpressure_is_503(tmp_path: Path) -> None:
     class BackpressuredAuthorityPersistence(MemoryPersistence):
         def claim_session_authority_is_live(self, _authority, _claims):
@@ -2220,6 +2249,213 @@ def test_sqlite_maintenance_classifies_commit_after_operation_deadline(
             ).scalar_one()
             == "0004_claim_sessions"
         )
+    engine.dispose()
+
+
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+def test_sqlite_maintenance_canonicalizes_relative_database_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, direction: str
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    absolute_engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    config = Config()
+    config.set_main_option(
+        "script_location", str(Path(store_migration.__file__).with_name("migrations"))
+    )
+    with absolute_engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(
+            config,
+            "0003_evidence_claim_leases" if direction == "upgrade" else "head",
+        )
+        connection.commit()
+    absolute_engine.dispose()
+    monkeypatch.chdir(store_root)
+    engine = create_engine("sqlite+pysqlite:///store.sqlite3")
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        database_identity=f"sqlite+pysqlite:///{database_path}",
+        expected_revision=(
+            "0003_evidence_claim_leases"
+            if direction == "upgrade"
+            else "0004_claim_sessions"
+        ),
+    )
+    operation = (
+        store_migration.maintenance_upgrade_database
+        if direction == "upgrade"
+        else store_migration.maintenance_downgrade_database
+    )
+    operation(engine, store_root, acknowledgement)
+    engine.dispose()
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "escape", "symlink", "missing"])
+def test_sqlite_maintenance_identity_fails_closed_before_ddl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    database_path.touch()
+    target = database_path
+    acknowledgement_identity = f"sqlite+pysqlite:///{database_path}"
+    if failure == "mismatch":
+        acknowledgement_identity += "-other"
+    elif failure == "escape":
+        target = tmp_path / "outside.sqlite3"
+        target.touch()
+        acknowledgement_identity = f"sqlite+pysqlite:///{target}"
+    elif failure == "symlink":
+        real = tmp_path / "real.sqlite3"
+        real.touch()
+        database_path.unlink()
+        database_path.symlink_to(real)
+    else:
+        database_path.unlink()
+    engine = create_engine(f"sqlite+pysqlite:///{target}")
+    called = False
+
+    def unexpected_ddl(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(store_migration, "_run_maintenance_upgrade", unexpected_ddl)
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        acknowledgement_identity, "0003_evidence_claim_leases"
+    )
+    with pytest.raises(RuntimeError):
+        store_migration.maintenance_upgrade_database(
+            engine, store_root, acknowledgement
+        )
+    assert not called
+    engine.dispose()
+
+
+def test_sqlite_maintenance_revalidates_target_after_file_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    replacement_path = tmp_path / "replacement.sqlite3"
+    config = Config()
+    config.set_main_option(
+        "script_location", str(Path(store_migration.__file__).with_name("migrations"))
+    )
+    for path in (database_path, replacement_path):
+        seeded = create_engine(f"sqlite+pysqlite:///{path}")
+        with seeded.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        seeded.dispose()
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        store_migration._database_identity(engine, store_root),  # pyright: ignore[reportPrivateUsage]
+        "0003_evidence_claim_leases",
+    )
+
+    original_upgrade = store_migration._run_maintenance_upgrade  # pyright: ignore[reportPrivateUsage]
+
+    def replace_after_mutation(*args, **kwargs):
+        original_upgrade(*args, **kwargs)
+        database_path.replace(tmp_path / "original.sqlite3")
+        replacement_path.replace(database_path)
+
+    monkeypatch.setattr(
+        store_migration, "_run_maintenance_upgrade", replace_after_mutation
+    )
+    with pytest.raises(RuntimeError, match="target changed while fenced"):
+        store_migration.maintenance_upgrade_database(
+            engine, store_root, acknowledgement
+        )
+    engine.dispose()
+
+
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+def test_sqlite_maintenance_pins_acknowledged_file_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, direction: str
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    replacement_path = tmp_path / "replacement.sqlite3"
+    for path in (database_path, replacement_path):
+        path.touch()
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        store_migration._database_identity(engine, store_root),  # pyright: ignore[reportPrivateUsage]
+        "0003_evidence_claim_leases"
+        if direction == "upgrade"
+        else "0004_claim_sessions",
+    )
+    original_pin = store_migration._pinned_sqlite_database  # pyright: ignore[reportPrivateUsage]
+
+    def replace_before_pin(path: Path, identity: tuple[int, int]):
+        database_path.replace(tmp_path / "acknowledged.sqlite3")
+        replacement_path.replace(database_path)
+        return original_pin(path, identity)
+
+    monkeypatch.setattr(store_migration, "_pinned_sqlite_database", replace_before_pin)
+    operation = (
+        store_migration.maintenance_upgrade_database
+        if direction == "upgrade"
+        else store_migration.maintenance_downgrade_database
+    )
+    with pytest.raises(RuntimeError, match="changed while opening"):
+        operation(engine, store_root, acknowledgement)
+    engine.dispose()
+
+
+def test_sqlite_maintenance_discards_stale_pooled_database_handle(
+    tmp_path: Path,
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    replacement_path = tmp_path / "replacement.sqlite3"
+    original_path = tmp_path / "original.sqlite3"
+    config = Config()
+    config.set_main_option(
+        "script_location", str(Path(store_migration.__file__).with_name("migrations"))
+    )
+    for path in (database_path, replacement_path):
+        seeded = create_engine(f"sqlite+pysqlite:///{path}")
+        with seeded.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        seeded.dispose()
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    with engine.connect() as stale:
+        assert stale.exec_driver_sql("PRAGMA database_list").one()[2] == str(
+            database_path
+        )
+    database_path.replace(original_path)
+    replacement_path.replace(database_path)
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        store_migration._database_identity(engine, store_root),  # pyright: ignore[reportPrivateUsage]
+        "0003_evidence_claim_leases",
+    )
+    store_migration.maintenance_upgrade_database(engine, store_root, acknowledgement)
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            == "0004_claim_sessions"
+        )
+    original = create_engine(f"sqlite+pysqlite:///{original_path}")
+    with original.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            == "0003_evidence_claim_leases"
+        )
+    original.dispose()
     engine.dispose()
 
 
@@ -2738,12 +2974,107 @@ def test_postgres_exact_session_and_claim_authority_readback() -> None:
             queries=(query,),
         )[0]
         assert acquired.claim is not None
-        assert persistence.claim_session_authority_is_live(authority, (acquired.claim,))
+        statements: list[tuple[str, object]] = []
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            statements.append((statement, parameters))
+
+        event.listen(persistence.engine, "before_cursor_execute", record_statement)
+        try:
+            assert persistence.claim_session_authority_is_live(
+                authority, (acquired.claim,)
+            )
+            assert not persistence.claim_session_authority_is_live(
+                authority,
+                (replace(acquired.claim, generation=acquired.claim.generation + 1),),
+            )
+        finally:
+            event.remove(persistence.engine, "before_cursor_execute", record_statement)
+        authority_queries = [
+            (statement, parameters)
+            for statement, parameters in statements
+            if "FROM session_claims" in statement
+        ]
+        assert len(authority_queries) == 2
+        assert all(" IN (" in statement for statement, _ in authority_queries)
+        assert all(
+            isinstance(parameters, dict) and len(parameters) == 6
+            for _, parameters in authority_queries
+        )
         persistence.close_claim_session(authority)
         assert not persistence.claim_session_authority_is_live(
             authority, (acquired.claim,)
         )
         persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_authority_readback_chunks_large_accepted_input() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-authority-large",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        claims = tuple(
+            SessionEvidenceClaim(_key("M" + "A" * index + "C")[1], 1)
+            for index in range(1, 1002)
+        )
+        with persistence.engine.begin() as connection:
+            connection.execute(
+                session_claims.insert(),
+                [
+                    {
+                        **{
+                            name: value
+                            for name, value in zip(
+                                persistence_module._CLAIM_KEY_NAMES,  # pyright: ignore[reportPrivateUsage]
+                                (
+                                    claim.key.sequence_id,
+                                    claim.key.adapter_contract_version,
+                                    claim.key.tool_runtime_digest,
+                                    claim.key.resource_id,
+                                    claim.key.semantic_parameters_hash,
+                                ),
+                                strict=True,
+                            )
+                        },
+                        "semantic_parameters_json": claim.key.semantic_parameters_json,
+                        "session_id": authority.session_id,
+                        "generation": claim.generation,
+                    }
+                    for claim in claims
+                ],
+            )
+        statements: list[str] = []
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            if "FROM session_claims" in statement:
+                statements.append(statement)
+
+        event.listen(persistence.engine, "before_cursor_execute", record_statement)
+        try:
+            assert persistence.claim_session_authority_is_live(authority, claims)
+        finally:
+            event.remove(persistence.engine, "before_cursor_execute", record_statement)
+            persistence.close()
+        assert len(statements) == 2
 
 
 @pytest.mark.requires_postgres

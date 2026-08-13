@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import os
 import random
 import threading
 import time
@@ -116,8 +117,85 @@ def _pristine(connection: Connection) -> bool:
     return not names or names == {"alembic_version"} and _revision(connection) is None
 
 
-def _database_identity(engine: Engine) -> str:
-    return engine.url.render_as_string(hide_password=True)
+def _database_identity(engine: Engine, store_root: Path | None = None) -> str:
+    if engine.dialect.name != "sqlite":
+        return engine.url.render_as_string(hide_password=True)
+    database_path = _canonical_sqlite_database_path(engine, store_root)
+    return engine.url.set(database=str(database_path)).render_as_string(
+        hide_password=True
+    )
+
+
+def _canonical_sqlite_database_path(engine: Engine, store_root: Path | None) -> Path:
+    database = engine.url.database
+    if not database or database == ":memory:" or engine.url.query:
+        raise RuntimeError("SQLite maintenance requires one unambiguous file database")
+    lexical_database = Path(database).expanduser()
+    if lexical_database.is_symlink():
+        raise RuntimeError("SQLite maintenance refuses a symlink database target")
+    try:
+        database_path = lexical_database.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("SQLite maintenance database target is missing") from error
+    if not database_path.is_file():
+        raise RuntimeError("SQLite maintenance target is not a regular database file")
+    if store_root is not None:
+        try:
+            canonical_root = store_root.expanduser().resolve(strict=True)
+        except FileNotFoundError as error:
+            raise RuntimeError("SQLite maintenance Store root is missing") from error
+        if not canonical_root.is_dir():
+            raise RuntimeError("SQLite maintenance Store root is not a directory")
+        expected_path = canonical_root / "store.sqlite3"
+        if database_path != expected_path:
+            raise RuntimeError(
+                "SQLite maintenance database is not the Store database under store_root"
+            )
+    return database_path
+
+
+def _sqlite_file_identity(path_or_fd: Path | int) -> tuple[int, int]:
+    stat = os.fstat(path_or_fd) if isinstance(path_or_fd, int) else path_or_fd.stat()
+    return stat.st_dev, stat.st_ino
+
+
+@contextmanager
+def _pinned_sqlite_database(
+    path: Path, acknowledged_identity: tuple[int, int]
+) -> Iterator[int]:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        descriptor_identity = _sqlite_file_identity(descriptor)
+        if (
+            _sqlite_file_identity(path) != descriptor_identity
+            or descriptor_identity != acknowledged_identity
+        ):
+            raise RuntimeError("SQLite maintenance database changed while opening")
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _validate_opened_sqlite_target(
+    connection: Connection, expected_path: Path, pinned_descriptor: int
+) -> None:
+    databases = connection.exec_driver_sql("PRAGMA database_list").all()
+    main_paths = [row[2] for row in databases if row[1] == "main"]
+    if len(main_paths) != 1 or not main_paths[0]:
+        raise RuntimeError("SQLite maintenance opened an ambiguous database target")
+    try:
+        opened_path = Path(main_paths[0]).resolve(strict=True)
+        opened_identity = _sqlite_file_identity(opened_path)
+        pinned_identity = _sqlite_file_identity(pinned_descriptor)
+    except (FileNotFoundError, OSError) as error:
+        raise RuntimeError(
+            "SQLite maintenance opened target cannot be verified"
+        ) from error
+    if opened_path != expected_path or opened_identity != pinned_identity:
+        raise RuntimeError("SQLite maintenance database target changed while fenced")
 
 
 def upgrade_database(engine: Engine, store_root: Path) -> None:
@@ -192,37 +270,62 @@ def maintenance_upgrade_database(
 ) -> None:
     """Apply 0004 under a bounded persistence fence after operator quiescence."""
 
-    if acknowledgement.database_identity != _database_identity(engine):
-        raise RuntimeError("maintenance acknowledgement targets another database")
     deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
-        try:
-            with (
-                _bounded_file_lock(store_root, deadline),
-                engine.connect() as connection,
-            ):
-                remaining = _remaining(deadline)
-                connection.exec_driver_sql(
-                    f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
+        database_path = _canonical_sqlite_database_path(engine, store_root)
+        if acknowledgement.database_identity != engine.url.set(
+            database=str(database_path)
+        ).render_as_string(hide_password=True):
+            raise RuntimeError("maintenance acknowledgement targets another database")
+        acknowledged_identity = _sqlite_file_identity(database_path)
+        engine.dispose()
+        with _pinned_sqlite_database(
+            database_path, acknowledged_identity
+        ) as pinned_descriptor:
+            try:
+                with (
+                    _bounded_file_lock(store_root, deadline),
+                    engine.connect() as connection,
+                ):
+                    _validate_opened_sqlite_target(
+                        connection, database_path, pinned_descriptor
+                    )
+                    remaining = _remaining(deadline)
+                    connection.exec_driver_sql(
+                        f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
+                    )
+                    raw = cast(Any, connection.connection.driver_connection)
+                    raw.set_progress_handler(
+                        lambda: 1 if time.monotonic() >= deadline else 0, 1000
+                    )
+                    try:
+                        connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                        _run_maintenance_upgrade(connection, acknowledgement, deadline)
+                        _validate_opened_sqlite_target(
+                            connection, database_path, pinned_descriptor
+                        )
+                    finally:
+                        raw.set_progress_handler(None, 0)
+            except _AmbiguousMaintenanceCommit as error:
+                _classify_ambiguous_maintenance(
+                    engine,
+                    _CURRENT_REVISION,
+                    _readback_deadline(),
+                    error,
+                    sqlite_binding=(database_path, pinned_descriptor),
                 )
-                raw = cast(Any, connection.connection.driver_connection)
-                raw.set_progress_handler(
-                    lambda: 1 if time.monotonic() >= deadline else 0, 1000
-                )
-                try:
-                    connection.exec_driver_sql("BEGIN EXCLUSIVE")
-                    _run_maintenance_upgrade(connection, acknowledgement, deadline)
-                finally:
-                    raw.set_progress_handler(None, 0)
-        except _AmbiguousMaintenanceCommit as error:
-            _classify_ambiguous_maintenance(
-                engine, _CURRENT_REVISION, _readback_deadline(), error
+                return
+            _verify_maintenance_completion(
+                engine,
+                _CURRENT_REVISION,
+                _readback_deadline(),
+                sqlite_binding=(database_path, pinned_descriptor),
             )
-            return
-        _verify_maintenance_completion(engine, _CURRENT_REVISION, _readback_deadline())
         return
+    if acknowledgement.database_identity != _database_identity(engine, store_root):
+        raise RuntimeError("maintenance acknowledgement targets another database")
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline)
     except _AmbiguousMaintenanceCommit as error:
@@ -240,41 +343,63 @@ def maintenance_downgrade_database(
 ) -> None:
     """Downgrade 0004 to empty 0003 coordination under the same bounded fence."""
 
-    if acknowledgement.database_identity != _database_identity(engine):
-        raise RuntimeError("maintenance acknowledgement targets another database")
     deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
-        try:
-            with (
-                _bounded_file_lock(store_root, deadline),
-                engine.connect() as connection,
-            ):
-                connection.exec_driver_sql(
-                    f"PRAGMA busy_timeout={max(int(_remaining(deadline) * 1000), 1)}"
+        database_path = _canonical_sqlite_database_path(engine, store_root)
+        if acknowledgement.database_identity != engine.url.set(
+            database=str(database_path)
+        ).render_as_string(hide_password=True):
+            raise RuntimeError("maintenance acknowledgement targets another database")
+        acknowledged_identity = _sqlite_file_identity(database_path)
+        engine.dispose()
+        with _pinned_sqlite_database(
+            database_path, acknowledged_identity
+        ) as pinned_descriptor:
+            try:
+                with (
+                    _bounded_file_lock(store_root, deadline),
+                    engine.connect() as connection,
+                ):
+                    _validate_opened_sqlite_target(
+                        connection, database_path, pinned_descriptor
+                    )
+                    connection.exec_driver_sql(
+                        f"PRAGMA busy_timeout={max(int(_remaining(deadline) * 1000), 1)}"
+                    )
+                    raw = cast(Any, connection.connection.driver_connection)
+                    raw.set_progress_handler(
+                        lambda: 1 if time.monotonic() >= deadline else 0, 1000
+                    )
+                    try:
+                        connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                        _run_maintenance_downgrade(
+                            connection, acknowledgement, deadline
+                        )
+                        _validate_opened_sqlite_target(
+                            connection, database_path, pinned_descriptor
+                        )
+                    finally:
+                        raw.set_progress_handler(None, 0)
+            except _AmbiguousMaintenanceCommit as error:
+                _classify_ambiguous_maintenance(
+                    engine,
+                    _AUTOMATIC_EXISTING_CEILING,
+                    _readback_deadline(),
+                    error,
+                    sqlite_binding=(database_path, pinned_descriptor),
                 )
-                raw = cast(Any, connection.connection.driver_connection)
-                raw.set_progress_handler(
-                    lambda: 1 if time.monotonic() >= deadline else 0, 1000
-                )
-                try:
-                    connection.exec_driver_sql("BEGIN EXCLUSIVE")
-                    _run_maintenance_downgrade(connection, acknowledgement, deadline)
-                finally:
-                    raw.set_progress_handler(None, 0)
-        except _AmbiguousMaintenanceCommit as error:
-            _classify_ambiguous_maintenance(
+                return
+            _verify_maintenance_completion(
                 engine,
                 _AUTOMATIC_EXISTING_CEILING,
                 _readback_deadline(),
-                error,
+                sqlite_binding=(database_path, pinned_descriptor),
             )
-            return
-        _verify_maintenance_completion(
-            engine, _AUTOMATIC_EXISTING_CEILING, _readback_deadline()
-        )
         return
+    if acknowledgement.database_identity != _database_identity(engine, store_root):
+        raise RuntimeError("maintenance acknowledgement targets another database")
     try:
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline, downgrade=True)
     except _AmbiguousMaintenanceCommit as error:
@@ -294,9 +419,19 @@ def _readback_deadline() -> float:
     return time.monotonic() + _MAINTENANCE_READBACK_TIMEOUT_SECONDS
 
 
-def _maintenance_state(engine: Engine, deadline: float) -> tuple[str | None, set[str]]:
+def _maintenance_state(
+    engine: Engine,
+    deadline: float,
+    *,
+    sqlite_binding: tuple[Path, int] | None = None,
+) -> tuple[str | None, set[str]]:
+    if engine.dialect.name == "sqlite":
+        engine.dispose()
     with engine.connect() as connection:
         if engine.dialect.name == "sqlite":
+            if sqlite_binding is None:
+                raise RuntimeError("SQLite maintenance readback requires file binding")
+            _validate_opened_sqlite_target(connection, *sqlite_binding)
             remaining = _remaining(deadline)
             connection.exec_driver_sql(
                 f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
@@ -310,6 +445,7 @@ def _maintenance_state(engine: Engine, deadline: float) -> tuple[str | None, set
                     _revision(connection),
                     set(inspect(connection).get_table_names()),
                 )
+                _validate_opened_sqlite_target(connection, *sqlite_binding)
                 _remaining(deadline)
                 return state
             finally:
@@ -347,17 +483,30 @@ def _state_matches_target(revision: str | None, tables: set[str], target: str) -
 
 
 def _verify_maintenance_completion(
-    engine: Engine, target: str, deadline: float
+    engine: Engine,
+    target: str,
+    deadline: float,
+    *,
+    sqlite_binding: tuple[Path, int] | None = None,
 ) -> None:
-    revision, tables = _maintenance_state(engine, deadline)
+    revision, tables = _maintenance_state(
+        engine, deadline, sqlite_binding=sqlite_binding
+    )
     if not _state_matches_target(revision, tables, target):
         raise RuntimeError("maintenance completion readback found mixed schema state")
 
 
 def _classify_ambiguous_maintenance(
-    engine: Engine, target: str, deadline: float, error: BaseException
+    engine: Engine,
+    target: str,
+    deadline: float,
+    error: BaseException,
+    *,
+    sqlite_binding: tuple[Path, int] | None = None,
 ) -> None:
-    revision, tables = _maintenance_state(engine, deadline)
+    revision, tables = _maintenance_state(
+        engine, deadline, sqlite_binding=sqlite_binding
+    )
     if _state_matches_target(revision, tables, target):
         return
     source = (
