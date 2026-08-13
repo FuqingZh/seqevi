@@ -687,6 +687,9 @@ class _HttpClaimSession:
         self.cancellation_signal = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._close_started = False
+        self._close_error: RuntimeError | None = None
         self._lost: BaseException | None = None
         self._claims: dict[EvidenceKey, SessionEvidenceClaim] = {}
         self._heartbeat_jitter = random.uniform(0.8, 1.2)
@@ -1249,24 +1252,35 @@ class _HttpClaimSession:
         self._upload_until(payload, deadline=deadline)
 
     def close(self) -> None:
-        with self.store._claim_transport.operation():
-            self._close()
-
-    def _close(self) -> None:
-        if self._stop.is_set():
-            return
-        self._stop.set()
-        self._thread.join(timeout=min(self.store._timeout_seconds, 5.0))
-        try:
-            request = ClaimSessionCloseRequest.model_validate(self._authority_request())
-            self.store._claim_transport.request(
-                "POST",
-                "/v1/internal/claim-sessions/close",
-                json=request.model_dump(mode="json"),
-                deadline=time.monotonic() + min(self.store._timeout_seconds, 5.0),
-            )
-        except (httpx.HTTPError, TimeoutError):
-            pass
+        with self._close_lock:
+            if self._close_started:
+                if self._close_error is not None:
+                    raise self._close_error
+                return
+            self._close_started = True
+            self._stop.set()
+            self._thread.join()
+            try:
+                with self.store._claim_transport.operation():
+                    request = ClaimSessionCloseRequest.model_validate(
+                        self._authority_request()
+                    )
+                    self.store._claim_transport.request(
+                        "POST",
+                        "/v1/internal/claim-sessions/close",
+                        json=request.model_dump(mode="json"),
+                        deadline=time.monotonic()
+                        + min(self.store._timeout_seconds, 5.0),
+                    )
+            except RuntimeError as error:
+                if not (
+                    self.store._closing.is_set()
+                    or self.store._claim_transport._closing.is_set()
+                ):
+                    self._close_error = error
+                    raise
+            except (httpx.HTTPError, TimeoutError):
+                pass
 
 
 def _claim_retry_delay(response: httpx.Response) -> float:

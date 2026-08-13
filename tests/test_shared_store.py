@@ -1406,6 +1406,163 @@ def test_slow_renew_body_promptly_publishes_session_loss() -> None:
         assert not session._thread.is_alive()
 
 
+def test_session_close_after_store_close_stops_heartbeat_without_admission() -> None:
+    now = datetime.now(UTC)
+    remote_close_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal remote_close_calls
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "close-after-store",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 1000,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/close"):
+            remote_close_calls += 1
+        return httpx.Response(200, json={"closed": True})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    )
+    session = store.claim_session()
+    store.close()
+    started = time.monotonic()
+    session.close()
+    assert time.monotonic() - started < 0.5
+    assert not session._thread.is_alive()
+    assert remote_close_calls == 0
+
+
+def test_session_close_sends_remote_close_once_and_is_idempotent() -> None:
+    now = datetime.now(UTC)
+    remote_close_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal remote_close_calls
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "close-once",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 1000,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/close"):
+            remote_close_calls += 1
+        return httpx.Response(200, json={"closed": True})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    )
+    session = store.claim_session()
+    session.close()
+    session.close()
+    assert remote_close_calls == 1
+    assert not session._thread.is_alive()
+    store.close()
+
+
+def test_session_close_replays_unexpected_admission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "close-error",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 1000,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        return httpx.Response(200, json={"closed": True})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    )
+    session = store.claim_session()
+
+    @contextmanager
+    def fail_admission() -> Iterator[None]:
+        raise RuntimeError("unexpected admission failure")
+        yield
+
+    monkeypatch.setattr(store._claim_transport, "operation", fail_admission)
+    for _attempt in range(2):
+        with pytest.raises(RuntimeError, match="unexpected admission failure"):
+            session.close()
+    assert not session._thread.is_alive()
+    monkeypatch.undo()
+    store.close()
+
+
 def test_finalize_commit_then_slow_body_reconciles_inside_original_budget(
     tmp_path: Path,
 ) -> None:
