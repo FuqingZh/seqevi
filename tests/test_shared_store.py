@@ -4913,7 +4913,7 @@ def test_postgres_maintenance_expiry_before_initialization_query_is_irreversible
 
 
 @pytest.mark.requires_postgres
-def test_postgres_maintenance_preserves_stricter_statement_timeout() -> None:
+def test_postgres_maintenance_does_not_mutate_configured_statement_timeout() -> None:
     with _isolated_postgres_url() as database_url:
         engine = create_engine(
             database_url,
@@ -5030,6 +5030,49 @@ def test_postgres_maintenance_captures_before_existing_checkout_listener() -> No
 
 
 @pytest.mark.requires_postgres
+def test_postgres_maintenance_preserves_checkout_hook_transaction_state() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE acquisition_hook_state (value integer NOT NULL)"
+            )
+        with engine.connect():
+            pass
+
+        def mutate_checkout(
+            dbapi_connection: Any, _connection_record: Any, _connection_proxy: Any
+        ) -> None:
+            with dbapi_connection.cursor() as cursor:
+                cursor.execute("SET statement_timeout = '1700ms'")
+                cursor.execute("INSERT INTO acquisition_hook_state VALUES (1)")
+
+        event.listen(engine, "checkout", mutate_checkout)
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ) as connection:
+            assert (
+                connection.exec_driver_sql("SHOW statement_timeout").scalar_one()
+                == "1700ms"
+            )
+            assert (
+                connection.exec_driver_sql(
+                    "SELECT count(*) FROM acquisition_hook_state"
+                ).scalar_one()
+                == 1
+            )
+        event.remove(engine, "checkout", mutate_checkout)
+        with engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql(
+                    "SELECT count(*) FROM acquisition_hook_state"
+                ).scalar_one()
+                == 0
+            )
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
 def test_postgres_maintenance_watchdog_join_failure_discards_checkout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5067,6 +5110,54 @@ def test_postgres_maintenance_watchdog_join_failure_discards_checkout(
         assert cast(Any, engine.pool).checkedout() == 0
         assert ("_do_ping_w_event" in vars(engine.dialect)) is pre_ping_was_own
         assert vars(engine.dialect).get("_do_ping_w_event") is original_own_pre_ping
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_error_path_join_failure_discards_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnstoppableTimer:
+        name = ""
+        daemon = False
+
+        def __init__(self, _interval: float, _callback: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            pass
+
+        def join(self, _timeout: float) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return True
+
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        with engine.connect():
+            pass
+        original_remove = store_migration.event.remove
+
+        def fail_connect_listener_removal(target: Any, name: str, fn: Any) -> None:
+            original_remove(target, name, fn)
+            if name == "do_connect":
+                raise RuntimeError("listener removal failed")
+
+        monkeypatch.setattr(store_migration.threading, "Timer", UnstoppableTimer)
+        monkeypatch.setattr(
+            store_migration.event, "remove", fail_connect_listener_removal
+        )
+        with pytest.raises(RuntimeError, match="listener removal failed") as raised:
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, time.monotonic() + 5
+            ):
+                pytest.fail("error-path watchdog failure yielded a connection")
+        assert any("watchdog cleanup failed" in note for note in raised.value.__notes__)
+        assert cast(Any, engine.pool).checkedout() == 0
         engine.dispose()
 
 

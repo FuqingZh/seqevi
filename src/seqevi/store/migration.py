@@ -39,7 +39,6 @@ _CLAIM_SESSION_TABLES = {
 _POSTGRES_ACQUISITION_LOCK = threading.Lock()
 _RESOLVER_STOP_GRACE_SECONDS = 0.2
 _ACQUISITION_CANCEL_TIMEOUT_SECONDS = 0.05
-_ACQUISITION_CANCEL_ATTEMPTS = 5
 _ACQUISITION_CANCEL_INTERVAL_SECONDS = 0.075
 _ACQUISITION_WATCHDOG_JOIN_SECONDS = 0.15
 
@@ -737,8 +736,6 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
         acquisition_expired = threading.Event()
         acquisition_finished = threading.Event()
         acquisition_state_lock = threading.Lock()
-        original_statement_timeout: str | None = None
-        timeout_armed_raw: Any | None = None
 
         def cancel_raw(raw: Any) -> None:
             cancel_safe = getattr(raw, "cancel_safe", None)
@@ -752,9 +749,7 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
         def cancel_checkout_initialization() -> None:
             with acquisition_state_lock:
                 acquisition_expired.set()
-            for _ in range(_ACQUISITION_CANCEL_ATTEMPTS):
-                if acquisition_finished.is_set():
-                    break
+            while not acquisition_finished.is_set():
                 with acquisition_state_lock:
                     raw = acquisition_raw
                 if raw is not None:
@@ -778,29 +773,15 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
                 acquisition_raw = raw
             return True
 
-        def arm_pooled_raw(raw: Any) -> None:
-            if not publish_pooled_raw(raw):
-                return
-            if timeout_armed_raw is not raw:
-                set_initialization_timeout(raw)
-            if acquisition_expired.is_set():
-                raise TimeoutError(
-                    "ClaimSession maintenance connection initialization "
-                    "exceeded deadline"
-                )
-
         def bounded_pre_ping(dbapi_connection: Any) -> bool:
             if not publish_pooled_raw(dbapi_connection):
                 return original_pre_ping(dbapi_connection)
-            ping_succeeded = original_pre_ping(dbapi_connection)
-            if ping_succeeded:
-                arm_pooled_raw(dbapi_connection)
-            return ping_succeeded
+            return original_pre_ping(dbapi_connection)
 
         def capture_before_checkout_hooks(
             raw: Any, _connection_record: Any, _connection_proxy: Any
         ) -> None:
-            arm_pooled_raw(raw)
+            publish_pooled_raw(raw)
 
         def quiesce_acquisition_timer(timer: threading.Timer) -> None:
             timer.cancel()
@@ -809,52 +790,6 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
             if timer.is_alive():
                 raise RuntimeError(
                     "PostgreSQL maintenance acquisition watchdog failed to stop"
-                )
-
-        def set_initialization_timeout(raw: Any) -> None:
-            nonlocal original_statement_timeout, timeout_armed_raw
-            milliseconds = max(1, int(_remaining(deadline) * 1000))
-            with raw.cursor() as cursor:
-                cursor.execute("SHOW statement_timeout")
-                original_statement_timeout = cursor.fetchone()[0]
-                cursor.execute(
-                    "SELECT current_setting('statement_timeout')::interval "
-                    "= interval '0'"
-                )
-                timeout_is_unbounded = cursor.fetchone()[0]
-                if not timeout_is_unbounded:
-                    cursor.execute(
-                        "SELECT (EXTRACT(epoch FROM LEAST(%s::interval, "
-                        "current_setting('statement_timeout')::interval)) "
-                        "* 1000)::bigint",
-                        (f"{milliseconds}ms",),
-                    )
-                    bounded_timeout = f"{cursor.fetchone()[0]}ms"
-                else:
-                    bounded_timeout = f"{milliseconds}ms"
-                cursor.execute(
-                    "SELECT set_config('statement_timeout', %s, false)",
-                    (bounded_timeout,),
-                )
-            raw.commit()
-            timeout_armed_raw = raw
-
-        def reset_initialization_timeout(raw: Any) -> None:
-            if original_statement_timeout is None:
-                raise RuntimeError(
-                    "PostgreSQL maintenance did not capture statement_timeout"
-                )
-            with raw.cursor() as cursor:
-                cursor.execute(
-                    "SELECT set_config('statement_timeout', %s, false)",
-                    (original_statement_timeout,),
-                )
-                cursor.execute("SHOW statement_timeout")
-                setting = cursor.fetchone()[0]
-            raw.commit()
-            if setting != original_statement_timeout:
-                raise RuntimeError(
-                    "PostgreSQL maintenance failed to restore statement_timeout"
                 )
 
         def bounded_physical_connect(
@@ -898,16 +833,6 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
                     "ClaimSession maintenance connection initialization "
                     "exceeded deadline"
                 )
-            try:
-                set_initialization_timeout(raw)
-                if acquisition_expired.is_set():
-                    raise TimeoutError(
-                        "ClaimSession maintenance connection initialization "
-                        "exceeded deadline"
-                    )
-            except BaseException:
-                raw.close()
-                raise
             return raw
 
         connection: Connection | None = None
@@ -933,9 +858,6 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
                 event.listen(engine, "do_connect", bounded_physical_connect)
                 connect_listener_registered = True
                 connection = engine.connect()
-                if original_statement_timeout is not None:
-                    assert acquisition_raw is not None
-                    reset_initialization_timeout(acquisition_raw)
             finally:
                 try:
                     listener_active = False
@@ -956,7 +878,10 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
                             del engine.dialect._do_ping_w_event
                         pool._timeout = original_pool_timeout
         except BaseException as error:
-            quiesce_acquisition_timer(acquisition_timer)
+            try:
+                quiesce_acquisition_timer(acquisition_timer)
+            except BaseException as cleanup:
+                error.add_note(f"maintenance watchdog cleanup failed: {cleanup!r}")
             if connection is not None:
                 _discard_postgres_connection(connection, error)
             if acquisition_expired.is_set() and not isinstance(error, TimeoutError):
