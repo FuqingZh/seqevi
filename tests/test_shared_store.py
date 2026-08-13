@@ -839,6 +839,51 @@ def test_artifact_reader_streams_more_than_one_chunk_exactly(tmp_path: Path) -> 
     assert observed == [content]
 
 
+def test_private_helpers_ignore_shadow_package_in_cwd_and_pythonpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    shadow_root = tmp_path / "shadow"
+    shadow_package = shadow_root / "seqevi" / "store"
+    shadow_package.mkdir(parents=True)
+    marker = tmp_path / "shadow-loaded"
+    (shadow_root / "seqevi" / "__init__.py").write_text(
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('loaded')\n",
+        encoding="utf-8",
+    )
+    (shadow_package / "__init__.py").write_text("", encoding="utf-8")
+    (shadow_package / "_artifact_reader.py").write_text(
+        "raise RuntimeError('shadow artifact reader loaded')\n", encoding="utf-8"
+    )
+    (shadow_package / "_resolver.py").write_text(
+        "raise RuntimeError('shadow resolver loaded')\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(shadow_root)
+    monkeypatch.setenv("PYTHONPATH", str(shadow_root))
+    artifact = tmp_path / "artifact"
+    artifact.write_bytes(b"isolated payload")
+    observed: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(await request.aread())
+        return httpx.Response(200)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    runtime.request(
+        "PUT",
+        "/upload",
+        deadline=time.monotonic() + 10.0,
+        content=store_client_module._async_file_chunks(artifact),
+    )
+    resolved = runtime.run(runtime._loop.getaddrinfo(b"localhost", 443, type=1))
+    runtime.close()
+    assert observed == [b"isolated payload"]
+    assert resolved
+    assert not marker.exists()
+
+
 def test_request_closes_upload_stream_when_transport_returns_early(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1121,6 +1166,47 @@ def test_http_store_concurrent_close_waits_for_all_cleanup_and_shares_error() ->
     assert not download_root.exists()
 
 
+def test_http_store_close_publishes_unexpected_cleanup_failure_to_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(lambda _: httpx.Response(404)),
+    )
+    original_cleanup = store._cleanup_resources
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    errors: list[BaseException] = []
+
+    def fail_cleanup() -> BaseException | None:
+        cleanup_started.set()
+        release_cleanup.wait()
+        raise RuntimeError("unexpected cleanup failure")
+
+    def close_store() -> None:
+        try:
+            store.close()
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(store, "_cleanup_resources", fail_cleanup)
+    closers = [threading.Thread(target=close_store) for _index in range(2)]
+    closers[0].start()
+    assert cleanup_started.wait(0.5)
+    closers[1].start()
+    release_cleanup.set()
+    for closer in closers:
+        closer.join(1.0)
+    assert all(not closer.is_alive() for closer in closers)
+    assert len(errors) == 2
+    assert all(str(error) == "unexpected cleanup failure" for error in errors)
+    assert store._closed
+    original_cleanup()
+
+
 def test_http_store_reentrant_close_does_not_publish_or_clean_up() -> None:
     store = HttpEvidenceStore(
         "http://testserver",
@@ -1143,6 +1229,65 @@ def test_http_store_reentrant_close_does_not_publish_or_clean_up() -> None:
     assert not runtime._thread.is_alive()
     assert not download_root.exists()
     assert store._closed
+
+
+def test_http_store_initialization_error_survives_complete_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    real_temporary_directory = store_client_module.tempfile.TemporaryDirectory
+    real_cleanup_resources = HttpEvidenceStore._cleanup_resources
+    roots: list[Path] = []
+    runtimes: list[Any] = []
+    sync_closed = threading.Event()
+
+    def tracking_temporary_directory(*args: Any, **kwargs: Any) -> Any:
+        directory = real_temporary_directory(*args, dir=tmp_path, **kwargs)
+        roots.append(Path(directory.name))
+        return directory
+
+    class TrackingRuntime(store_client_module._ClaimTransportRuntime):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            runtimes.append(self)
+
+    class OwningClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            sync_closed.set()
+
+    class FailingAsyncClose(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            del request
+            return httpx.Response(200)
+
+        async def aclose(self) -> None:
+            raise RuntimeError("async cleanup failed")
+
+    def cleanup_then_fail(store: HttpEvidenceStore) -> BaseException | None:
+        real_cleanup_resources(store)
+        raise RuntimeError("unexpected cleanup wrapper failure")
+
+    monkeypatch.setattr(
+        store_client_module.tempfile,
+        "TemporaryDirectory",
+        tracking_temporary_directory,
+    )
+    monkeypatch.setattr(store_client_module, "_ClaimTransportRuntime", TrackingRuntime)
+    monkeypatch.setattr(store_client_module.httpx, "Client", OwningClient)
+    monkeypatch.setattr(HttpEvidenceStore, "_cleanup_resources", cleanup_then_fail)
+    with pytest.raises(ValueError, match="maximum_artifact_bytes must be positive"):
+        HttpEvidenceStore(
+            "http://testserver",
+            maximum_artifact_bytes=0,
+            maximum_batch_size=1,
+            _async_transport=FailingAsyncClose(),
+        )
+    assert sync_closed.is_set()
+    assert len(roots) == 1 and not roots[0].exists()
+    assert len(runtimes) == 1 and not runtimes[0]._thread.is_alive()
 
 
 def test_claim_transport_aclose_failure_still_joins_runtime() -> None:

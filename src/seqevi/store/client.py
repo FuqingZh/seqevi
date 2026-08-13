@@ -98,7 +98,7 @@ _READER_ERROR = -2
 
 
 def _artifact_reader_command(path: Path) -> tuple[str, ...]:
-    return (sys.executable, "-m", "seqevi.store._artifact_reader", str(path))
+    return (sys.executable, "-I", "-m", "seqevi.store._artifact_reader", str(path))
 
 
 def _resolver_command(
@@ -112,6 +112,7 @@ def _resolver_command(
     resolver_host = host.decode("ascii") if isinstance(host, bytes) else host
     return (
         sys.executable,
+        "-I",
         "-m",
         "seqevi.store._resolver",
         resolver_host,
@@ -352,11 +353,30 @@ class HttpEvidenceStore:
         try:
             self._initialize(maximum_artifact_bytes, maximum_batch_size)
         except BaseException:
+            try:
+                self._cleanup_resources()
+            except BaseException:
+                pass
+            raise
+
+    def _cleanup_resources(self) -> BaseException | None:
+        error: BaseException | None = None
+        try:
             self._claim_transport.close()
+        except BaseException as caught:
+            error = caught
+        try:
             if self._owns_client:
                 self.client.close()
+        except BaseException as caught:
+            if error is None:
+                error = caught
+        try:
             self._download_directory.cleanup()
-            raise
+        except BaseException as caught:
+            if error is None:
+                error = caught
+        return error
 
     def _initialize(
         self,
@@ -441,20 +461,9 @@ class HttpEvidenceStore:
             self._closing.set()
         error: BaseException | None = None
         try:
-            self._claim_transport.close()
+            error = self._cleanup_resources()
         except BaseException as caught:
             error = caught
-        try:
-            if self._owns_client:
-                self.client.close()
-        except BaseException as caught:
-            if error is None:
-                error = caught
-        try:
-            self._download_directory.cleanup()
-        except BaseException as caught:
-            if error is None:
-                error = caught
         finally:
             with self._close_condition:
                 self._close_error = error
