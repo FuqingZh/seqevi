@@ -53,6 +53,10 @@ later feature work.
 | evidence claim coordination | ClaimSession coordination with actively cancellable per-session HTTP transport; maintenance acquisition and external-tool cancellation remain separate delivery units | [evidence contract v1.5](architecture/20260813-v1.5-sequence-evidence-contract.md), [storage architecture v1.5](architecture/20260813-v1.5-storage-deployment-architecture.md), [maintenance runbook v1.1](operations/20260813-v1.1-claim-session-store-maintenance.md) |
 | shared Store claim contention hardening | delivery rebaselined after PR #31 review convergence exhaustion: PR A remains in progress; #33/#34/#35 remain independent; #37 owns external-tool cleanup and final PostgreSQL pressure/C2 acceptance and merges last | [delivery rebaseline addendum and settled boundaries](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md), [ClaimSession technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md), [superseded per-key hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md) |
 
+Issue #33 review convergence retains one PR and one owner because resolver,
+artifact-reader, logical-operation drain, and close ownership form one lifecycle
+invariant. See the [HTTP review-convergence addendum](implementation-plan/20260813-v1.5-claim-session-http-review-convergence-addendum.md).
+
 ## Start Here
 
 1. [Architecture overview](architecture/20260720-v1.0-seqevi-architecture.md)
