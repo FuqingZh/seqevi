@@ -211,6 +211,10 @@ class _ClaimTransportRuntime:
                 self._active_operations -= 1
                 self._operation_condition.notify_all()
 
+    def ensure_close_allowed(self) -> None:
+        if getattr(self._operation_local, "depth", 0):
+            raise RuntimeError("cannot close ClaimSession transport from an operation")
+
     @staticmethod
     async def _create_client(
         base_url: str,
@@ -270,8 +274,7 @@ class _ClaimTransportRuntime:
         await self._client.aclose()
 
     def close(self) -> None:
-        if getattr(self._operation_local, "depth", 0):
-            raise RuntimeError("cannot close ClaimSession transport from an operation")
+        self.ensure_close_allowed()
         owner = False
         with self._operation_condition:
             if self._closed.is_set():
@@ -422,6 +425,7 @@ class HttpEvidenceStore:
         return _HttpClaimSession(self, capabilities)
 
     def close(self) -> None:
+        self._claim_transport.ensure_close_allowed()
         with self._close_condition:
             if self._closed:
                 if self._close_error is not None:
@@ -904,10 +908,23 @@ class _HttpClaimSession:
         self, proposed: Iterable[EvidenceCommit]
     ) -> tuple[CommitOutcome, ...]:
         with self.store._claim_transport.operation():
-            return self._finalize_many(proposed)
+            started = time.monotonic()
+            authority_request, renew_deadline = self._authority_request_and_deadline()
+            deadline = min(started + 30.0, renew_deadline)
+            return self._finalize_many(
+                proposed,
+                started=started,
+                deadline=deadline,
+                authority_request=authority_request,
+            )
 
     def _finalize_many(
-        self, proposed: Iterable[EvidenceCommit]
+        self,
+        proposed: Iterable[EvidenceCommit],
+        *,
+        started: float,
+        deadline: float,
+        authority_request: dict[str, object],
     ) -> tuple[CommitOutcome, ...]:
         self.raise_if_lost()
         commits = tuple(proposed)
@@ -922,7 +939,17 @@ class _HttpClaimSession:
             return tuple(
                 outcome
                 for offset in range(0, len(commits), maximum)
-                for outcome in self.finalize_many(commits[offset : offset + maximum])
+                for outcome in self._finalize_many(
+                    commits[offset : offset + maximum],
+                    started=started,
+                    deadline=deadline,
+                    authority_request=authority_request,
+                )
+            )
+        transport_deadline = deadline - _FINALIZE_RECONCILIATION_RUNWAY_SECONDS
+        if transport_deadline <= time.monotonic():
+            raise EvidenceClaimLostError(
+                "ClaimSession finalization has no reconciliation runway"
             )
         for commit in commits:
             for payload in (commit.normalized_artifact, commit.raw_artifact):
@@ -930,7 +957,7 @@ class _HttpClaimSession:
                     payload is not None
                     and payload.digest not in self.store._uploaded_artifact_digests
                 ):
-                    self._upload_artifact(payload)
+                    self._upload_artifact(payload, deadline=transport_deadline)
                     self.store._uploaded_artifact_digests.add(payload.digest)
         items = []
         for commit in commits:
@@ -942,14 +969,6 @@ class _HttpClaimSession:
                     commit=CommitModel.from_domain(commit),
                     claim_generation=claim.generation,
                 )
-            )
-        started = time.monotonic()
-        authority_request, renew_deadline = self._authority_request_and_deadline()
-        deadline = min(started + 30.0, renew_deadline)
-        transport_deadline = deadline - _FINALIZE_RECONCILIATION_RUNWAY_SECONDS
-        if transport_deadline <= started:
-            raise EvidenceClaimLostError(
-                "ClaimSession finalization has no reconciliation runway"
             )
         request_id = uuid4().hex
         pending = list(zip(commits, items, strict=True))
@@ -1213,18 +1232,12 @@ class _HttpClaimSession:
         if uploaded != expected:
             raise StoreIntegrityError("shared Store returned wrong artifact metadata")
 
-    def _upload_artifact(self, payload: ArtifactFile) -> None:
-        upload_started = time.monotonic()
-        _authority, authority_deadline = self._authority_request_and_deadline()
-        upload_deadline = min(
-            upload_started + 30.0,
-            authority_deadline - _FINALIZE_RECONCILIATION_RUNWAY_SECONDS,
-        )
-        if upload_deadline <= upload_started:
+    def _upload_artifact(self, payload: ArtifactFile, *, deadline: float) -> None:
+        if deadline <= time.monotonic():
             raise EvidenceClaimLostError(
                 "ClaimSession artifact upload has no reconciliation runway"
             )
-        self._upload_until(payload, deadline=upload_deadline)
+        self._upload_until(payload, deadline=deadline)
 
     def close(self) -> None:
         with self.store._claim_transport.operation():

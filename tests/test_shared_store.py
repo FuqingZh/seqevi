@@ -1121,6 +1121,30 @@ def test_http_store_concurrent_close_waits_for_all_cleanup_and_shares_error() ->
     assert not download_root.exists()
 
 
+def test_http_store_reentrant_close_does_not_publish_or_clean_up() -> None:
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(lambda _: httpx.Response(404)),
+    )
+    runtime = store._claim_transport
+    download_root = store._download_root
+    with runtime.operation():
+        with pytest.raises(RuntimeError, match="from an operation"):
+            store.close()
+        assert runtime._thread.is_alive()
+        assert download_root.exists()
+        assert not store._closing.is_set()
+        assert not store._close_started
+        assert not store._closed
+    store.close()
+    assert not runtime._thread.is_alive()
+    assert not download_root.exists()
+    assert store._closed
+
+
 def test_claim_transport_aclose_failure_still_joins_runtime() -> None:
     store_client_module = importlib.import_module("seqevi.store.client")
 
@@ -1150,25 +1174,18 @@ def test_claim_artifact_upload_reserves_reconciliation_runway(
         tmp_path / "artifact", b"payload", "application/octet-stream"
     )
     session = object.__new__(store_client_module._HttpClaimSession)
-    authority_deadline = 105.0
+    upload_deadline = 104.0
     observed: list[float] = []
     monkeypatch.setattr(store_client_module.time, "monotonic", lambda: 100.0)
-    monkeypatch.setattr(
-        session,
-        "_authority_request_and_deadline",
-        lambda: ({}, authority_deadline),
-    )
     monkeypatch.setattr(
         session,
         "_upload_until",
         lambda _payload, *, deadline: observed.append(deadline),
     )
 
-    session._upload_artifact(payload)
+    session._upload_artifact(payload, deadline=upload_deadline)
 
-    assert observed == [
-        authority_deadline - store_client_module._FINALIZE_RECONCILIATION_RUNWAY_SECONDS
-    ]
+    assert observed == [upload_deadline]
 
 
 def test_claim_artifact_upload_rejects_insufficient_runway_before_transport(
@@ -1181,11 +1198,6 @@ def test_claim_artifact_upload_rejects_insufficient_runway_before_transport(
     session = object.__new__(store_client_module._HttpClaimSession)
     upload_called = False
     monkeypatch.setattr(store_client_module.time, "monotonic", lambda: 100.0)
-    monkeypatch.setattr(
-        session,
-        "_authority_request_and_deadline",
-        lambda: ({}, 100.5),
-    )
 
     def record_upload(_payload: object, *, deadline: float) -> None:
         nonlocal upload_called
@@ -1194,7 +1206,7 @@ def test_claim_artifact_upload_rejects_insufficient_runway_before_transport(
     monkeypatch.setattr(session, "_upload_until", record_upload)
 
     with pytest.raises(EvidenceClaimLostError, match="no reconciliation runway"):
-        session._upload_artifact(payload)
+        session._upload_artifact(payload, deadline=100.0)
     assert not upload_called
 
 
@@ -2119,6 +2131,102 @@ def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
                 session.finalize_many((commit,))
     assert lookup_timeouts
     assert all(0 < timeout <= 1.4 for timeout in lookup_timeouts)
+
+
+def test_finalize_batch_split_and_artifacts_share_one_absolute_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    commits = (
+        _hit_commit(tmp_path / "first", "MSHAREDBUDGETONE"),
+        _hit_commit(tmp_path / "second", "MSHAREDBUDGETTWO"),
+    )
+    queries = tuple(EvidenceQuery(commit.identity, commit.key) for commit in commits)
+    now = datetime.now(UTC)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "shared-budget",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            payload = json.loads(await request.aread())
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {"key": model["key"], "generation": 1},
+                        }
+                        for model in payload["queries"]
+                    ]
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            return httpx.Response(200, json={"outcomes": ["created"]})
+        return httpx.Response(200, json={"closed": True})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    )
+    session = store.claim_session()
+    session.acquire_many(queries)
+    clock = [100.0]
+    deadlines: list[tuple[str, float]] = []
+    monkeypatch.setattr(store_client_module.time, "monotonic", lambda: clock[0])
+    session._renew_deadline = 125.0
+    original_request = store._claim_transport.request
+
+    def capture_request(
+        method: str, path: str, *, deadline: float, **kwargs: Any
+    ) -> httpx.Response:
+        if path.endswith("/finalize"):
+            deadlines.append(("finalize", deadline))
+            clock[0] += 3.0
+        return original_request(method, path, deadline=deadline, **kwargs)
+
+    def capture_upload(_payload: object, *, deadline: float) -> None:
+        deadlines.append(("upload", deadline))
+        clock[0] += 3.0
+
+    monkeypatch.setattr(store._claim_transport, "request", capture_request)
+    monkeypatch.setattr(session, "_upload_until", capture_upload)
+    assert session.finalize_many(commits) == (
+        CommitOutcome.CREATED,
+        CommitOutcome.CREATED,
+    )
+    cutoff = 125.0 - store_client_module._FINALIZE_RECONCILIATION_RUNWAY_SECONDS
+    assert len([kind for kind, _ in deadlines if kind == "upload"]) >= 2
+    assert deadlines == [(kind, cutoff) for kind, _deadline in deadlines]
+    session._stop.set()
+    session._thread.join(0.5)
+    store.close()
 
 
 def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> None:
