@@ -803,7 +803,7 @@ def test_artifact_reader_timeout_kills_and_reaps_stalled_child(
     )
     worker.start()
     for _attempt in range(50):
-        if pid_file.exists():
+        if pid_file.exists() and pid_file.stat().st_size:
             break
         time.sleep(0.01)
     reader_pid = int(pid_file.read_text(encoding="ascii"))
@@ -837,6 +837,51 @@ def test_artifact_reader_streams_more_than_one_chunk_exactly(tmp_path: Path) -> 
     )
     runtime.close()
     assert observed == [content]
+
+
+def test_request_closes_upload_stream_when_transport_returns_early(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    artifact = tmp_path / "artifact"
+    artifact.write_bytes(b"payload")
+    pid_file = tmp_path / "reader.pid"
+    monkeypatch.setattr(
+        store_client_module,
+        "_artifact_reader_command",
+        lambda _path: (
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,signal,struct,sys;"
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()),encoding='ascii');"
+                "sys.stdout.buffer.write(struct.pack('!q',7)+b'payload');"
+                "sys.stdout.buffer.flush();signal.pause()"
+            ),
+            str(pid_file),
+        ),
+    )
+
+    class EarlyResponseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            stream = cast(httpx.AsyncByteStream, request.stream).__aiter__()
+            assert await stream.__anext__() == b"payload"
+            return httpx.Response(200, json={"accepted": True})
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, EarlyResponseTransport()
+    )
+    response = runtime.request(
+        "PUT",
+        "/upload",
+        deadline=time.monotonic() + 10.0,
+        content=store_client_module._async_file_chunks(artifact),
+    )
+    assert response.json() == {"accepted": True}
+    reader_pid = int(pid_file.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(reader_pid, 0)
+    runtime.close()
 
 
 def test_artifact_reader_reports_error_and_is_reaped(tmp_path: Path) -> None:
@@ -965,7 +1010,7 @@ def test_claim_resolver_close_kills_and_reaps_stalled_child(
     worker = threading.Thread(target=resolve)
     worker.start()
     for _attempt in range(50):
-        if pid_file.exists():
+        if pid_file.exists() and pid_file.stat().st_size:
             break
         time.sleep(0.01)
     resolver_pid = int(pid_file.read_text(encoding="ascii"))
@@ -1023,6 +1068,57 @@ def test_claim_transport_concurrent_close_waits_for_owner() -> None:
     assert all(not closer.is_alive() for closer in closers)
     assert not close_errors
     assert sorted(closed) == [0, 1]
+
+
+def test_http_store_concurrent_close_waits_for_all_cleanup_and_shares_error() -> None:
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(lambda _: httpx.Response(404)),
+    )
+    download_root = store._download_root
+    close_started = threading.Event()
+    release_close = threading.Event()
+
+    class BlockingFailingClient:
+        def close(self) -> None:
+            close_started.set()
+            release_close.wait()
+            raise RuntimeError("sync close failed")
+
+    store.client = cast(Any, BlockingFailingClient())
+    store._owns_client = True
+    errors: list[BaseException] = []
+    done = [threading.Event(), threading.Event()]
+
+    def close_store(index: int) -> None:
+        try:
+            store.close()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            done[index].set()
+
+    closers = [
+        threading.Thread(target=close_store, args=(index,)) for index in range(2)
+    ]
+    closers[0].start()
+    assert close_started.wait(0.5)
+    closers[1].start()
+    time.sleep(0.05)
+    assert not done[0].is_set()
+    assert not done[1].is_set()
+    assert download_root.exists()
+    release_close.set()
+    for closer in closers:
+        closer.join(1.0)
+    assert all(not closer.is_alive() for closer in closers)
+    assert all(event.is_set() for event in done)
+    assert len(errors) == 2
+    assert all(str(error) == "sync close failed" for error in errors)
+    assert not download_root.exists()
 
 
 def test_claim_transport_aclose_failure_still_joins_runtime() -> None:

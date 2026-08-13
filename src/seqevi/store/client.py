@@ -242,6 +242,8 @@ class _ClaimTransportRuntime:
         task = asyncio.current_task()
         assert task is not None
         self._requests.add(task)
+        content = kwargs.get("content")
+        close_content = getattr(content, "aclose", None)
         remaining = deadline - time.monotonic()
         try:
             if remaining <= 0:
@@ -253,7 +255,16 @@ class _ClaimTransportRuntime:
             async with asyncio.timeout(remaining):
                 return await self._client.request(method, path, **kwargs)
         finally:
-            self._requests.discard(task)
+            try:
+                if close_content is not None:
+                    cleanup = asyncio.create_task(close_content())
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        await cleanup
+                        raise
+            finally:
+                self._requests.discard(task)
 
     async def _shutdown(self) -> None:
         await self._client.aclose()
@@ -317,6 +328,10 @@ class HttpEvidenceStore:
             raise ValueError("timeout_seconds must be finite and positive")
         self._timeout_seconds = timeout_seconds
         self._closing = threading.Event()
+        self._close_condition = threading.Condition()
+        self._close_started = False
+        self._closed = False
+        self._close_error: BaseException | None = None
         self._uploaded_artifact_digests: set[str] = set()
         self._download_directory = tempfile.TemporaryDirectory(
             prefix="seqevi-http-artifacts-"
@@ -407,15 +422,42 @@ class HttpEvidenceStore:
         return _HttpClaimSession(self, capabilities)
 
     def close(self) -> None:
-        self._closing.set()
+        with self._close_condition:
+            if self._closed:
+                if self._close_error is not None:
+                    raise self._close_error
+                return
+            if self._close_started:
+                while not self._closed:
+                    self._close_condition.wait()
+                if self._close_error is not None:
+                    raise self._close_error
+                return
+            self._close_started = True
+            self._closing.set()
+        error: BaseException | None = None
         try:
             self._claim_transport.close()
+        except BaseException as caught:
+            error = caught
+        try:
+            if self._owns_client:
+                self.client.close()
+        except BaseException as caught:
+            if error is None:
+                error = caught
+        try:
+            self._download_directory.cleanup()
+        except BaseException as caught:
+            if error is None:
+                error = caught
         finally:
-            try:
-                if self._owns_client:
-                    self.client.close()
-            finally:
-                self._download_directory.cleanup()
+            with self._close_condition:
+                self._close_error = error
+                self._closed = True
+                self._close_condition.notify_all()
+        if error is not None:
+            raise error
 
     def __enter__(self) -> HttpEvidenceStore:
         return self
