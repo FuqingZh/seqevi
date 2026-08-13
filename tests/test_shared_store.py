@@ -2374,6 +2374,56 @@ def test_sqlite_maintenance_revalidates_target_after_file_fence(
     engine.dispose()
 
 
+def test_sqlite_maintenance_discards_stale_pooled_database_handle(
+    tmp_path: Path,
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    replacement_path = tmp_path / "replacement.sqlite3"
+    original_path = tmp_path / "original.sqlite3"
+    config = Config()
+    config.set_main_option(
+        "script_location", str(Path(store_migration.__file__).with_name("migrations"))
+    )
+    for path in (database_path, replacement_path):
+        seeded = create_engine(f"sqlite+pysqlite:///{path}")
+        with seeded.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        seeded.dispose()
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    with engine.connect() as stale:
+        assert stale.exec_driver_sql("PRAGMA database_list").one()[2] == str(
+            database_path
+        )
+    database_path.replace(original_path)
+    replacement_path.replace(database_path)
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        store_migration._database_identity(engine, store_root),  # pyright: ignore[reportPrivateUsage]
+        "0003_evidence_claim_leases",
+    )
+    store_migration.maintenance_upgrade_database(engine, store_root, acknowledgement)
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            == "0004_claim_sessions"
+        )
+    original = create_engine(f"sqlite+pysqlite:///{original_path}")
+    with original.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            == "0003_evidence_claim_leases"
+        )
+    original.dispose()
+    engine.dispose()
+
+
 @pytest.mark.requires_postgres
 def test_postgres_fenced_downgrade_recreates_empty_0003_coordination() -> None:
     with _isolated_postgres_url() as database_url:

@@ -271,6 +271,7 @@ def maintenance_upgrade_database(
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
         database_path = _canonical_sqlite_database_path(engine, store_root)
+        engine.dispose()
         with _pinned_sqlite_database(database_path) as pinned_descriptor:
             try:
                 with (
@@ -336,6 +337,7 @@ def maintenance_downgrade_database(
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
         database_path = _canonical_sqlite_database_path(engine, store_root)
+        engine.dispose()
         with _pinned_sqlite_database(database_path) as pinned_descriptor:
             try:
                 with (
@@ -403,6 +405,8 @@ def _maintenance_state(
     *,
     sqlite_binding: tuple[Path, int] | None = None,
 ) -> tuple[str | None, set[str]]:
+    if engine.dialect.name == "sqlite":
+        engine.dispose()
     with engine.connect() as connection:
         if engine.dialect.name == "sqlite":
             if sqlite_binding is None:
