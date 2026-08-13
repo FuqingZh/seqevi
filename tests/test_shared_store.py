@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from inspect import signature
+from inspect import getclosurevars, signature
 from typing import Any, cast
 
 import httpx
@@ -4582,12 +4582,13 @@ def test_postgres_maintenance_acquisition_only_narrows_pool_timeout() -> None:
     with _isolated_postgres_url() as database_url:
         engine = create_engine(database_url, pool_timeout=0.25)
         observed: list[float] = []
+        original_connect = engine.dialect.connect
 
-        @event.listens_for(engine, "do_connect")
-        def observe_pool_timeout(
-            _dialect, _connection_record, _cargs, _cparams
-        ) -> None:
+        def observe_pool_timeout(*args: Any, **kwargs: Any) -> Any:
             observed.append(cast(Any, engine.pool)._timeout)
+            return original_connect(*args, **kwargs)
+
+        engine.dialect.connect = observe_pool_timeout
 
         with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
             engine, time.monotonic() + 5
@@ -4658,6 +4659,68 @@ def test_postgres_maintenance_rejects_unbounded_client_cancellation(
         ):
             pytest.fail("unsupported client cancellation acquired a connection")
     assert not connected
+    engine.dispose()
+
+
+@pytest.mark.parametrize("source", ["parameter", "positional"])
+def test_postgres_maintenance_rejects_embedded_conninfo_before_connect(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    engine = create_engine(
+        "postgresql+psycopg://unused@127.0.0.1/unused",
+        connect_args={"conninfo": "host=hidden.example"}
+        if source == "parameter"
+        else {},
+    )
+    connected = False
+
+    def unexpected_connect(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal connected
+        connected = True
+
+    if source == "positional":
+        creator_args = getclosurevars(engine.pool._creator).nonlocals[  # pyright: ignore[reportPrivateUsage]
+            "cargs_tup"
+        ]
+        creator_args.append("host=hidden.example")
+    monkeypatch.setattr(engine.dialect, "connect", unexpected_connect)
+    with pytest.raises(RuntimeError, match="rejects embedded conninfo targets"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pytest.fail("embedded conninfo reached physical connect")
+    assert not connected
+    engine.dispose()
+
+
+def test_postgres_maintenance_preempts_returning_do_connect_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(
+        "postgresql+psycopg://unused@127.0.0.1/unused",
+        connect_args={"connect_timeout": 30},
+    )
+    earlier_called = False
+    observed: dict[str, Any] = {}
+
+    @event.listens_for(engine, "do_connect")
+    def earlier_returning_listener(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal earlier_called
+        earlier_called = True
+        return object()
+
+    def bounded_connect(*_args: Any, **cparams: Any) -> None:
+        observed.update(cparams)
+        raise RuntimeError("bounded physical creation owned")
+
+    monkeypatch.setattr(engine.dialect, "connect", bounded_connect)
+    with pytest.raises(RuntimeError, match="bounded physical creation owned"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pytest.fail("earlier do_connect listener bypassed bounded creation")
+    assert not earlier_called
+    assert 0 < int(observed["connect_timeout"]) < 30
     engine.dispose()
 
 

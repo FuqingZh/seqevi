@@ -806,6 +806,10 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
         ) -> Any:
             if not listener_active:
                 return None
+            if any(str(arg) for arg in cargs) or cparams.get("conninfo"):
+                raise RuntimeError(
+                    "PostgreSQL maintenance rejects embedded conninfo targets"
+                )
             bounded_cparams, attempts = _resolve_postgres_connect_targets(
                 cparams, deadline
             )
@@ -861,7 +865,14 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
                     insert=True,
                 )
                 checkout_listener_registered = True
-                event.listen(engine, "do_connect", bounded_physical_connect)
+                event.listen(
+                    engine,
+                    "do_connect",
+                    bounded_physical_connect,
+                )
+                connect_listeners = engine.dialect.dispatch.do_connect.listeners
+                connect_listeners.remove(bounded_physical_connect)
+                connect_listeners.appendleft(bounded_physical_connect)
                 connect_listener_registered = True
                 connection = engine.connect()
             finally:
