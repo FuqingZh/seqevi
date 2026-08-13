@@ -97,7 +97,11 @@ def _configure_sqlite(dbapi_connection: Any, _connection_record: Any) -> None:
         cursor.close()
 
 
-def _reset_sqlite_after_sweep(dbapi_connection: Any, _connection_record: Any) -> None:
+def _reset_sqlite_after_sweep(
+    dbapi_connection: Any | None, _connection_record: Any
+) -> None:
+    if dbapi_connection is None:
+        return
     dbapi_connection.set_progress_handler(None, 0)
     cursor = dbapi_connection.cursor()
     try:
@@ -1091,7 +1095,8 @@ def _key_sort_value(key: EvidenceKey) -> tuple[str, str, str, str, str]:
 
 
 def _sqlite_is_busy(error: OperationalError) -> bool:
-    return getattr(error.orig, "sqlite_errorcode", None) in {5, 6, 9}
+    code = getattr(error.orig, "sqlite_errorcode", None)
+    return isinstance(code, int) and code & 0xFF in {5, 6, 9}
 
 
 def _as_utc(value: datetime) -> datetime:

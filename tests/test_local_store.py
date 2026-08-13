@@ -4,11 +4,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+import sqlite3
 import threading
 import time
 
 import pytest
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import OperationalError
 
 from seqevi.errors import (
     EvidenceClaimLostError,
@@ -466,3 +468,15 @@ def test_sweeper_deadline_interrupts_work_inside_transaction(tmp_path: Path) -> 
             assert (
                 connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 30000
             )
+
+
+def test_sweeper_checkin_reset_tolerates_invalidated_connection() -> None:
+    local_module._reset_sqlite_after_sweep(None, object())  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("code", [261, 517, 773, 262])
+def test_sweeper_classifies_extended_sqlite_contention_codes(code: int) -> None:
+    original = sqlite3.OperationalError("database is locked")
+    original.sqlite_errorcode = code
+    error = OperationalError("statement", {}, original)
+    assert local_module._sqlite_is_busy(error)  # pyright: ignore[reportPrivateUsage]
