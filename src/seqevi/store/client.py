@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 import os
@@ -9,7 +10,8 @@ import random
 import tempfile
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Coroutine, Iterable, Iterator
+from concurrent.futures import Future
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -85,6 +87,76 @@ _MAX_CLAIM_BACKPRESSURE_RETRIES = 3
 _DEFAULT_CLAIM_RETRY_SECONDS = 0.25
 _CLAIM_RETRY_JITTER_RATIO = 0.1
 _TRANSFER_CHUNK_SIZE = 1024 * 1024
+_FINALIZE_RECONCILIATION_RUNWAY_SECONDS = 1.0
+
+
+class _ClaimTransportRuntime:
+    """Store-owned async client whose loop makes request cancellation joinable."""
+
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: float,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._started = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="seqevi-claim-http-runtime",
+            daemon=True,
+        )
+        self._thread.start()
+        self._started.wait()
+        self._client = self.run(
+            self._create_client(base_url, timeout_seconds, transport)
+        )
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._started.set()
+        self._loop.run_forever()
+        self._loop.close()
+
+    @staticmethod
+    async def _create_client(
+        base_url: str,
+        timeout_seconds: float,
+        transport: httpx.AsyncBaseTransport | None,
+    ) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=base_url,
+            timeout=httpx.Timeout(timeout_seconds),
+            transport=transport,
+        )
+
+    def run(self, operation: Coroutine[object, object, Any]) -> Any:
+        future: Future[Any] = asyncio.run_coroutine_threadsafe(operation, self._loop)
+        return future.result()
+
+    def request(
+        self, method: str, path: str, *, deadline: float, **kwargs: Any
+    ) -> httpx.Response:
+        return self.run(self._request(method, path, deadline=deadline, **kwargs))
+
+    async def _request(
+        self, method: str, path: str, *, deadline: float, **kwargs: Any
+    ) -> httpx.Response:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        kwargs.setdefault("timeout", httpx.Timeout(remaining))
+        # asyncio.timeout covers connection, headers, and complete body consumption.
+        # Leaving it cancels and awaits httpx/httpcore before the sync caller resumes.
+        async with asyncio.timeout(remaining):
+            return await self._client.request(method, path, **kwargs)
+
+    def close(self) -> None:
+        if not self._thread.is_alive():
+            return
+        self.run(self._client.aclose())
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join()
 
 
 class HttpEvidenceStore:
@@ -97,7 +169,8 @@ class HttpEvidenceStore:
         timeout_seconds: float = 120.0,
         maximum_artifact_bytes: int | None = None,
         maximum_batch_size: int | None = None,
-        client: httpx.Client | None = None,
+        _client: httpx.Client | None = None,
+        _async_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
@@ -109,11 +182,28 @@ class HttpEvidenceStore:
         )
         self._download_root = Path(self._download_directory.name)
         self._downloaded_artifacts: dict[str, ArtifactFile] = {}
-        self._owns_client = client is None
-        self.client = client or httpx.Client(
+        self._owns_client = _client is None
+        self.client = _client or httpx.Client(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout_seconds),
         )
+        self._claim_transport = _ClaimTransportRuntime(
+            base_url.rstrip("/"), timeout_seconds, _async_transport
+        )
+        try:
+            self._initialize(maximum_artifact_bytes, maximum_batch_size)
+        except BaseException:
+            self._claim_transport.close()
+            if self._owns_client:
+                self.client.close()
+            self._download_directory.cleanup()
+            raise
+
+    def _initialize(
+        self,
+        maximum_artifact_bytes: int | None,
+        maximum_batch_size: int | None,
+    ) -> None:
         if maximum_artifact_bytes is None or maximum_batch_size is None:
             health = HealthResponse.model_validate(
                 self._request("GET", "/health").json()
@@ -129,12 +219,12 @@ class HttpEvidenceStore:
         self.maximum_artifact_bytes = maximum_artifact_bytes
         self.maximum_batch_size = maximum_batch_size
         try:
-            capability_response = self.client.request(
+            capability_response = self._claim_transport.request(
                 "GET",
                 "/v1/internal/claim-sessions/capabilities",
-                timeout=httpx.Timeout(min(timeout_seconds, 30.0)),
+                deadline=time.monotonic() + min(self._timeout_seconds, 30.0),
             )
-        except httpx.HTTPError as error:
+        except (httpx.HTTPError, TimeoutError) as error:
             raise StoreError(
                 "shared Store request failed during GET "
                 "/v1/internal/claim-sessions/capabilities: "
@@ -157,11 +247,16 @@ class HttpEvidenceStore:
     def claim_session(self) -> _HttpClaimSession:
         if self._claim_session_capabilities is None:
             raise StoreError("shared Store does not support ClaimSession")
-        response = self._request(
-            "GET",
-            "/v1/internal/claim-sessions/capabilities",
-            timeout=httpx.Timeout(min(self._timeout_seconds, 30.0)),
-        )
+        deadline = time.monotonic() + min(self._timeout_seconds, 30.0)
+        try:
+            response = self._claim_transport.request(
+                "GET",
+                "/v1/internal/claim-sessions/capabilities",
+                deadline=deadline,
+            )
+        except (httpx.HTTPError, TimeoutError) as error:
+            raise StoreError("ClaimSession capability discovery failed") from error
+        _raise_for_store_status(response)
         capabilities = ClaimSessionCapabilitiesResponse.model_validate(response.json())
         self._claim_session_capabilities = capabilities
         return _HttpClaimSession(self, capabilities)
@@ -169,10 +264,13 @@ class HttpEvidenceStore:
     def close(self) -> None:
         self._closing.set()
         try:
-            if self._owns_client:
-                self.client.close()
+            self._claim_transport.close()
         finally:
-            self._download_directory.cleanup()
+            try:
+                if self._owns_client:
+                    self.client.close()
+            finally:
+                self._download_directory.cleanup()
 
     def __enter__(self) -> HttpEvidenceStore:
         return self
@@ -544,6 +642,7 @@ class _HttpClaimSession:
                             "POST",
                             "/v1/internal/claim-sessions/acquire",
                             deadline=deadline,
+                            deadline_loses_authority=False,
                             json=request.model_dump(mode="json"),
                         )
                         payload = ClaimSessionAcquireResponse.model_validate(
@@ -632,7 +731,14 @@ class _HttpClaimSession:
                     payload is not None
                     and payload.digest not in self.store._uploaded_artifact_digests
                 ):
-                    self.store._upload(payload)
+                    upload_started = time.monotonic()
+                    _authority, upload_authority_deadline = (
+                        self._authority_request_and_deadline()
+                    )
+                    upload_deadline = min(
+                        upload_started + 30.0, upload_authority_deadline
+                    )
+                    self._upload_until(payload, deadline=upload_deadline)
                     self.store._uploaded_artifact_digests.add(payload.digest)
         items = []
         for commit in commits:
@@ -648,6 +754,11 @@ class _HttpClaimSession:
         started = time.monotonic()
         authority_request, renew_deadline = self._authority_request_and_deadline()
         deadline = min(started + 30.0, renew_deadline)
+        transport_deadline = deadline - _FINALIZE_RECONCILIATION_RUNWAY_SECONDS
+        if transport_deadline <= started:
+            raise EvidenceClaimLostError(
+                "ClaimSession finalization has no reconciliation runway"
+            )
         request_id = uuid4().hex
         pending = list(zip(commits, items, strict=True))
         resolved: dict[EvidenceKey, CommitOutcome] = {}
@@ -669,13 +780,13 @@ class _HttpClaimSession:
                         "ClaimSession finalization deadline expired"
                     )
                 try:
-                    response = self.store.client.request(
+                    response = self.store._claim_transport.request(
                         "POST",
                         "/v1/internal/claim-sessions/finalize",
-                        timeout=httpx.Timeout(remaining_time),
+                        deadline=transport_deadline,
                         json=request.model_dump(mode="json"),
                     )
-                except httpx.HTTPError as error:
+                except (httpx.HTTPError, TimeoutError) as error:
                     unknown_outcome = True
                     attempt_error = StoreError(
                         "ClaimSession finalize transport outcome is unknown"
@@ -748,13 +859,13 @@ class _HttpClaimSession:
                         ]
                     )
                     try:
-                        lookup_response = self.store.client.request(
+                        lookup_response = self.store._claim_transport.request(
                             "POST",
                             "/v1/evidence/lookup",
-                            timeout=httpx.Timeout(remaining_time),
+                            deadline=deadline,
                             json=lookup_request.model_dump(mode="json"),
                         )
-                    except httpx.HTTPError as error:
+                    except (httpx.HTTPError, TimeoutError) as error:
                         raise StoreError(
                             "finalize evidence readback transport failed"
                         ) from error
@@ -840,20 +951,34 @@ class _HttpClaimSession:
         return tuple(resolved[commit.key] for commit in commits)
 
     def _request_until(
-        self, method: str, path: str, *, deadline: float, **kwargs: Any
+        self,
+        method: str,
+        path: str,
+        *,
+        deadline: float,
+        deadline_loses_authority: bool = True,
+        **kwargs: Any,
     ) -> httpx.Response:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise EvidenceClaimLostError("ClaimSession operation deadline expired")
+                if deadline_loses_authority:
+                    raise EvidenceClaimLostError(
+                        "ClaimSession operation deadline expired"
+                    )
+                raise StoreError("ClaimSession operation deadline expired")
             try:
-                response = self.store.client.request(
-                    method, path, timeout=httpx.Timeout(remaining), **kwargs
+                response = self.store._claim_transport.request(
+                    method, path, deadline=deadline, **kwargs
                 )
-            except httpx.HTTPError:
+            except (httpx.HTTPError, TimeoutError):
                 response = None
             if time.monotonic() >= deadline:
-                raise EvidenceClaimLostError(
+                if deadline_loses_authority:
+                    raise EvidenceClaimLostError(
+                        "ClaimSession operation response exceeded its deadline"
+                    )
+                raise StoreError(
                     "ClaimSession operation response exceeded its deadline"
                 )
             if response is not None and response.status_code == 412:
@@ -871,6 +996,31 @@ class _HttpClaimSession:
             if self._stop.wait(delay):
                 raise StoreError("ClaimSession closed during request")
 
+    def _upload_until(self, payload: ArtifactFile, *, deadline: float) -> None:
+        headers = {
+            "X-Artifact-Media-Type": payload.media_type,
+            "X-Artifact-Byte-Size": str(payload.byte_size),
+        }
+        try:
+            response = self.store._claim_transport.request(
+                "PUT",
+                f"/v1/artifacts/{payload.digest}",
+                deadline=deadline,
+                headers=headers,
+                content=_async_file_chunks(payload.path),
+            )
+        except (httpx.HTTPError, TimeoutError) as error:
+            raise StoreError("ClaimSession artifact upload failed") from error
+        _raise_for_store_status(response)
+        uploaded = ArtifactUploadResponse.model_validate(response.json()).artifact
+        expected = ArtifactReferenceModel(
+            digest=payload.digest,
+            media_type=payload.media_type,
+            byte_size=payload.byte_size,
+        )
+        if uploaded != expected:
+            raise StoreIntegrityError("shared Store returned wrong artifact metadata")
+
     def close(self) -> None:
         if self._stop.is_set():
             return
@@ -878,13 +1028,13 @@ class _HttpClaimSession:
         self._thread.join(timeout=min(self.store._timeout_seconds, 5.0))
         try:
             request = ClaimSessionCloseRequest.model_validate(self._authority_request())
-            self.store.client.request(
+            self.store._claim_transport.request(
                 "POST",
                 "/v1/internal/claim-sessions/close",
                 json=request.model_dump(mode="json"),
-                timeout=httpx.Timeout(min(self.store._timeout_seconds, 5.0)),
+                deadline=time.monotonic() + min(self.store._timeout_seconds, 5.0),
             )
-        except httpx.HTTPError:
+        except (httpx.HTTPError, TimeoutError):
             pass
 
 
@@ -925,6 +1075,12 @@ def _record_matches_commit(record: EvidenceRecord, commit: EvidenceCommit) -> bo
 
 
 def _file_chunks(path: Path) -> Iterator[bytes]:
+    with path.open("rb") as handle:
+        while chunk := handle.read(_TRANSFER_CHUNK_SIZE):
+            yield chunk
+
+
+async def _async_file_chunks(path: Path) -> Any:
     with path.open("rb") as handle:
         while chunk := handle.read(_TRANSFER_CHUNK_SIZE):
             yield chunk
