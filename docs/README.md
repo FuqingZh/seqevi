@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-08-12
+> Last updated: 2026-08-13
 
 SeqEvi has implemented the v1 local and shared Store paths. The current tree
 also contains the DuckDB result surface, fixture-backed contracts for the three
@@ -40,7 +40,7 @@ later feature work.
 | managed onboarding | dbCAN only for 0.2.0; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
 | shared Store cache seeding | approved staged execution plan; execution not started | [cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
 | evidence claim leases | per-EvidenceKey duplicate-suppression implementation validation accepted | [evidence contract v1.2](architecture/20260810-v1.2-sequence-evidence-contract.md), [claim-lease plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md) |
-| shared Store claim contention hardening | approved two-PR plan: PR A delivers compatibility-safe discovery, idempotent open, normalized bounded receipts and complete finalize reconciliation; PR B fault-injects/accepts reconciliation and adds runway-bounded PGID/PID1 cancellation; implementation not started | [active ClaimSession plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md), [superseded per-key hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md) |
+| shared Store claim contention hardening | delivery rebaselined after PR #31 review convergence exhaustion: #32 docs merge first; frozen implementation PR A remains independent from release-blocking #33/#34/#35 | [delivery rebaseline addendum](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md), [ClaimSession technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md), [superseded per-key hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md) |
 
 ## Start Here
 
@@ -81,8 +81,9 @@ later feature work.
 35. [Managed dbCAN Slice D public release gate](benchmarks/20260806-v1.4-dbcan-public-release-gate.md)
 36. [Shared Store cache-seeding implementation plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md)
 37. [Evidence claim lease implementation plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md)
-38. [ClaimSession and tool cancellation implementation plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md)
-39. [Superseded shared Store claim contention hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md)
+38. [ClaimSession delivery rebaseline addendum](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md)
+39. [ClaimSession and tool cancellation technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md)
+40. [Superseded shared Store claim contention hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md)
 
 ## Managed Boundary Contracts
 
