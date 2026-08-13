@@ -34,7 +34,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.engine import Connection
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, TimeoutError as SQLAlchemyTimeoutError
 
 from seqevi.annotate import run_annotation
 from seqevi.errors import (
@@ -3385,7 +3385,7 @@ def test_postgres_maintenance_classifies_commit_after_operation_deadline(
 
         monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 1.0)
         monkeypatch.setattr(
-            store_migration, "_MAINTENANCE_READBACK_TIMEOUT_SECONDS", 1.0
+            store_migration, "_MAINTENANCE_READBACK_TIMEOUT_SECONDS", 3.0
         )
         monkeypatch.setattr(store_migration, run_name, committed_late)
         if direction == "upgrade":
@@ -4405,6 +4405,294 @@ def test_postgres_maintenance_completion_readback_uses_fresh_bounded_connection(
             )
         assert time.monotonic() - started < 0.5
         engine.dispose()
+
+
+@pytest.mark.requires_postgres
+@pytest.mark.parametrize("phase", ["mutation", "reconciliation"])
+def test_postgres_maintenance_pool_checkout_uses_phase_remainder(
+    phase: str,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        held = engine.connect()
+        deadline = time.monotonic() + 1.1
+        started = time.monotonic()
+        try:
+            with pytest.raises((TimeoutError, SQLAlchemyTimeoutError)):
+                if phase == "mutation":
+                    store_migration._maintenance_upgrade_postgres(  # pyright: ignore[reportPrivateUsage]
+                        engine,
+                        store_migration.MaintenanceAcknowledgement(
+                            database_identity="unused",
+                            expected_revision="0003_evidence_claim_leases",
+                        ),
+                        deadline,
+                    )
+                else:
+                    store_migration._maintenance_state(  # pyright: ignore[reportPrivateUsage]
+                        engine, deadline
+                    )
+        finally:
+            held.close()
+            engine.dispose()
+        elapsed = time.monotonic() - started
+        assert 0.9 <= elapsed < 1.6
+
+
+@pytest.mark.requires_postgres
+@pytest.mark.parametrize("phase", ["mutation", "reconciliation"])
+def test_postgres_maintenance_physical_connect_uses_phase_remainder(
+    phase: str,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        observed: list[int] = []
+
+        original_connect = engine.dialect.connect
+
+        def stall_physical_connect(*cargs, **cparams):
+            timeout = int(cparams["connect_timeout"])
+            observed.append(timeout)
+            time.sleep(timeout)
+            raise TimeoutError("deterministic stalled physical connection")
+
+        engine.dialect.connect = stall_physical_connect
+
+        deadline = time.monotonic() + 2.5
+        started = time.monotonic()
+        try:
+            with pytest.raises(
+                TimeoutError, match="deterministic stalled physical connection"
+            ):
+                if phase == "mutation":
+                    store_migration._maintenance_upgrade_postgres(  # pyright: ignore[reportPrivateUsage]
+                        engine,
+                        store_migration.MaintenanceAcknowledgement(
+                            database_identity="unused",
+                            expected_revision="0003_evidence_claim_leases",
+                        ),
+                        deadline,
+                    )
+                else:
+                    store_migration._maintenance_state(  # pyright: ignore[reportPrivateUsage]
+                        engine, deadline
+                    )
+        finally:
+            engine.dialect.connect = original_connect
+            engine.dispose()
+        assert observed == [2]
+        assert 1.9 <= time.monotonic() - started < 2.5
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_fresh_readback_after_invalidation_is_bounded() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        with engine.connect() as connection:
+            config = Config()
+            config.set_main_option(
+                "script_location",
+                str(Path(store_migration.__file__).with_name("migrations")),
+            )
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0004_claim_sessions")
+            connection.commit()
+            assert (
+                170000
+                <= int(
+                    connection.exec_driver_sql("SHOW server_version_num").scalar_one()
+                )
+                < 180000
+            )
+            connection.invalidate()
+
+        observed: list[int] = []
+
+        original_connect = engine.dialect.connect
+
+        def observe_fresh_connect(*cargs, **cparams):
+            observed.append(int(cparams["connect_timeout"]))
+            return original_connect(*cargs, **cparams)
+
+        engine.dialect.connect = observe_fresh_connect
+
+        revision, tables = store_migration._maintenance_state(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        )
+        assert revision == "0004_claim_sessions"
+        assert "claim_sessions" in tables
+        assert observed and 1 <= observed[0] <= 4
+        engine.dialect.connect = original_connect
+        engine.dispose()
+
+
+def test_postgres_maintenance_acquisition_lock_wait_uses_phase_remainder() -> None:
+    engine = create_engine("postgresql+psycopg://unused@127.0.0.1/unused")
+    store_migration._POSTGRES_ACQUISITION_LOCK.acquire()  # pyright: ignore[reportPrivateUsage]
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="serialization"):
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, started + 0.1
+            ):
+                pytest.fail("connection acquisition unexpectedly succeeded")
+    finally:
+        store_migration._POSTGRES_ACQUISITION_LOCK.release()  # pyright: ignore[reportPrivateUsage]
+        engine.dispose()
+    assert 0.08 <= time.monotonic() - started < 0.5
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_post_checkout_expiry_discards_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        with engine.connect():
+            pass
+        original_remaining = store_migration._remaining  # pyright: ignore[reportPrivateUsage]
+        calls = 0
+
+        def expire_after_checkout(deadline: float) -> float:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise TimeoutError("deadline expired after checkout")
+            return original_remaining(deadline)
+
+        monkeypatch.setattr(store_migration, "_remaining", expire_after_checkout)
+        with pytest.raises(TimeoutError, match="expired after checkout"):
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, time.monotonic() + 5
+            ):
+                pytest.fail("expired connection was yielded")
+        assert cast(Any, engine.pool).checkedout() == 0
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_acquisition_only_narrows_pool_timeout() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_timeout=0.25)
+        observed: list[float] = []
+
+        @event.listens_for(engine, "do_connect")
+        def observe_pool_timeout(
+            _dialect, _connection_record, _cargs, _cparams
+        ) -> None:
+            observed.append(cast(Any, engine.pool)._timeout)
+
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pass
+        assert observed == [0.25]
+        assert cast(Any, engine.pool)._timeout == 0.25
+        engine.dispose()
+
+
+def test_postgres_maintenance_rejects_unrepresentable_physical_connect_budget() -> None:
+    engine = create_engine("postgresql+psycopg://unused@127.0.0.1/unused")
+    connected = False
+
+    def unexpected_connect(*_cargs, **_cparams):
+        nonlocal connected
+        connected = True
+        raise AssertionError("physical connect should have been rejected")
+
+    engine.dialect.connect = unexpected_connect
+    with pytest.raises(TimeoutError, match="insufficient physical-connect budget"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 1.5
+        ):
+            pytest.fail("unrepresentable physical connection was acquired")
+    assert not connected
+    engine.dispose()
+
+
+def test_postgres_maintenance_replaces_zero_physical_connect_timeout() -> None:
+    engine = create_engine(
+        "postgresql+psycopg://unused@127.0.0.1/unused",
+        connect_args={"connect_timeout": 0},
+    )
+    observed: list[int] = []
+
+    def observe_connect_timeout(*_cargs, **cparams):
+        observed.append(int(cparams["connect_timeout"]))
+        raise TimeoutError("stop after observing bounded connect timeout")
+
+    engine.dialect.connect = observe_connect_timeout
+    with pytest.raises(TimeoutError, match="stop after observing"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 3.5
+        ):
+            pytest.fail("test physical connection unexpectedly succeeded")
+    assert observed == [3]
+    engine.dispose()
+
+
+def test_postgres_maintenance_listener_setup_failure_restores_pool_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(
+        "postgresql+psycopg://unused@127.0.0.1/unused", pool_timeout=0.25
+    )
+
+    def fail_listener_setup(*_args, **_kwargs) -> None:
+        raise RuntimeError("listener setup failed")
+
+    monkeypatch.setattr(store_migration.event, "listen", fail_listener_setup)
+    with pytest.raises(RuntimeError, match="listener setup failed"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pytest.fail("listener setup failure unexpectedly acquired a connection")
+    assert cast(Any, engine.pool)._timeout == 0.25
+    engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_listener_removal_failure_restores_and_discards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(
+            database_url, pool_size=1, max_overflow=0, pool_timeout=0.25
+        )
+
+        def fail_listener_removal(*_args, **_kwargs) -> None:
+            raise RuntimeError("listener removal failed")
+
+        monkeypatch.setattr(store_migration.event, "remove", fail_listener_removal)
+        with pytest.raises(RuntimeError, match="listener removal failed"):
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, time.monotonic() + 5
+            ):
+                pytest.fail("listener removal failure yielded a connection")
+        assert cast(Any, engine.pool)._timeout == 0.25
+        assert cast(Any, engine.pool).checkedout() == 0
+        engine.dispose()
+
+
+def test_postgres_maintenance_discard_attempts_close_after_invalidate_failure() -> None:
+    class FailingConnection:
+        closed = False
+
+        def invalidate(self) -> None:
+            raise RuntimeError("invalidate failed")
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = FailingConnection()
+    primary = TimeoutError("deadline expired after checkout")
+    store_migration._discard_postgres_connection(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, connection), primary
+    )
+    assert connection.closed
+    assert primary.__notes__ == [
+        "maintenance connection invalidation failed: RuntimeError('invalidate failed')"
+    ]
 
 
 @pytest.mark.requires_postgres

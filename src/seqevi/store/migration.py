@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterator, cast
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import DBAPIError
 
@@ -31,6 +31,7 @@ _CLAIM_SESSION_TABLES = {
     "claim_session_acquire_receipts",
     "claim_session_acquire_receipt_items",
 }
+_POSTGRES_ACQUISITION_LOCK = threading.Lock()
 
 
 class _AmbiguousMaintenanceCommit(RuntimeError):
@@ -427,7 +428,12 @@ def _maintenance_state(
 ) -> tuple[str | None, set[str]]:
     if engine.dialect.name == "sqlite":
         engine.dispose()
-    with engine.connect() as connection:
+    connection_context = (
+        engine.connect()
+        if engine.dialect.name == "sqlite"
+        else _bounded_postgres_connect(engine, deadline)
+    )
+    with connection_context as connection:
         if engine.dialect.name == "sqlite":
             if sqlite_binding is None:
                 raise RuntimeError("SQLite maintenance readback requires file binding")
@@ -609,7 +615,7 @@ def _maintenance_upgrade_postgres(
     *,
     downgrade: bool = False,
 ) -> None:
-    with engine.connect() as connection:
+    with _bounded_postgres_connect(engine, deadline) as connection:
         acquired = False
         primary: BaseException | None = None
         cleanup: BaseException | None = None
@@ -695,6 +701,89 @@ def _maintenance_upgrade_postgres(
             raise primary
         if cleanup is not None:
             raise cleanup
+
+
+@contextmanager
+def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Connection]:
+    """Acquire one pooled PostgreSQL connection inside an absolute deadline."""
+
+    if not _POSTGRES_ACQUISITION_LOCK.acquire(timeout=_remaining(deadline)):
+        raise TimeoutError(
+            "ClaimSession maintenance connection serialization exceeded deadline"
+        )
+    try:
+        remaining = _remaining(deadline)
+        pool = cast(Any, engine.pool)
+        if not hasattr(pool, "_timeout"):
+            raise RuntimeError(
+                "PostgreSQL maintenance requires a timeout-capable connection pool"
+            )
+        original_pool_timeout = pool._timeout
+
+        def clamp_physical_connect(
+            _dialect: Any,
+            _connection_record: Any,
+            _cargs: list[Any],
+            cparams: dict[str, Any],
+        ) -> None:
+            connect_timeout = int(_remaining(deadline))
+            if connect_timeout < 2:
+                raise TimeoutError(
+                    "ClaimSession maintenance has insufficient physical-connect budget"
+                )
+            configured = cparams.get("connect_timeout")
+            cparams["connect_timeout"] = (
+                min(int(configured), connect_timeout)
+                if configured is not None and int(configured) > 0
+                else connect_timeout
+            )
+            return None
+
+        connection: Connection | None = None
+        listener_registered = False
+        try:
+            pool._timeout = min(float(original_pool_timeout), remaining)
+            try:
+                event.listen(engine, "do_connect", clamp_physical_connect)
+                listener_registered = True
+                connection = engine.connect()
+            finally:
+                try:
+                    if listener_registered:
+                        event.remove(engine, "do_connect", clamp_physical_connect)
+                finally:
+                    pool._timeout = original_pool_timeout
+        except BaseException as error:
+            if connection is not None:
+                _discard_postgres_connection(connection, error)
+            raise
+        assert connection is not None
+        try:
+            _remaining(deadline)
+        except BaseException as error:
+            _discard_postgres_connection(connection, error)
+            raise
+    finally:
+        _POSTGRES_ACQUISITION_LOCK.release()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def _discard_postgres_connection(
+    connection: Connection, primary: BaseException
+) -> None:
+    """Attempt all discard steps while retaining the acquisition failure."""
+
+    try:
+        connection.invalidate()
+    except BaseException as cleanup:
+        primary.add_note(f"maintenance connection invalidation failed: {cleanup!r}")
+    try:
+        connection.close()
+    except BaseException as cleanup:
+        primary.add_note(f"maintenance connection close failed: {cleanup!r}")
 
 
 def _cleanup_postgres_maintenance(
