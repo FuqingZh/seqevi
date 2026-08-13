@@ -441,17 +441,22 @@ class PostgresEvidencePersistence:
             key_values = tuple(
                 dict.fromkeys(_key_sort_value(claim.key) for claim in requested)
             )
-            rows = connection.execute(
-                select(
-                    *(session_claims.c[name] for name in _CLAIM_KEY_NAMES),
-                    session_claims.c.generation,
-                ).where(
-                    session_claims.c.session_id == authority.session_id,
-                    tuple_(*(session_claims.c[name] for name in _CLAIM_KEY_NAMES)).in_(
-                        key_values
-                    ),
+            rows = []
+            for offset in range(0, len(key_values), _LOOKUP_CHUNK_SIZE):
+                chunk = key_values[offset : offset + _LOOKUP_CHUNK_SIZE]
+                rows.extend(
+                    connection.execute(
+                        select(
+                            *(session_claims.c[name] for name in _CLAIM_KEY_NAMES),
+                            session_claims.c.generation,
+                        ).where(
+                            session_claims.c.session_id == authority.session_id,
+                            tuple_(
+                                *(session_claims.c[name] for name in _CLAIM_KEY_NAMES)
+                            ).in_(chunk),
+                        )
+                    ).all()
                 )
-            ).all()
             actual = {tuple(row) for row in rows}
             return actual == expected
 

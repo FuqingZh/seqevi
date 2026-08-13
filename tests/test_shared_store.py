@@ -71,9 +71,9 @@ from seqevi.store.schema import (
     claim_session_acquire_receipts,
     claim_sessions,
     evidence_claim_generations,
+    session_claims,
 )
 from seqevi.store.transport import (
-    ClaimSessionAuthorityCheckRequest,
     ClaimSessionFinalizeItem,
     CommitModel,
     EvidenceRecordModel,
@@ -1914,13 +1914,12 @@ def test_claim_session_sweeper_retries_after_connection_failure(tmp_path: Path) 
     assert persistence.sweeps >= 2
 
 
-@pytest.mark.parametrize("claim_count, expected_status", [(1000, 200), (1001, 422)])
-def test_claim_session_authority_request_has_fixed_batch_boundary(
-    tmp_path: Path, claim_count: int, expected_status: int
+def test_claim_session_authority_preserves_inputs_larger_than_future_ceiling(
+    tmp_path: Path,
 ) -> None:
     class AuthorityPersistence(MemoryPersistence):
         def claim_session_authority_is_live(self, _authority, claims):
-            assert len(tuple(claims)) == 1000
+            assert len(tuple(claims)) == 1001
             return True
 
     _, key = _key("MAUTHORITYBOUNDARY")
@@ -1929,18 +1928,15 @@ def test_claim_session_authority_request_has_fixed_batch_boundary(
         "session_id": "session",
         "owner_token": "owner",
         "generation": 1,
-        "claims": [claim.model_dump(mode="json")] * claim_count,
+        "claims": [claim.model_dump(mode="json")] * 1001,
     }
-    if claim_count == 1001:
-        with pytest.raises(ValidationError):
-            ClaimSessionAuthorityCheckRequest.model_validate(payload)
     persistence = AuthorityPersistence()
     app = create_service_app(
         _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
     )
     with TestClient(app) as service:
         response = service.post("/v1/internal/claim-sessions/authority", json=payload)
-    assert response.status_code == expected_status
+    assert response.status_code == 200
 
 
 def test_claim_session_authority_backpressure_is_503(tmp_path: Path) -> None:
@@ -2361,14 +2357,17 @@ def test_sqlite_maintenance_revalidates_target_after_file_fence(
         "0003_evidence_claim_leases",
     )
 
-    @contextmanager
-    def replace_after_fence(_store_root: Path, _deadline: float):
+    original_upgrade = store_migration._run_maintenance_upgrade  # pyright: ignore[reportPrivateUsage]
+
+    def replace_after_mutation(*args, **kwargs):
+        original_upgrade(*args, **kwargs)
         database_path.replace(tmp_path / "original.sqlite3")
         replacement_path.replace(database_path)
-        yield
 
-    monkeypatch.setattr(store_migration, "_bounded_file_lock", replace_after_fence)
-    with pytest.raises(RuntimeError, match="target changed before fencing"):
+    monkeypatch.setattr(
+        store_migration, "_run_maintenance_upgrade", replace_after_mutation
+    )
+    with pytest.raises(RuntimeError, match="target changed while fenced"):
         store_migration.maintenance_upgrade_database(
             engine, store_root, acknowledgement
         )
@@ -2929,6 +2928,68 @@ def test_postgres_exact_session_and_claim_authority_readback() -> None:
             authority, (acquired.claim,)
         )
         persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_authority_readback_chunks_large_accepted_input() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-authority-large",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        claims = tuple(
+            SessionEvidenceClaim(_key("M" + "A" * index + "C")[1], 1)
+            for index in range(1, 1002)
+        )
+        with persistence.engine.begin() as connection:
+            connection.execute(
+                session_claims.insert(),
+                [
+                    {
+                        **{
+                            name: value
+                            for name, value in zip(
+                                persistence_module._CLAIM_KEY_NAMES,  # pyright: ignore[reportPrivateUsage]
+                                (
+                                    claim.key.sequence_id,
+                                    claim.key.adapter_contract_version,
+                                    claim.key.tool_runtime_digest,
+                                    claim.key.resource_id,
+                                    claim.key.semantic_parameters_hash,
+                                ),
+                                strict=True,
+                            )
+                        },
+                        "semantic_parameters_json": claim.key.semantic_parameters_json,
+                        "session_id": authority.session_id,
+                        "generation": claim.generation,
+                    }
+                    for claim in claims
+                ],
+            )
+        statements: list[str] = []
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            if "FROM session_claims" in statement:
+                statements.append(statement)
+
+        event.listen(persistence.engine, "before_cursor_execute", record_statement)
+        try:
+            assert persistence.claim_session_authority_is_live(authority, claims)
+        finally:
+            event.remove(persistence.engine, "before_cursor_execute", record_statement)
+            persistence.close()
+        assert len(statements) == 2
 
 
 @pytest.mark.requires_postgres

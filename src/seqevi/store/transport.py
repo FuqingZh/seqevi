@@ -350,7 +350,7 @@ class ClaimSessionAcquireResponse(TransportModel):
 
 
 class ClaimSessionAuthorityCheckRequest(ClaimSessionAuthorityModel):
-    claims: Annotated[list[SessionEvidenceClaimModel], Field(max_length=1000)]
+    claims: list[SessionEvidenceClaimModel]
 
 
 class ClaimSessionAuthorityCheckResponse(TransportModel):

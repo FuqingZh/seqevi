@@ -349,8 +349,8 @@ class LocalStore:
                 )
                 removed += result.rowcount
                 return removed
-            finally:
-                connection.exec_driver_sql("PRAGMA busy_timeout=30000")
+            except BaseException:
+                raise
 
     @property
     def supports_claim_sessions(self) -> bool:

@@ -9,7 +9,7 @@ import threading
 import time
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import OperationalError
 
 from seqevi.errors import (
@@ -451,7 +451,19 @@ def test_sweeper_close_is_bounded_by_writer_contention_and_recovers_next_open(
 
 def test_sweeper_restores_foreground_sqlite_busy_timeout(tmp_path: Path) -> None:
     with LocalStore.open(tmp_path / "store") as store:
-        store._sweep_once()  # pyright: ignore[reportPrivateUsage]
+        commit_timeouts: list[int] = []
+
+        def record_commit_timeout(connection) -> None:
+            commit_timeouts.append(
+                connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+            )
+
+        event.listen(store.engine, "commit", record_commit_timeout)
+        try:
+            store._sweep_once()  # pyright: ignore[reportPrivateUsage]
+        finally:
+            event.remove(store.engine, "commit", record_commit_timeout)
+        assert commit_timeouts == [100]
         with store.engine.connect() as connection:
             assert (
                 connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 30000

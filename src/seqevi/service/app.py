@@ -330,7 +330,6 @@ def create_service_app(
     def claim_session_authority(
         request: ClaimSessionAuthorityCheckRequest,
     ) -> ClaimSessionAuthorityCheckResponse:
-        _check_batch_size(len(request.claims), min(settings.maximum_batch_size, 1000))
         try:
             return ClaimSessionAuthorityCheckResponse(
                 live=database.claim_session_authority_is_live(
