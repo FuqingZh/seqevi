@@ -9,26 +9,17 @@ import random
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import (
-    FIRST_COMPLETED,
-    CancelledError,
-    Future,
-    InvalidStateError,
-    TimeoutError as FutureTimeoutError,
-    ThreadPoolExecutor,
-    wait,
-)
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from queue import PriorityQueue
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
 from seqevi.errors import (
+    ClaimReceiptCapacityError,
     EvidenceClaimLostError,
     EvidenceConflictError,
     StoreError,
@@ -37,16 +28,15 @@ from seqevi.errors import (
 from seqevi.evidence import (
     ArtifactFile,
     ArtifactLifetime,
-    ClaimAcquireResult,
-    ClaimDisposition,
-    ClaimedEvidenceCommit,
     CommitOutcome,
-    EvidenceClaim,
     EvidenceCommit,
     EvidenceKey,
     EvidenceQuery,
     EvidenceRecord,
     FetchedEvidence,
+    ClaimSessionAuthority,
+    SessionClaimAcquireResult,
+    SessionEvidenceClaim,
 )
 
 from .transport import (
@@ -55,15 +45,19 @@ from .transport import (
     CommitModel,
     CommitRequest,
     CommitResponse,
-    ClaimAcquireRequest,
-    ClaimAcquireResponse,
-    ClaimCapabilitiesResponse,
-    ClaimFinalizeRequest,
-    ClaimedCommitModel,
-    ClaimMutationRequest,
-    ClaimReleaseResponse,
-    ClaimRenewResponse,
-    EvidenceClaimModel,
+    ClaimSessionAcquireRequest,
+    ClaimSessionAcquireResponse,
+    ClaimSessionAuthorityCheckRequest,
+    ClaimSessionAuthorityCheckResponse,
+    ClaimSessionCapabilitiesResponse,
+    ClaimSessionCloseRequest,
+    ClaimSessionFinalizeItem,
+    ClaimSessionFinalizeRequest,
+    ClaimSessionFinalizeResponse,
+    ClaimSessionOpenRequest,
+    ClaimSessionOpenResponse,
+    ClaimSessionRenewRequest,
+    ClaimSessionRenewResponse,
     EvidenceKeyModel,
     EvidenceQueryModel,
     FetchManyRequest,
@@ -71,7 +65,16 @@ from .transport import (
     HealthResponse,
     LookupRequest,
     LookupResponse,
+    SessionEvidenceClaimModel,
+    canonical_query_digest,
 )
+
+
+class _StoreResponseError(StoreError):
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(f"shared Store returned HTTP {status_code}: {detail}")
+        self.status_code = status_code
+
 
 _CLAIM_RUNWAY_SECONDS = 5.0
 _HANDOFF_SCHEDULING_SECONDS = 1.0
@@ -81,361 +84,6 @@ _RESERVED_CLAIM_RENEWAL_SLOTS = 2
 _MAX_CLAIM_BACKPRESSURE_RETRIES = 3
 _DEFAULT_CLAIM_RETRY_SECONDS = 0.25
 _CLAIM_RETRY_JITTER_RATIO = 0.1
-
-
-@dataclass(frozen=True)
-class _ScheduledClaimRequest:
-    call: Callable[[float], httpx.Response]
-    deadline: float
-    future: Future[httpx.Response]
-
-
-class _ClaimRequestScheduler:
-    """Bound claim transport concurrency and give queued renewals priority."""
-
-    def __init__(self, maximum_workers: int) -> None:
-        self._queue: PriorityQueue[tuple[int, int, _ScheduledClaimRequest | None]] = (
-            PriorityQueue()
-        )
-        self._lock = threading.Lock()
-        self._capacity = threading.Condition(self._lock)
-        self._maximum_workers = maximum_workers
-        self._reserved_renewal_slots = min(
-            _RESERVED_CLAIM_RENEWAL_SLOTS,
-            max(maximum_workers - 1, 0),
-        )
-        self._maximum_mutation_workers = maximum_workers - self._reserved_renewal_slots
-        self._closed = False
-        self._sequence = 0
-        self._active_transports: set[threading.Thread] = set()
-        self._threads = tuple(
-            threading.Thread(
-                target=self._run,
-                name=f"seqevi-claim-request-{index}",
-                daemon=True,
-            )
-            for index in range(maximum_workers)
-        )
-        for thread in self._threads:
-            thread.start()
-
-    def submit(
-        self,
-        call: Callable[[float], httpx.Response],
-        *,
-        renewal: bool,
-        deadline: float,
-    ) -> Future[httpx.Response]:
-        future: Future[httpx.Response] = Future()
-        with self._capacity:
-            if self._closed:
-                raise StoreError("shared Store closed during claim request")
-            sequence = self._sequence
-            self._sequence += 1
-            self._queue.put(
-                (
-                    0 if renewal else 1,
-                    sequence,
-                    _ScheduledClaimRequest(call, deadline, future),
-                )
-            )
-            # A mutation worker may already be waiting because the reserved
-            # renewal slots are the only remaining capacity. Wake it when a
-            # renewal arrives so queue priority can take effect immediately.
-            self._capacity.notify_all()
-        return future
-
-    def cancel_pending(self) -> None:
-        """Cancel queued calls while leaving currently running calls alone."""
-
-        with self._queue.mutex:
-            for _priority, _sequence, scheduled in self._queue.queue:
-                if scheduled is not None:
-                    scheduled.future.cancel()
-
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._capacity.notify_all()
-            for _thread in self._threads:
-                self._queue.put((2, self._sequence, None))
-                self._sequence += 1
-        for thread in self._threads:
-            thread.join()
-        while True:
-            with self._lock:
-                active = tuple(self._active_transports)
-            if not active:
-                return
-            for thread in active:
-                thread.join()
-
-    def _run(self) -> None:
-        while True:
-            priority, sequence, scheduled = self._queue.get()
-            if scheduled is None:
-                self._queue.task_done()
-                return
-
-            with self._capacity:
-                if self._closed:
-                    try:
-                        scheduled.future.set_exception(
-                            StoreError("shared Store closed during claim request")
-                        )
-                    except InvalidStateError:
-                        pass
-                    self._queue.task_done()
-                    continue
-
-                active_limit = (
-                    self._maximum_workers
-                    if priority == 0
-                    else self._maximum_mutation_workers
-                )
-                if len(self._active_transports) >= active_limit:
-                    # Do not let a lower-priority mutation occupy a scheduler
-                    # worker while it waits for a transport slot. Requeue it
-                    # and select again after capacity is available so a
-                    # renewal submitted meanwhile can overtake it.
-                    self._queue.put((priority, sequence, scheduled))
-                    self._queue.task_done()
-                    self._capacity.wait()
-                    continue
-
-                transport_done = threading.Event()
-
-                def run_transport(
-                    scheduled_request: _ScheduledClaimRequest = scheduled,
-                    done: threading.Event = transport_done,
-                ) -> None:
-                    try:
-                        response = scheduled_request.call(
-                            max(scheduled_request.deadline - time.monotonic(), 0.0)
-                        )
-                    except BaseException as error:
-                        try:
-                            scheduled_request.future.set_exception(error)
-                        except InvalidStateError:
-                            pass
-                    else:
-                        try:
-                            scheduled_request.future.set_result(response)
-                        except InvalidStateError:
-                            pass
-                    finally:
-                        done.set()
-                        with self._capacity:
-                            self._active_transports.discard(threading.current_thread())
-                            self._capacity.notify()
-
-                transport_thread = threading.Thread(
-                    target=run_transport,
-                    name="seqevi-claim-transport",
-                    daemon=True,
-                )
-                self._active_transports.add(transport_thread)
-
-            try:
-                if not scheduled.future.set_running_or_notify_cancel():
-                    with self._capacity:
-                        self._active_transports.discard(transport_thread)
-                        self._capacity.notify()
-                    continue
-
-                remaining = scheduled.deadline - time.monotonic()
-                if remaining <= 0:
-                    scheduled.future.set_exception(
-                        TimeoutError("claim request expired before transport started")
-                    )
-                    with self._capacity:
-                        self._active_transports.discard(transport_thread)
-                        self._capacity.notify()
-                    continue
-                transport_thread.start()
-                if not transport_done.wait(timeout=remaining):
-                    try:
-                        scheduled.future.set_exception(
-                            TimeoutError("claim request exceeded its deadline")
-                        )
-                    except InvalidStateError:
-                        pass
-            finally:
-                self._queue.task_done()
-
-
-class _ChunkAcquireRenewer:
-    """Keep early HTTP acquisition chunks alive until the whole call returns."""
-
-    def __init__(self, store: HttpEvidenceStore) -> None:
-        self._store = store
-        self._claims: dict[EvidenceKey, EvidenceClaim] = {}
-        self._queries: dict[EvidenceKey, EvidenceQuery] = {}
-        self._terminal: dict[EvidenceKey, EvidenceRecord] = {}
-        self._deadlines: dict[EvidenceKey, float] = {}
-        self._lock = threading.Lock()
-        self._changed = threading.Event()
-        self._stopped = threading.Event()
-        self._failure: BaseException | None = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def add(self, claim: EvidenceClaim, query: EvidenceQuery) -> None:
-        with self._lock:
-            self._claims[claim.key] = claim
-            self._queries[claim.key] = query
-            self._deadlines[claim.key] = time.monotonic() + _claim_renewal_delay(claim)
-        self._changed.set()
-
-    def stop(self) -> None:
-        self._stopped.set()
-        self._changed.set()
-        self._thread.join()
-
-    def claims(self) -> dict[EvidenceKey, EvidenceClaim]:
-        with self._lock:
-            return dict(self._claims)
-
-    def terminal_records(self) -> dict[EvidenceKey, EvidenceRecord]:
-        with self._lock:
-            return dict(self._terminal)
-
-    def raise_if_failed(self) -> None:
-        if self._failure is not None:
-            raise self._failure
-
-    def release_best_effort(self) -> None:
-        now = datetime.now(UTC)
-        claims = tuple(
-            claim for claim in self.claims().values() if claim.expires_at > now
-        )
-        if not claims:
-            return
-        try:
-            self._store.release_many(claims)
-        except Exception:
-            pass
-
-    def flush_unsafe(self) -> None:
-        """Synchronously refresh claims too close to expiry for safe handoff."""
-
-        now = datetime.now(UTC)
-        with self._lock:
-            pending = tuple(
-                claim
-                for claim in self._claims.values()
-                if (claim.expires_at - now).total_seconds()
-                <= _CLAIM_RUNWAY_SECONDS + _HANDOFF_SCHEDULING_SECONDS
-            )
-            expired = tuple(claim for claim in pending if claim.expires_at <= now)
-            expired_queries = tuple(self._queries[claim.key] for claim in expired)
-        if expired:
-            terminal = self._store.lookup_many(expired_queries)
-            with self._lock:
-                for key, record in terminal.items():
-                    self._claims.pop(key, None)
-                    self._queries.pop(key, None)
-                    self._deadlines.pop(key, None)
-                    self._terminal[key] = record
-            expired_nonterminal = tuple(
-                claim for claim in expired if claim.key not in terminal
-            )
-            if expired_nonterminal:
-                raise EvidenceClaimLostError(
-                    "claim acquisition received an expired authority runway"
-                )
-            pending = tuple(claim for claim in pending if claim.key not in terminal)
-        while pending:
-            try:
-                renewed = self._store.renew_many(pending)
-            except EvidenceClaimLostError:
-                with self._lock:
-                    queries = tuple(self._queries[claim.key] for claim in pending)
-                terminal = self._store.lookup_many(queries)
-                if not terminal:
-                    raise
-                with self._lock:
-                    for key, record in terminal.items():
-                        self._claims.pop(key, None)
-                        self._queries.pop(key, None)
-                        self._deadlines.pop(key, None)
-                        self._terminal[key] = record
-                pending = tuple(claim for claim in pending if claim.key not in terminal)
-            else:
-                with self._lock:
-                    renewed_at = time.monotonic()
-                    for claim in renewed:
-                        self._claims[claim.key] = claim
-                        self._deadlines[claim.key] = renewed_at + _claim_renewal_delay(
-                            claim
-                        )
-                return
-
-    def _run(self) -> None:
-        while not self._stopped.is_set():
-            self._changed.clear()
-            with self._lock:
-                now = time.monotonic()
-                due_keys = tuple(
-                    key for key, deadline in self._deadlines.items() if deadline <= now
-                )
-                snapshot = tuple(self._claims[key] for key in due_keys)
-                next_deadline = min(self._deadlines.values(), default=now + 1.0)
-            if not snapshot:
-                self._changed.wait(max(0.0, next_deadline - time.monotonic()))
-                continue
-            while snapshot:
-                try:
-                    renewed = self._store.renew_many(snapshot)
-                    break
-                except EvidenceClaimLostError as error:
-                    with self._lock:
-                        queries = tuple(self._queries[claim.key] for claim in snapshot)
-                    try:
-                        terminal = self._store.lookup_many(queries)
-                    except BaseException as lookup_error:
-                        self._failure = lookup_error
-                        self._stopped.set()
-                        return
-                    if not terminal:
-                        self._failure = error
-                        self._stopped.set()
-                        return
-                    with self._lock:
-                        for key, record in terminal.items():
-                            self._claims.pop(key, None)
-                            self._queries.pop(key, None)
-                            self._deadlines.pop(key, None)
-                            self._terminal[key] = record
-                    snapshot = tuple(
-                        claim for claim in snapshot if claim.key not in terminal
-                    )
-                except BaseException as error:
-                    self._failure = error
-                    self._stopped.set()
-                    return
-            else:
-                continue
-            with self._lock:
-                renewed_at = time.monotonic()
-                for claim in renewed:
-                    if not _claim_has_runway(claim):
-                        self._failure = EvidenceClaimLostError(
-                            "claim renewal returned insufficient authority runway"
-                        )
-                        self._stopped.set()
-                        return
-                    if claim.key in self._claims:
-                        self._claims[claim.key] = claim
-                        self._deadlines[claim.key] = renewed_at + _claim_renewal_delay(
-                            claim
-                        )
-
-
 _TRANSFER_CHUNK_SIZE = 1024 * 1024
 
 
@@ -482,58 +130,49 @@ class HttpEvidenceStore:
         self.maximum_batch_size = maximum_batch_size
         try:
             capability_response = self.client.request(
-                "GET", "/v1/evidence/claims/capabilities"
+                "GET",
+                "/v1/internal/claim-sessions/capabilities",
+                timeout=httpx.Timeout(min(timeout_seconds, 30.0)),
             )
         except httpx.HTTPError as error:
             raise StoreError(
                 "shared Store request failed during GET "
-                "/v1/evidence/claims/capabilities: "
+                "/v1/internal/claim-sessions/capabilities: "
                 f"{error}"
             ) from error
         if capability_response.status_code == 404:
-            self._claim_capabilities = None
+            self._claim_session_capabilities = None
         else:
             _raise_for_store_status(capability_response)
-            self._claim_capabilities = ClaimCapabilitiesResponse.model_validate(
-                capability_response.json()
+            self._claim_session_capabilities = (
+                ClaimSessionCapabilitiesResponse.model_validate(
+                    capability_response.json()
+                )
             )
-        self._renewal_executor = ThreadPoolExecutor(
-            max_workers=_MAX_CONCURRENT_CLAIM_REQUESTS,
-            thread_name_prefix="seqevi-claim-renewal",
-        )
-        self._claim_request_scheduler = _ClaimRequestScheduler(
-            _MAX_CONCURRENT_CLAIM_REQUESTS
-        )
 
     @property
-    def supports_claims(self) -> bool:
-        """Return whether the service exposes atomic claim endpoints.
+    def supports_claim_sessions(self) -> bool:
+        return self._claim_session_capabilities is not None
 
-        Examples:
-            A 404 capability probe selects legacy Store behavior:
-
-            >>> store.supports_claims
-            False
-        """
-
-        return self._claim_capabilities is not None
+    def claim_session(self) -> _HttpClaimSession:
+        if self._claim_session_capabilities is None:
+            raise StoreError("shared Store does not support ClaimSession")
+        response = self._request(
+            "GET",
+            "/v1/internal/claim-sessions/capabilities",
+            timeout=httpx.Timeout(min(self._timeout_seconds, 30.0)),
+        )
+        capabilities = ClaimSessionCapabilitiesResponse.model_validate(response.json())
+        self._claim_session_capabilities = capabilities
+        return _HttpClaimSession(self, capabilities)
 
     def close(self) -> None:
         self._closing.set()
         try:
-            # Renewal tasks may already be blocked on the request scheduler;
-            # cancel those queued transport futures before waiting for them.
-            self._claim_request_scheduler.cancel_pending()
-            self._renewal_executor.shutdown(wait=True, cancel_futures=True)
+            if self._owns_client:
+                self.client.close()
         finally:
-            try:
-                self._claim_request_scheduler.close()
-            finally:
-                try:
-                    if self._owns_client:
-                        self.client.close()
-                finally:
-                    self._download_directory.cleanup()
+            self._download_directory.cleanup()
 
     def __enter__(self) -> HttpEvidenceStore:
         return self
@@ -603,218 +242,6 @@ class HttpEvidenceStore:
                 )
             outcomes.extend(chunk_outcomes)
         return tuple(outcomes)
-
-    def acquire_many(
-        self, requested_queries: Iterable[EvidenceQuery], *, owner_token: str
-    ) -> tuple[ClaimAcquireResult, ...]:
-        """Acquire exact work in service-bounded chunks.
-
-        Examples:
-            Busy results contain wait metadata but no owner credential:
-
-            >>> results = store.acquire_many(queries, owner_token="worker")
-        """
-
-        requested = tuple(requested_queries)
-        if len({query.key for query in requested}) != len(requested):
-            raise ValueError("acquire batch contains a duplicate evidence key")
-        _validate_owner_token(owner_token)
-        capabilities = self._require_claims()
-        results = []
-        renewer = _ChunkAcquireRenewer(self)
-        maximum = min(
-            capabilities.maximum_batch_size,
-            self.maximum_batch_size,
-            _CLAIM_MUTATION_CHUNK_SIZE,
-        )
-        renewer.start()
-        try:
-            for offset in range(0, len(requested), maximum):
-                renewer.raise_if_failed()
-                chunk = requested[offset : offset + maximum]
-                request = ClaimAcquireRequest(
-                    owner_token=owner_token,
-                    queries=[EvidenceQueryModel.from_domain(query) for query in chunk],
-                )
-                response = self._claim_request(
-                    "POST",
-                    "/v1/evidence/claims/acquire",
-                    json=request.model_dump(mode="json"),
-                )
-                payload = ClaimAcquireResponse.model_validate(response.json())
-                if len(payload.results) != len(chunk):
-                    raise StoreIntegrityError(
-                        "shared Store returned incomplete claim results"
-                    )
-                for query, model in zip(chunk, payload.results, strict=True):
-                    result = model.to_domain()
-                    if result.record is not None:
-                        key = result.record.key
-                    elif result.claim is not None:
-                        key = result.claim.key
-                    else:
-                        assert result.busy is not None
-                        key = result.busy.key
-                    if key != query.key:
-                        raise StoreIntegrityError(
-                            "shared Store returned a mismatched claim result"
-                        )
-                    if (
-                        result.claim is not None
-                        and result.claim.owner_token != owner_token
-                    ):
-                        raise StoreIntegrityError(
-                            "shared Store returned claim credentials for another owner"
-                        )
-                    results.append(result)
-                    if result.claim is not None:
-                        renewer.add(result.claim, query)
-                renewer.raise_if_failed()
-        except BaseException:
-            renewer.stop()
-            renewer.release_best_effort()
-            raise
-        renewer.stop()
-        try:
-            renewer.raise_if_failed()
-            renewer.flush_unsafe()
-        except BaseException:
-            renewer.release_best_effort()
-            raise
-        current = renewer.claims()
-        terminal = renewer.terminal_records()
-        completion_time = datetime.now(UTC)
-        if any(
-            (claim.expires_at - completion_time).total_seconds() < _CLAIM_RUNWAY_SECONDS
-            for claim in current.values()
-        ):
-            renewer.release_best_effort()
-            raise EvidenceClaimLostError(
-                "claim acquisition completed without a safe authority runway"
-            )
-        return tuple(
-            ClaimAcquireResult(
-                ClaimDisposition.CACHED, record=terminal[result.claim.key]
-            )
-            if result.claim is not None and result.claim.key in terminal
-            else ClaimAcquireResult(result.disposition, claim=current[result.claim.key])
-            if result.claim is not None
-            else result
-            for result in results
-        )
-
-    def renew_many(self, claims: Iterable[EvidenceClaim]) -> tuple[EvidenceClaim, ...]:
-        """Renew authoritative claims in service-bounded chunks.
-
-        Examples:
-            Returned leases replace the previous expiry values:
-
-            >>> claims = store.renew_many(claims)
-        """
-
-        return self._mutate_claims(tuple(claims), renew=True)
-
-    def release_many(self, claims: Iterable[EvidenceClaim]) -> None:
-        """Release authoritative claims in service-bounded chunks.
-
-        Examples:
-            Normal failure can release all still-owned work:
-
-            >>> store.release_many(claims)
-        """
-
-        self._mutate_claims(tuple(claims), renew=False)
-
-    def finalize_many(
-        self, proposed: Iterable[ClaimedEvidenceCommit]
-    ) -> tuple[CommitOutcome, ...]:
-        """Upload artifacts then atomically finalize matching claims.
-
-        Examples:
-            Matching generations retire their claim with terminal evidence:
-
-            >>> outcomes = store.finalize_many(proposed)
-        """
-
-        items = tuple(proposed)
-        if len({item.commit.key for item in items}) != len(items):
-            raise ValueError("finalize batch contains a duplicate evidence key")
-        self._require_claims()
-        payloads: dict[str, ArtifactFile] = {}
-        for item in items:
-            for payload in (item.commit.normalized_artifact, item.commit.raw_artifact):
-                if payload is not None:
-                    existing = payloads.setdefault(payload.digest, payload)
-                    if _artifact_identity(existing) != _artifact_identity(payload):
-                        raise StoreIntegrityError(
-                            f"artifact digest has conflicting payloads: {payload.digest}"
-                        )
-        for payload in payloads.values():
-            if payload.digest not in self._uploaded_artifact_digests:
-                self._upload(payload)
-                self._uploaded_artifact_digests.add(payload.digest)
-        outcomes = []
-        maximum = min(
-            self._claim_capabilities.maximum_batch_size,  # type: ignore[union-attr]
-            self.maximum_batch_size,
-            _CLAIM_MUTATION_CHUNK_SIZE,
-        )
-        for offset in range(0, len(items), maximum):
-            chunk = items[offset : offset + maximum]
-            # Artifact uploads happen before the claim request. A background
-            # renewer can therefore have replaced the server expiry while the
-            # immutable handles in ``proposed`` still carry the old deadline.
-            # Refresh this chunk after uploads so both the transport budget and
-            # the finalize payload reflect current authority.
-            refreshed = self._refresh_claims_for_finalize(
-                tuple(item.claim for item in chunk)
-            )
-            refreshed_by_key = {claim.key: claim for claim in refreshed}
-            current = tuple(
-                ClaimedEvidenceCommit(item.commit, refreshed_by_key[item.claim.key])
-                for item in chunk
-            )
-            request = ClaimFinalizeRequest(
-                commits=[ClaimedCommitModel.from_domain(item) for item in current]
-            )
-            claim_budget = _claim_request_budget(refreshed)
-            if claim_budget <= 0:
-                raise EvidenceClaimLostError(
-                    "claim finalization could not start before its authority runway"
-                )
-            response = self._claim_request(
-                "POST",
-                "/v1/evidence/claims/finalize",
-                json=request.model_dump(mode="json"),
-                timeout=min(self._timeout_seconds, claim_budget),
-            )
-            returned = CommitResponse.model_validate(response.json()).outcomes
-            if len(returned) != len(chunk):
-                raise StoreIntegrityError(
-                    "shared Store returned incomplete finalize outcomes"
-                )
-            outcomes.extend(returned)
-        return tuple(outcomes)
-
-    def _refresh_claims_for_finalize(
-        self, claims: tuple[EvidenceClaim, ...]
-    ) -> tuple[EvidenceClaim, ...]:
-        """Refresh claims after artifact transfer without stale deadlines."""
-
-        maximum = min(
-            self._claim_capabilities.maximum_batch_size,  # type: ignore[union-attr]
-            self.maximum_batch_size,
-            _CLAIM_MUTATION_CHUNK_SIZE,
-        )
-        refreshed: list[EvidenceClaim] = []
-        for offset in range(0, len(claims), maximum):
-            refreshed.extend(
-                self._renew_claim_chunk(
-                    claims[offset : offset + maximum],
-                    enforce_authority_budget=False,
-                )
-            )
-        return tuple(refreshed)
 
     def fetch(self, key: EvidenceKey) -> FetchedEvidence | None:
         return self.fetch_many((key,)).get(key)
@@ -894,226 +321,6 @@ class HttpEvidenceStore:
         if uploaded != expected:
             raise StoreIntegrityError("shared Store returned wrong artifact metadata")
 
-    def _require_claims(self) -> ClaimCapabilitiesResponse:
-        if self._claim_capabilities is None:
-            raise StoreError("shared Store does not support evidence claims")
-        return self._claim_capabilities
-
-    def _mutate_claims(
-        self, claims: tuple[EvidenceClaim, ...], *, renew: bool
-    ) -> tuple[EvidenceClaim, ...]:
-        if len({claim.key for claim in claims}) != len(claims):
-            raise ValueError("claim mutation contains a duplicate evidence key")
-        capabilities = self._require_claims()
-        returned: list[EvidenceClaim] = []
-        maximum = min(
-            capabilities.maximum_batch_size,
-            self.maximum_batch_size,
-            _CLAIM_MUTATION_CHUNK_SIZE,
-        )
-        if renew:
-            chunks = tuple(
-                claims[offset : offset + maximum]
-                for offset in range(0, len(claims), maximum)
-            )
-            if not chunks:
-                return ()
-            scheduled = sorted(
-                enumerate(chunks),
-                key=lambda item: min(claim.expires_at for claim in item[1]),
-            )
-            renewed_by_index: dict[int, tuple[EvidenceClaim, ...]] = {}
-            pending: set[Future[tuple[int, tuple[EvidenceClaim, ...]]]] = set()
-            next_index = 0
-
-            def submit_next() -> None:
-                nonlocal next_index
-                while (
-                    next_index < len(scheduled)
-                    and len(pending) < _MAX_CONCURRENT_CLAIM_REQUESTS
-                ):
-                    item = scheduled[next_index]
-                    next_index += 1
-                    try:
-                        pending.add(
-                            self._renewal_executor.submit(
-                                self._renew_indexed_claim_chunk, item
-                            )
-                        )
-                    except RuntimeError as error:
-                        raise StoreError(
-                            "shared Store closed during claim renewal"
-                        ) from error
-
-            try:
-                submit_next()
-                while pending:
-                    completed, _ = wait(pending, return_when=FIRST_COMPLETED)
-                    for future in completed:
-                        pending.remove(future)
-                        try:
-                            index, renewed_chunk = future.result()
-                        except CancelledError as error:
-                            raise StoreError(
-                                "shared Store closed during claim renewal"
-                            ) from error
-                        renewed_by_index[index] = renewed_chunk
-                    submit_next()
-            except BaseException:
-                for future in pending:
-                    future.cancel()
-                raise
-            renewed_chunks = tuple(
-                renewed_by_index[index] for index in range(len(chunks))
-            )
-            renewed = tuple(claim for chunk in renewed_chunks for claim in chunk)
-            if any(not _claim_has_runway(claim) for claim in renewed):
-                raise EvidenceClaimLostError(
-                    "claim renewal completed without a safe authority runway"
-                )
-            return renewed
-        for offset in range(0, len(claims), maximum):
-            chunk = claims[offset : offset + maximum]
-            request = ClaimMutationRequest(
-                claims=[EvidenceClaimModel.from_domain(claim) for claim in chunk]
-            )
-            path = (
-                "/v1/evidence/claims/renew" if renew else "/v1/evidence/claims/release"
-            )
-            response = self._claim_request(
-                "POST", path, json=request.model_dump(mode="json")
-            )
-            payload = ClaimReleaseResponse.model_validate(response.json())
-            if tuple(
-                (ack.key.to_domain(), ack.generation) for ack in payload.released
-            ) != tuple((claim.key, claim.generation) for claim in chunk):
-                raise StoreIntegrityError(
-                    "shared Store returned mismatched claim release"
-                )
-        return tuple(returned)
-
-    def _renew_indexed_claim_chunk(
-        self, indexed: tuple[int, tuple[EvidenceClaim, ...]]
-    ) -> tuple[int, tuple[EvidenceClaim, ...]]:
-        index, chunk = indexed
-        return index, self._renew_claim_chunk(chunk)
-
-    def _renew_claim_chunk(
-        self,
-        chunk: tuple[EvidenceClaim, ...],
-        *,
-        enforce_authority_budget: bool = True,
-    ) -> tuple[EvidenceClaim, ...]:
-        timeout = (
-            min(self._timeout_seconds, _claim_request_budget(chunk))
-            if enforce_authority_budget
-            else self._timeout_seconds
-        )
-        if timeout <= 0:
-            raise EvidenceClaimLostError(
-                "claim renewal could not start before its authority runway"
-            )
-        request = ClaimMutationRequest(
-            claims=[EvidenceClaimModel.from_domain(claim) for claim in chunk]
-        )
-        response = self._claim_request(
-            "POST",
-            "/v1/evidence/claims/renew",
-            json=request.model_dump(mode="json"),
-            timeout=timeout,
-        )
-        payload = ClaimRenewResponse.model_validate(response.json())
-        if len(payload.claims) != len(chunk):
-            raise StoreIntegrityError("shared Store returned incomplete renewed claims")
-        renewed = tuple(model.to_domain() for model in payload.claims)
-        if tuple(
-            (claim.key, claim.owner_token, claim.generation) for claim in renewed
-        ) != tuple((claim.key, claim.owner_token, claim.generation) for claim in chunk):
-            raise StoreIntegrityError("shared Store returned mismatched renewed claims")
-        return renewed
-
-    def _claim_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
-        if self._closing.is_set():
-            raise StoreError("shared Store closed during claim request")
-        kwargs.setdefault("timeout", self._timeout_seconds)
-        request_timeout = kwargs["timeout"]
-        if not isinstance(request_timeout, (int, float)):
-            raise TypeError("internal claim request timeout must be numeric")
-        deadline = time.monotonic() + request_timeout
-        retryable = (
-            path.endswith("/acquire")
-            or path.endswith("/renew")
-            or path.endswith("/finalize")
-        )
-        renewal = path.endswith("/renew")
-        for attempt in range(_MAX_CLAIM_BACKPRESSURE_RETRIES + 1):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-
-            def request(transport_timeout: float) -> httpx.Response:
-                request_kwargs = dict(kwargs)
-                # The Future wait below owns the total wall-clock deadline. The
-                # worker derives this phase timeout after queueing, preserving
-                # the full response budget that remains at actual start.
-                request_kwargs["timeout"] = httpx.Timeout(transport_timeout)
-                return self.client.request(method, path, **request_kwargs)
-
-            try:
-                future = self._claim_request_scheduler.submit(
-                    request,
-                    renewal=renewal,
-                    deadline=deadline,
-                )
-                try:
-                    response = future.result(
-                        timeout=max(0.0, deadline - time.monotonic())
-                    )
-                except FutureTimeoutError as error:
-                    future.cancel()
-                    if renewal or path.endswith("/finalize"):
-                        raise EvidenceClaimLostError(
-                            "claim request exceeded its authority runway"
-                        ) from error
-                    break
-            except httpx.HTTPError as error:
-                raise StoreError(
-                    f"shared Store request failed during {method} {path}: {error}"
-                ) from error
-            if (
-                response.status_code == 503
-                and retryable
-                and attempt < _MAX_CLAIM_BACKPRESSURE_RETRIES
-            ):
-                delay = _claim_retry_delay(response)
-                remaining = deadline - time.monotonic()
-                if remaining <= delay:
-                    break
-                delay = min(delay, remaining)
-                if self._wait_for_claim_retry(delay):
-                    raise StoreError("shared Store closed during claim request")
-                continue
-            if response.status_code == 412:
-                raise EvidenceClaimLostError(response.text)
-            try:
-                _raise_for_store_status(response)
-            except (EvidenceClaimLostError, EvidenceConflictError):
-                raise
-            except StoreError as error:
-                raise StoreError(
-                    f"shared Store {method} {path} failed: {error}"
-                ) from error
-            return response
-        raise StoreError(
-            f"shared Store {method} {path} remained unavailable after "
-            f"{_MAX_CLAIM_BACKPRESSURE_RETRIES} retries"
-        )
-
-    def _wait_for_claim_retry(self, delay: float) -> bool:
-        """Wait for a retry delay, returning whether shutdown began."""
-
-        return self._closing.wait(delay)
-
     def _download(self, digest: str) -> ArtifactFile:
         cached = self._downloaded_artifacts.get(digest)
         if cached is not None:
@@ -1171,32 +378,514 @@ class HttpEvidenceStore:
         return response
 
 
-def _validate_owner_token(owner_token: str) -> None:
-    if not owner_token or len(owner_token) > 255:
-        raise ValueError("owner_token must contain 1 to 255 characters")
+class _HttpClaimSession:
+    """One remote session, one heartbeat, and exact-key generation fences."""
 
+    def __init__(
+        self, store: HttpEvidenceStore, capabilities: ClaimSessionCapabilitiesResponse
+    ) -> None:
+        self.store = store
+        self.capabilities = capabilities
+        self.cancellation_signal = threading.Event()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._lost: BaseException | None = None
+        self._claims: dict[EvidenceKey, SessionEvidenceClaim] = {}
+        self._heartbeat_jitter = random.uniform(0.8, 1.2)
+        request_started = time.monotonic()
+        open_deadline = request_started + 30.0
+        request = ClaimSessionOpenRequest(
+            open_request_id=uuid4().hex,
+            server_time=capabilities.server_time,
+            open_not_after=capabilities.server_time + timedelta(seconds=30),
+        )
+        while True:
+            response = self._request_until(
+                "POST",
+                "/v1/internal/claim-sessions/open",
+                deadline=open_deadline,
+                json=request.model_dump(mode="json"),
+            )
+            try:
+                opened = ClaimSessionOpenResponse.model_validate(
+                    response.json()
+                ).to_domain()
+                break
+            except (ValueError, StoreIntegrityError):
+                remaining = open_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                if self._stop.wait(min(0.25, remaining)):
+                    raise StoreError("ClaimSession closed during open recovery")
+        self._authority = opened
+        self._renew_deadline = self._authority_deadline(opened, request_started)
+        self._thread = threading.Thread(
+            target=self._heartbeat,
+            name="seqevi-claim-session-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
 
-def _claim_renewal_delay(claim: EvidenceClaim) -> float:
-    remaining = (claim.expires_at - datetime.now(UTC)).total_seconds()
-    return max(
-        0.0,
-        min(claim.renewal_after_seconds, remaining - _CLAIM_RUNWAY_SECONDS),
-    )
+    def __enter__(self) -> _HttpClaimSession:
+        return self
 
+    def __exit__(self, *_error: object) -> None:
+        self.close()
 
-def _claim_has_runway(claim: EvidenceClaim) -> bool:
-    return (
-        claim.expires_at - datetime.now(UTC)
-    ).total_seconds() >= _CLAIM_RUNWAY_SECONDS
+    def raise_if_lost(self) -> None:
+        if self._lost is not None:
+            raise EvidenceClaimLostError(
+                "ClaimSession authority was lost"
+            ) from self._lost
 
+    @staticmethod
+    def _authority_deadline(
+        authority: ClaimSessionAuthority, request_started: float
+    ) -> float:
+        return min(
+            request_started + authority.renew_deadline_seconds,
+            request_started + authority.remaining_lease_seconds - _CLAIM_RUNWAY_SECONDS,
+        )
 
-def _claim_request_budget(claims: tuple[EvidenceClaim, ...]) -> float:
-    remaining = min(
-        (claim.expires_at - datetime.now(UTC)).total_seconds() for claim in claims
-    )
-    if remaining > _CLAIM_RUNWAY_SECONDS:
-        return remaining - _CLAIM_RUNWAY_SECONDS
-    return remaining
+    def _authority_request(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "session_id": self._authority.session_id,
+                "owner_token": self._authority.owner_token,
+                "generation": self._authority.generation,
+            }
+
+    def _authority_request_and_deadline(self) -> tuple[dict[str, object], float]:
+        with self._lock:
+            return (
+                {
+                    "session_id": self._authority.session_id,
+                    "owner_token": self._authority.owner_token,
+                    "generation": self._authority.generation,
+                },
+                self._renew_deadline,
+            )
+
+    def _heartbeat(self) -> None:
+        while True:
+            with self._lock:
+                delay = min(
+                    self._authority.heartbeat_after_seconds * self._heartbeat_jitter,
+                    max(self._renew_deadline - time.monotonic() - 1.0, 0.0),
+                )
+            if self._stop.wait(delay):
+                return
+            started = time.monotonic()
+            try:
+                authority_request, renew_deadline = (
+                    self._authority_request_and_deadline()
+                )
+                renew_json = ClaimSessionRenewRequest.model_validate(
+                    authority_request
+                ).model_dump(mode="json")
+                response = self._request_until(
+                    "POST",
+                    "/v1/internal/claim-sessions/renew",
+                    deadline=renew_deadline,
+                    json=renew_json,
+                )
+                renewed = ClaimSessionRenewResponse.model_validate(
+                    response.json()
+                ).to_domain()
+                if (
+                    renewed.session_id != authority_request["session_id"]
+                    or renewed.owner_token != authority_request["owner_token"]
+                    or renewed.generation != authority_request["generation"]
+                ):
+                    raise StoreIntegrityError(
+                        "renewal response switched ClaimSession authority"
+                    )
+                with self._lock:
+                    self._authority = renewed
+                    self._renew_deadline = self._authority_deadline(renewed, started)
+            except BaseException as error:
+                self._lost = error
+                self.cancellation_signal.set()
+                return
+
+    def acquire_many(
+        self, requested_queries: Iterable[EvidenceQuery]
+    ) -> tuple[SessionClaimAcquireResult, ...]:
+        self.raise_if_lost()
+        requested = tuple(requested_queries)
+        if len({query.key for query in requested}) != len(requested):
+            raise ValueError("acquire batch contains a duplicate evidence key")
+        results: list[SessionClaimAcquireResult] = []
+        maximum = min(
+            self.capabilities.maximum_batch_size, self.store.maximum_batch_size
+        )
+        for offset in range(0, len(requested), maximum):
+            chunk = requested[offset : offset + maximum]
+            models = [EvidenceQueryModel.from_domain(query) for query in chunk]
+            while True:
+                started = time.monotonic()
+                authority_request, renew_deadline = (
+                    self._authority_request_and_deadline()
+                )
+                deadline = min(started + 30.0, renew_deadline)
+                request = ClaimSessionAcquireRequest.model_validate(
+                    {
+                        **authority_request,
+                        "acquire_request_id": uuid4().hex,
+                        "query_digest": canonical_query_digest(models),
+                        "queries": [model.model_dump(mode="json") for model in models],
+                    }
+                )
+                payload: ClaimSessionAcquireResponse | None = None
+                staged: list[SessionClaimAcquireResult] | None = None
+                while True:
+                    try:
+                        response = self._request_until(
+                            "POST",
+                            "/v1/internal/claim-sessions/acquire",
+                            deadline=deadline,
+                            json=request.model_dump(mode="json"),
+                        )
+                        payload = ClaimSessionAcquireResponse.model_validate(
+                            response.json()
+                        )
+                        if len(payload.results) != len(chunk):
+                            raise StoreIntegrityError(
+                                "shared Store returned incomplete acquire results"
+                            )
+                        staged = []
+                        for query, model in zip(chunk, payload.results, strict=True):
+                            record = (
+                                None
+                                if model.record is None
+                                else model.record.to_domain()
+                            )
+                            claim = (
+                                None if model.claim is None else model.claim.to_domain()
+                            )
+                            busy = (
+                                None if model.busy is None else model.busy.to_domain()
+                            )
+                            result = SessionClaimAcquireResult(
+                                model.disposition,
+                                record=record,
+                                claim=claim,
+                                busy=busy,
+                            )
+                            result_key = (
+                                record.key
+                                if record is not None
+                                else claim.key
+                                if claim is not None
+                                else busy.key  # type: ignore[union-attr]
+                            )
+                            if result_key != query.key:
+                                raise StoreIntegrityError(
+                                    "shared Store returned a mismatched acquire result"
+                                )
+                            staged.append(result)
+                        break
+                    except ClaimReceiptCapacityError:
+                        delay = min(1.0, self._renew_deadline - time.monotonic())
+                        if delay <= 0 or self._stop.wait(delay):
+                            raise EvidenceClaimLostError(
+                                "ClaimSession authority runway expired during receipt admission"
+                            )
+                        break
+                    except (ValueError, StoreIntegrityError):
+                        if time.monotonic() >= deadline:
+                            raise
+                        if self._stop.wait(min(0.25, deadline - time.monotonic())):
+                            raise StoreError(
+                                "ClaimSession closed during acquire recovery"
+                            )
+                        continue
+                if staged is not None:
+                    break
+            for result in staged:
+                if result.claim is not None:
+                    self._claims[result.claim.key] = result.claim
+                results.append(result)
+        return tuple(results)
+
+    def finalize_many(
+        self, proposed: Iterable[EvidenceCommit]
+    ) -> tuple[CommitOutcome, ...]:
+        self.raise_if_lost()
+        commits = tuple(proposed)
+        if len({commit.key for commit in commits}) != len(commits):
+            raise ValueError("finalize batch contains a duplicate evidence key")
+        if not commits:
+            return ()
+        maximum = min(
+            self.capabilities.maximum_batch_size, self.store.maximum_batch_size
+        )
+        if len(commits) > maximum:
+            return tuple(
+                outcome
+                for offset in range(0, len(commits), maximum)
+                for outcome in self.finalize_many(commits[offset : offset + maximum])
+            )
+        for commit in commits:
+            for payload in (commit.normalized_artifact, commit.raw_artifact):
+                if (
+                    payload is not None
+                    and payload.digest not in self.store._uploaded_artifact_digests
+                ):
+                    self.store._upload(payload)
+                    self.store._uploaded_artifact_digests.add(payload.digest)
+        items = []
+        for commit in commits:
+            claim = self._claims.get(commit.key)
+            if claim is None:
+                raise EvidenceClaimLostError("no exact claim for finalization")
+            items.append(
+                ClaimSessionFinalizeItem(
+                    commit=CommitModel.from_domain(commit),
+                    claim_generation=claim.generation,
+                )
+            )
+        started = time.monotonic()
+        authority_request, renew_deadline = self._authority_request_and_deadline()
+        deadline = min(started + 30.0, renew_deadline)
+        request_id = uuid4().hex
+        pending = list(zip(commits, items, strict=True))
+        resolved: dict[EvidenceKey, CommitOutcome] = {}
+        unknown_outcome = False
+        while pending:
+            request = ClaimSessionFinalizeRequest.model_validate(
+                {
+                    **authority_request,
+                    "finalize_request_id": request_id,
+                    "commits": [item.model_dump(mode="json") for _, item in pending],
+                }
+            )
+            try:
+                attempt_error: BaseException | None = None
+                response: httpx.Response | None = None
+                remaining_time = deadline - time.monotonic()
+                if remaining_time <= 0:
+                    raise EvidenceClaimLostError(
+                        "ClaimSession finalization deadline expired"
+                    )
+                try:
+                    response = self.store.client.request(
+                        "POST",
+                        "/v1/internal/claim-sessions/finalize",
+                        timeout=httpx.Timeout(remaining_time),
+                        json=request.model_dump(mode="json"),
+                    )
+                except httpx.HTTPError as error:
+                    unknown_outcome = True
+                    attempt_error = StoreError(
+                        "ClaimSession finalize transport outcome is unknown"
+                    )
+                    attempt_error.__cause__ = error
+                else:
+                    if (
+                        response.status_code in {412, 503}
+                        or response.status_code >= 500
+                    ):
+                        unknown_outcome = True
+                        attempt_error = _StoreResponseError(
+                            response.status_code, response.text
+                        )
+                    else:
+                        _raise_for_store_status(response)
+                if attempt_error is not None:
+                    delay = min(0.25, deadline - time.monotonic())
+                    if delay <= 0:
+                        raise attempt_error
+                    if self._stop.wait(delay):
+                        raise StoreError("ClaimSession closed during finalize recovery")
+                    # Reconcile this observed attempt before any same-ID retry.
+                    raise attempt_error
+                assert response is not None
+                returned = tuple(
+                    ClaimSessionFinalizeResponse.model_validate(
+                        response.json()
+                    ).outcomes
+                )
+                if len(returned) != len(pending):
+                    raise StoreIntegrityError(
+                        "shared Store returned incomplete finalize outcomes"
+                    )
+                if not unknown_outcome:
+                    resolved.update(
+                        (commit.key, outcome)
+                        for (commit, _item), outcome in zip(
+                            pending, returned, strict=True
+                        )
+                    )
+                    break
+                recovery_error: BaseException = StoreError(
+                    "finalize response requires terminal evidence reconciliation"
+                )
+            except (StoreError, ValueError) as error:
+                if (
+                    isinstance(error, _StoreResponseError)
+                    and error.status_code < 500
+                    and error.status_code != 412
+                    and not unknown_outcome
+                ):
+                    raise
+                unknown_outcome = True
+                recovery_error = error
+            while True:
+                try:
+                    remaining_time = deadline - time.monotonic()
+                    if remaining_time <= 0:
+                        raise EvidenceClaimLostError(
+                            "ClaimSession finalize readback deadline expired"
+                        )
+                    queries = tuple(
+                        EvidenceQuery(commit.identity, commit.key)
+                        for commit, _ in pending
+                    )
+                    lookup_request = LookupRequest(
+                        queries=[
+                            EvidenceQueryModel.from_domain(query) for query in queries
+                        ]
+                    )
+                    try:
+                        lookup_response = self.store.client.request(
+                            "POST",
+                            "/v1/evidence/lookup",
+                            timeout=httpx.Timeout(remaining_time),
+                            json=lookup_request.model_dump(mode="json"),
+                        )
+                    except httpx.HTTPError as error:
+                        raise StoreError(
+                            "finalize evidence readback transport failed"
+                        ) from error
+                    _raise_for_store_status(lookup_response)
+                    lookup_payload = LookupResponse.model_validate(
+                        lookup_response.json()
+                    )
+                    expected = {query.key for query in queries}
+                    found = {}
+                    for model in lookup_payload.records:
+                        record = model.to_domain()
+                        if record.key not in expected or record.key in found:
+                            raise StoreIntegrityError(
+                                "shared Store returned unexpected lookup records"
+                            )
+                        found[record.key] = record
+                    break
+                except (StoreError, ValueError):
+                    remaining_time = deadline - time.monotonic()
+                    if remaining_time <= 0:
+                        raise
+                    if self._stop.wait(min(0.25, remaining_time)):
+                        raise StoreError("ClaimSession closed during finalize readback")
+            remaining = []
+            for commit, item in pending:
+                record = found.get(commit.key)
+                if record is None:
+                    remaining.append((commit, item))
+                    continue
+                if not _record_matches_commit(record, commit):
+                    raise EvidenceConflictError(
+                        "finalize readback found conflicting immutable evidence"
+                    ) from recovery_error
+                resolved[commit.key] = CommitOutcome.EXISTING
+                self._claims.pop(commit.key, None)
+            if not remaining:
+                break
+            authority_check = ClaimSessionAuthorityCheckRequest.model_validate(
+                {
+                    **self._authority_request(),
+                    "claims": [
+                        SessionEvidenceClaimModel.from_domain(
+                            self._claims[commit.key]
+                        ).model_dump(mode="json")
+                        for commit, _item in remaining
+                    ],
+                }
+            )
+            while True:
+                authority_response = self._request_until(
+                    "POST",
+                    "/v1/internal/claim-sessions/authority",
+                    deadline=deadline,
+                    json=authority_check.model_dump(mode="json"),
+                )
+                try:
+                    authority_is_live = (
+                        ClaimSessionAuthorityCheckResponse.model_validate(
+                            authority_response.json()
+                        ).live
+                    )
+                    break
+                except ValueError:
+                    remaining_time = deadline - time.monotonic()
+                    if remaining_time <= 0:
+                        raise
+                    if self._stop.wait(min(0.25, remaining_time)):
+                        raise StoreError(
+                            "ClaimSession closed during authority recovery"
+                        )
+            if not authority_is_live:
+                raise EvidenceClaimLostError(
+                    "exact ClaimSession finalization authority was lost"
+                ) from recovery_error
+            if time.monotonic() >= deadline:
+                raise recovery_error
+            if len(remaining) == len(pending):
+                if self._stop.wait(min(0.25, deadline - time.monotonic())):
+                    raise StoreError("ClaimSession closed during finalize recovery")
+            pending = remaining
+        for commit in commits:
+            self._claims.pop(commit.key, None)
+        return tuple(resolved[commit.key] for commit in commits)
+
+    def _request_until(
+        self, method: str, path: str, *, deadline: float, **kwargs: Any
+    ) -> httpx.Response:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EvidenceClaimLostError("ClaimSession operation deadline expired")
+            try:
+                response = self.store.client.request(
+                    method, path, timeout=httpx.Timeout(remaining), **kwargs
+                )
+            except httpx.HTTPError:
+                response = None
+            if time.monotonic() >= deadline:
+                raise EvidenceClaimLostError(
+                    "ClaimSession operation response exceeded its deadline"
+                )
+            if response is not None and response.status_code == 412:
+                raise EvidenceClaimLostError(response.text)
+            if response is not None and _is_receipt_capacity(response):
+                raise ClaimReceiptCapacityError("claim_receipt_capacity")
+            if response is not None and response.status_code != 503:
+                _raise_for_store_status(response)
+                return response
+            delay = random.uniform(1.0, 5.0)
+            if response is not None:
+                delay = max(delay, _claim_retry_delay(response))
+            if delay >= deadline - time.monotonic():
+                raise StoreError("ClaimSession operation remained unavailable")
+            if self._stop.wait(delay):
+                raise StoreError("ClaimSession closed during request")
+
+    def close(self) -> None:
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        self._thread.join(timeout=min(self.store._timeout_seconds, 5.0))
+        try:
+            request = ClaimSessionCloseRequest.model_validate(self._authority_request())
+            self.store.client.request(
+                "POST",
+                "/v1/internal/claim-sessions/close",
+                json=request.model_dump(mode="json"),
+                timeout=httpx.Timeout(min(self.store._timeout_seconds, 5.0)),
+            )
+        except httpx.HTTPError:
+            pass
 
 
 def _claim_retry_delay(response: httpx.Response) -> float:
@@ -1217,6 +906,24 @@ def _claim_retry_delay(response: httpx.Response) -> float:
     return base + random.uniform(0.0, jitter)
 
 
+def _is_receipt_capacity(response: httpx.Response) -> bool:
+    if response.status_code != 503:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    detail = payload.get("detail", payload) if isinstance(payload, dict) else None
+    return isinstance(detail, dict) and detail.get("code") == "claim_receipt_capacity"
+
+
+def _record_matches_commit(record: EvidenceRecord, commit: EvidenceCommit) -> bool:
+    return (
+        record.status == commit.status
+        and record.payload_digest == commit.payload_digest
+    )
+
+
 def _file_chunks(path: Path) -> Iterator[bytes]:
     with path.open("rb") as handle:
         while chunk := handle.read(_TRANSFER_CHUNK_SIZE):
@@ -1231,7 +938,7 @@ def _raise_for_store_status(
     detail = response.text if include_body else response.reason_phrase
     if response.status_code == 409:
         raise EvidenceConflictError(detail)
-    raise StoreError(f"shared Store returned HTTP {response.status_code}: {detail}")
+    raise _StoreResponseError(response.status_code, detail)
 
 
 def _artifact_identity(artifact: ArtifactFile) -> tuple[str, str, int]:

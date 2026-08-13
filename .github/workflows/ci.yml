@@ -22,6 +22,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      PDM_USE_PYTHON_VERSION: "false"
       SEQEVI_TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/seqevi
     strategy:
       fail-fast: false
@@ -36,6 +37,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: true
       - run: pdm install --frozen-lockfile -G dev -G server
+      - name: Verify matrix interpreter
+        env:
+          EXPECTED_PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          test "$(pdm run python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "${EXPECTED_PYTHON_VERSION}"
       - run: pdm run check
 
   distribution-and-image:
@@ -99,10 +105,12 @@ jobs:
             test "${attempt}" -lt 30
             sleep 1
           done
+          expected_revision="$(docker run --rm --entrypoint python seqevi:ci -c \
+            'from seqevi.store.migration import _CURRENT_REVISION; print(_CURRENT_REVISION)')"
           docker exec "${{ job.services.postgres.id }}" \
             psql -U postgres -d seqevi_image -Atc \
             "select version_num from alembic_version" \
-            | grep -Fx "0003_evidence_claim_leases"
+            | grep -Fx "${expected_revision}"
           docker restart seqevi-ci
           for attempt in $(seq 1 30); do
             curl --fail --silent http://127.0.0.1:18081/health && break

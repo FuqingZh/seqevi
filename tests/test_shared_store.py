@@ -1,24 +1,24 @@
 from __future__ import annotations
 
+import importlib
 import os
-import json
 import logging
+import json
 import threading
 import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from email.utils import format_datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, cast
 
 import httpx
 import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import ValidationError
 from sqlalchemy import (
     BigInteger,
     create_engine,
@@ -26,26 +26,24 @@ from sqlalchemy import (
     func,
     inspect,
     make_url,
-    select,
     text,
-    update,
+    select,
 )
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import DBAPIError
 
 from seqevi.annotate import run_annotation
 from seqevi.errors import (
+    ClaimReceiptCapacityError,
     EvidenceClaimLostError,
     EvidenceConflictError,
-    StoreBackpressureError,
     StoreError,
+    StoreBackpressureError,
     StoreIntegrityError,
 )
 from seqevi.evidence import (
-    ClaimAcquireResult,
     ClaimDisposition,
-    ClaimedEvidenceCommit,
     CommitOutcome,
-    EvidenceClaim,
     EvidenceCommit,
     EvidenceKey,
     EvidenceQuery,
@@ -62,18 +60,22 @@ from seqevi.service import (
 )
 from seqevi.service import persistence as persistence_module
 from seqevi.service.persistence import PostgresEvidencePersistence
+from seqevi.service.persistence import ServicePersistence
 from seqevi.store import HttpEvidenceStore, LocalStore
-from seqevi.store import client as client_module
 from seqevi.store import migration as store_migration
-from seqevi.store.schema import artifacts, evidence_claims
+from seqevi.store.schema import (
+    artifacts,
+    claim_session_acquire_receipt_items,
+    claim_session_acquire_receipts,
+    claim_sessions,
+    evidence_claim_generations,
+)
 from seqevi.store.transport import (
-    ClaimAcquireResultModel,
-    ClaimAcquireRequest,
-    ClaimedCommitModel,
+    ClaimSessionFinalizeItem,
     CommitModel,
-    EvidenceClaimModel,
     EvidenceRecordModel,
     EvidenceQueryModel,
+    canonical_query_digest,
 )
 
 from polars.testing import assert_frame_equal
@@ -98,7 +100,7 @@ class MemoryPersistence:
         self.closed = False
 
     @property
-    def supports_claims(self) -> bool:
+    def supports_claim_sessions(self) -> bool:
         return False
 
     def lookup_many(
@@ -166,26 +168,30 @@ class MemoryPersistence:
     def artifact_metadata(self, digest: str) -> StoredArtifact | None:
         return self.artifacts.get(digest)
 
-    def acquire_many(
-        self, queries: Iterable[EvidenceQuery], *, owner_token: str
-    ) -> tuple[ClaimAcquireResult, ...]:
+    def database_time(self) -> datetime:
+        return datetime.now(UTC)
+
+    def open_claim_session(self, **_kwargs):
         raise NotImplementedError
 
-    def renew_many(self, claims: Iterable[EvidenceClaim]) -> tuple[EvidenceClaim, ...]:
+    def renew_claim_session(self, _authority):
         raise NotImplementedError
 
-    def release_many(self, claims: Iterable[EvidenceClaim]) -> None:
+    def close_claim_session(self, _authority) -> None:
         raise NotImplementedError
 
-    def finalize_many(
-        self,
-        commits: Iterable[ClaimedCommitModel],
-        stored_artifacts: dict[str, StoredArtifact],
-    ) -> tuple[CommitOutcome, ...]:
+    def acquire_claim_session(self, _authority, _queries):
+        raise NotImplementedError
+
+    def finalize_claim_session(self, _authority, _commits, _stored_artifacts):
         raise NotImplementedError
 
     def close(self) -> None:
         self.closed = True
+
+
+def _memory_persistence() -> ServicePersistence:
+    return cast(ServicePersistence, MemoryPersistence())
 
 
 def _key(sequence: str) -> tuple[SequenceIdentity, EvidenceKey]:
@@ -254,7 +260,9 @@ def _settings(
 
 def test_http_store_matches_lookup_commit_and_fetch_contract(tmp_path: Path) -> None:
     persistence = MemoryPersistence()
-    app = create_service_app(_settings(tmp_path), persistence=persistence)
+    app = create_service_app(
+        _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
+    )
     commit = _hit_commit(tmp_path / "sources")
 
     with TestClient(app) as test_client:
@@ -292,7 +300,9 @@ def test_http_store_preserves_no_hit_without_normalized_artifact(
         ),
     )
     persistence = MemoryPersistence()
-    app = create_service_app(_settings(tmp_path), persistence=persistence)
+    app = create_service_app(
+        _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
+    )
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
             "http://testserver",
@@ -313,7 +323,8 @@ def test_http_fetch_many_chunks_metadata_requests_without_n_plus_one(
 ) -> None:
     persistence = MemoryPersistence()
     app = create_service_app(
-        _settings(tmp_path, maximum_batch_size=2), persistence=persistence
+        _settings(tmp_path, maximum_batch_size=2),
+        persistence=cast(ServicePersistence, persistence),
     )
     first = _hit_commit(tmp_path / "sources", "MONE")
     second = _hit_commit(tmp_path / "sources", "MTWO")
@@ -339,7 +350,7 @@ def test_http_lookup_and_commit_follow_discovered_service_batch_size(
     persistence = MemoryPersistence()
     app = create_service_app(
         _settings(tmp_path, maximum_batch_size=2),
-        persistence=persistence,
+        persistence=cast(ServicePersistence, persistence),
     )
     commits = tuple(
         _hit_commit(tmp_path / "sources", sequence)
@@ -376,7 +387,7 @@ def test_http_store_uses_discovered_artifact_limit_and_formats_stream_errors(
     )
     app = create_service_app(
         _settings(tmp_path, maximum_artifact_bytes=1234),
-        persistence=persistence,
+        persistence=cast(ServicePersistence, persistence),
     )
 
     with TestClient(app) as test_client:
@@ -394,7 +405,7 @@ def test_service_rejects_bad_artifact_digest_and_oversized_batches(
 ) -> None:
     app = create_service_app(
         _settings(tmp_path, maximum_batch_size=1),
-        persistence=MemoryPersistence(),
+        persistence=_memory_persistence(),
     )
     with TestClient(app) as client:
         response = client.put(
@@ -464,7 +475,7 @@ def test_service_rejects_bad_artifact_digest_and_oversized_batches(
 def test_service_openapi_preserves_legacy_and_adds_claim_operations(
     tmp_path: Path,
 ) -> None:
-    app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
+    app = create_service_app(_settings(tmp_path), persistence=_memory_persistence())
     paths = set(app.openapi()["paths"])
     assert paths == {
         "/health",
@@ -473,129 +484,14 @@ def test_service_openapi_preserves_legacy_and_adds_claim_operations(
         "/v1/evidence/fetch",
         "/v1/evidence/fetch-many",
         "/v1/evidence/lookup",
-        "/v1/evidence/claims/capabilities",
-        "/v1/evidence/claims/acquire",
-        "/v1/evidence/claims/renew",
-        "/v1/evidence/claims/release",
-        "/v1/evidence/claims/finalize",
+        "/v1/internal/claim-sessions/capabilities",
+        "/v1/internal/claim-sessions/open",
+        "/v1/internal/claim-sessions/renew",
+        "/v1/internal/claim-sessions/acquire",
+        "/v1/internal/claim-sessions/authority",
+        "/v1/internal/claim-sessions/finalize",
+        "/v1/internal/claim-sessions/close",
     }
-
-
-def test_service_claim_requests_emit_secret_free_timing_records(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    class ClaimPersistence(MemoryPersistence):
-        def acquire_many(
-            self,
-            queries: Iterable[EvidenceQuery],
-            *,
-            owner_token: str,
-        ) -> tuple[ClaimAcquireResult, ...]:
-            return tuple(
-                ClaimAcquireResult(
-                    ClaimDisposition.ACQUIRED,
-                    claim=EvidenceClaim(
-                        query.key,
-                        owner_token,
-                        1,
-                        datetime.now(UTC) + timedelta(seconds=60),
-                        20.0,
-                    ),
-                )
-                for query in queries
-            )
-
-    identity, key = _key("MCLAIMLOG")
-    app = create_service_app(_settings(tmp_path), persistence=ClaimPersistence())
-    caplog.set_level(logging.INFO, logger="seqevi.service.claims")
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/v1/evidence/claims/acquire",
-            json={
-                "owner_token": "secret-owner-token",
-                "queries": [
-                    EvidenceQueryModel.from_domain(
-                        EvidenceQuery(identity, key)
-                    ).model_dump(mode="json")
-                ],
-            },
-        )
-
-    assert response.status_code == 200
-    records = [
-        json.loads(record.message)
-        for record in caplog.records
-        if record.name == "seqevi.service.claims"
-    ]
-    assert len(records) == 1
-    assert records[0]["event"] == "seqevi.claim_request"
-    assert records[0]["operation"] == "acquire"
-    assert records[0]["batch_size"] == 1
-    assert records[0]["outcome"] == "ok"
-    assert records[0]["status_code"] == 200
-    assert records[0]["duration_ms"] >= 0
-    assert records[0]["request_id"]
-    assert "secret-owner-token" not in caplog.records[0].message
-
-
-def test_service_claim_validation_errors_emit_timing_records(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
-    caplog.set_level(logging.INFO, logger="seqevi.service.claims")
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/v1/evidence/claims/acquire",
-            content="{not-json}",
-            headers={"content-type": "application/json"},
-        )
-
-    assert response.status_code == 422
-    records = [
-        json.loads(record.message)
-        for record in caplog.records
-        if record.name == "seqevi.service.claims"
-    ]
-    assert len(records) == 1
-    assert records[0]["operation"] == "acquire"
-    assert records[0]["batch_size"] is None
-    assert records[0]["outcome"] == "http_error"
-    assert records[0]["status_code"] == 422
-    assert records[0]["duration_ms"] >= 0
-
-
-def test_service_claim_validation_preserves_batch_size(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    identity, key = _key("MCLAIMINVALIDOWNER")
-    app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
-    caplog.set_level(logging.INFO, logger="seqevi.service.claims")
-
-    with TestClient(app) as client:
-        response = client.post(
-            "/v1/evidence/claims/acquire",
-            json={
-                "owner_token": "x" * 256,
-                "queries": [
-                    EvidenceQueryModel.from_domain(
-                        EvidenceQuery(identity, key)
-                    ).model_dump(mode="json")
-                ],
-            },
-        )
-
-    assert response.status_code == 422
-    records = [
-        json.loads(record.message)
-        for record in caplog.records
-        if record.name == "seqevi.service.claims"
-    ]
-    assert len(records) == 1
-    assert records[0]["operation"] == "acquire"
-    assert records[0]["batch_size"] == 1
-    assert records[0]["duration_ms"] >= 0
 
 
 def test_configure_claim_logging_attaches_an_info_handler() -> None:
@@ -617,111 +513,103 @@ def test_configure_claim_logging_attaches_an_info_handler() -> None:
         logger.propagate = propagate
 
 
-def test_service_claim_backpressure_returns_retryable_response(tmp_path: Path) -> None:
-    class BusyPersistence(MemoryPersistence):
-        def acquire_many(
-            self,
-            queries: Iterable[EvidenceQuery],
-            *,
-            owner_token: str,
-        ) -> tuple[ClaimAcquireResult, ...]:
-            raise StoreBackpressureError("database mutation is busy")
+def test_claim_request_logging_uses_validated_batch_size_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class ObservedPersistence(MemoryPersistence):
+        finalize_calls = 0
 
-    identity, key = _key("MBACKPRESSURE")
-    app = create_service_app(_settings(tmp_path), persistence=BusyPersistence())
+        @property
+        def supports_claim_sessions(self) -> bool:
+            return True
+
+        def acquire_claim_session(  # pyright: ignore[reportIncompatibleMethodOverride]
+            self, _authority, **_kwargs
+        ):
+            return ()
+
+        def finalize_claim_session(self, _authority, commits, _stored_artifacts):
+            proposed = tuple(commits)
+            self.finalize_calls += 1
+            return (CommitOutcome.CREATED,) * len(proposed)
+
+    observed: list[tuple[str, int | None, int]] = []
+    service_app_module = importlib.import_module("seqevi.service.app")
+
+    def record(operation: str, **fields: object) -> None:
+        observed.append(
+            (
+                operation,
+                cast(int | None, fields["batch_size"]),
+                cast(int, fields["status_code"]),
+            )
+        )
+
+    monkeypatch.setattr(service_app_module, "_log_claim_request", record)
+    persistence = ObservedPersistence()
+    app = create_service_app(
+        _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
+    )
+    identity, key = _key("MOBSERVEDCLAIMBATCH")
+    query = EvidenceQuery(identity, key)
+    commit = _hit_commit(tmp_path / "source", "MOBSERVEDCLAIMBATCH")
+    authority = {"session_id": "session", "owner_token": "owner", "generation": 1}
 
     with TestClient(app) as client:
-        response = client.post(
-            "/v1/evidence/claims/acquire",
+        acquire = client.post(
+            "/v1/internal/claim-sessions/acquire",
             json={
-                "owner_token": "owner",
+                **authority,
+                "acquire_request_id": "acquire-observed",
+                "query_digest": canonical_query_digest(
+                    [EvidenceQueryModel.from_domain(query)]
+                ),
                 "queries": [
-                    EvidenceQueryModel.from_domain(
-                        EvidenceQuery(identity, key)
+                    EvidenceQueryModel.from_domain(query).model_dump(mode="json")
+                ],
+            },
+        )
+        empty = client.post(
+            "/v1/internal/claim-sessions/finalize",
+            json={
+                **authority,
+                "finalize_request_id": "finalize-empty",
+                "commits": [],
+            },
+        )
+        for artifact in (commit.normalized_artifact, commit.raw_artifact):
+            assert artifact is not None
+            uploaded = client.put(
+                f"/v1/artifacts/{artifact.digest}",
+                headers={
+                    "X-Artifact-Media-Type": artifact.media_type,
+                    "X-Artifact-Byte-Size": str(artifact.byte_size),
+                },
+                content=artifact.path.read_bytes(),
+            )
+            assert uploaded.status_code == 200
+        finalized = client.post(
+            "/v1/internal/claim-sessions/finalize",
+            json={
+                **authority,
+                "finalize_request_id": "finalize-observed",
+                "commits": [
+                    ClaimSessionFinalizeItem(
+                        commit=CommitModel.from_domain(commit), claim_generation=1
                     ).model_dump(mode="json")
                 ],
             },
         )
 
-    assert response.status_code == 503
-    assert response.headers["retry-after"] == "1"
-    assert response.json()["detail"] == "database mutation is busy"
-
-
-def test_old_health_shape_and_missing_claim_capability_fall_back(
-    tmp_path: Path,
-) -> None:
-    class ReleasedHealthResponse(BaseModel):
-        model_config = ConfigDict(extra="forbid")
-
-        status: Literal["ok"]
-        api_version: Literal["v1"]
-        maximum_batch_size: int
-        maximum_artifact_bytes: int
-
-    app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
-    commit = _hit_commit(tmp_path / "sources", "MLEGACYFALLBACK")
-    query = EvidenceQuery(commit.identity, commit.key)
-    with TestClient(app) as test_client:
-        health = test_client.get("/health")
-        parsed = ReleasedHealthResponse.model_validate(health.json())
-        store = HttpEvidenceStore(
-            "http://testserver", client=cast(httpx.Client, test_client)
-        )
-        assert store.commit_many((commit,)) == (CommitOutcome.CREATED,)
-        found = store.lookup_many((query, query))
-
-    assert health.json() == {
-        "status": "ok",
-        "api_version": "v1",
-        "maximum_batch_size": 1000,
-        "maximum_artifact_bytes": 512 * 1024 * 1024,
-    }
-    assert store.supports_claims is False
-    assert parsed.status == "ok"
-    assert found[commit.key].status is EvidenceStatus.HIT
-
-
-@pytest.mark.parametrize("capability_status", [401, 500])
-def test_claim_capability_auth_and_server_errors_do_not_fall_back(
-    capability_status: int,
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        return httpx.Response(capability_status, text="capability failed")
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with pytest.raises(StoreError):
-        HttpEvidenceStore("http://testserver", client=client)
-
-
-@pytest.mark.parametrize(
-    "capabilities",
-    [
-        {
-            "maximum_batch_size": 1000,
-            "lease_seconds": 5.0,
-            "renewal_after_seconds": 1.0,
-        },
-        {
-            "maximum_batch_size": 1000,
-            "lease_seconds": 10.0,
-            "renewal_after_seconds": 6.0,
-        },
-    ],
-)
-def test_http_claim_capabilities_require_fixed_runway(
-    capabilities: dict[str, object],
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        return httpx.Response(200, json=capabilities)
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with pytest.raises(ValidationError, match="5-second runway"):
-        HttpEvidenceStore("http://testserver", client=client)
+    assert acquire.status_code == 200
+    assert empty.status_code == 422
+    assert finalized.status_code == 200
+    assert persistence.finalize_calls == 1
+    assert [item for item in observed if item[0] in {"acquire", "finalize"}] == [
+        ("acquire", 1, 200),
+        ("finalize", 0, 422),
+        ("finalize", 1, 200),
+    ]
 
 
 def _claim_mock_client(handler: httpx.MockTransport) -> httpx.Client:
@@ -737,2172 +625,975 @@ def _claim_health(maximum_batch_size: int = 1000) -> dict[str, object]:
     }
 
 
-def _claim_capabilities() -> dict[str, object]:
-    return {
-        "maximum_batch_size": 1000,
-        "lease_seconds": 60.0,
-        "renewal_after_seconds": 20.0,
-    }
-
-
-def test_http_claim_acquire_rejects_another_owner_credentials() -> None:
-    identity, key = _key("MOWNERBOUNDARY")
+def test_http_claim_session_refresh_uses_bounded_capability_timeout() -> None:
+    now = datetime.now(UTC)
+    capability_timeouts: list[float] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(200, json=_claim_health())
         if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        wrong = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                key,
-                "other-owner",
-                1,
-                datetime.now(UTC) + timedelta(seconds=60),
-                20.0,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(wrong).model_dump(mode="json")
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(StoreIntegrityError, match="another owner"):
-            store.acquire_many((EvidenceQuery(identity, key),), owner_token="owner")
-
-
-def test_http_claim_acquire_rejects_duplicates_before_request() -> None:
-    identity, key = _key("MDUPLICATECLAIM")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        raise AssertionError("duplicate acquisition must not reach the service")
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        query = EvidenceQuery(identity, key)
-        with pytest.raises(ValueError, match="duplicate"):
-            store.acquire_many(
-                (query, _distinct_query_with_same_key(query)), owner_token="owner"
+            capability_timeouts.append(request.extensions["timeout"]["read"])
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
             )
-        with pytest.raises(ValueError, match="owner_token"):
-            store.acquire_many((), owner_token="")
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
-    model = EvidenceQueryModel.from_domain(query)
-
-    with pytest.raises(ValidationError, match="duplicate evidence key"):
-        ClaimAcquireRequest(owner_token="owner", queries=[model, model.model_copy()])
-
-
-def test_http_claim_mutations_reject_duplicates_before_network_or_upload(
-    tmp_path: Path,
-) -> None:
-    commit = _hit_commit(tmp_path / "sources", "MDUPLICATEMUTATION")
-    claim = EvidenceClaim(
-        commit.key,
-        "owner",
-        1,
-        datetime.now(UTC) + timedelta(seconds=60),
-        20.0,
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        raise AssertionError("duplicate mutation must not reach the service")
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(ValueError, match="duplicate"):
-            store.renew_many((claim, claim))
-        with pytest.raises(ValueError, match="duplicate"):
-            store.release_many((claim, claim))
-        proposed = ClaimedEvidenceCommit(commit, claim)
-        with pytest.raises(ValueError, match="duplicate"):
-            store.finalize_many((proposed, proposed))
+    with HttpEvidenceStore(
+        "http://testserver",
+        timeout_seconds=120,
+        client=_claim_mock_client(httpx.MockTransport(handler)),
+    ) as store:
+        with store.claim_session():
+            pass
+    assert capability_timeouts == [30.0, 30.0]
 
 
 @pytest.mark.parametrize(
-    ("status_code", "error_type"),
-    [(409, EvidenceConflictError), (412, EvidenceClaimLostError)],
+    "missing",
+    [
+        "protocol",
+        "maximum_batch_size",
+        "retention_seconds",
+        "maximum_session_receipt_headers",
+        "maximum_session_receipt_items",
+        "server_time",
+    ],
 )
-def test_http_claim_status_preserves_conflict_contract(
-    status_code: int, error_type: type[StoreError]
+def test_http_claim_session_rejects_partial_capability_advertisement(
+    missing: str,
 ) -> None:
-    _identity, key = _key("MSTATUSMAPPING")
-    claim = EvidenceClaim(
-        key,
-        "owner",
-        1,
-        datetime.now(UTC) + timedelta(seconds=60),
-        20.0,
-    )
+    payload = {
+        "protocol": "claim-session-v1",
+        "maximum_batch_size": 1000,
+        "retention_seconds": 60,
+        "maximum_session_receipt_headers": 1000,
+        "maximum_session_receipt_items": 32000,
+        "server_time": datetime.now(UTC).isoformat(),
+    }
+    del payload[missing]
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        return httpx.Response(status_code, text="claim mutation failed")
+        return httpx.Response(200, json=payload)
 
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(error_type):
-            store.renew_many((claim,))
-
-
-def test_http_claim_transport_error_identifies_method_and_path() -> None:
-    _identity, key = _key("MCLAIMTIMEOUT")
-    claim = EvidenceClaim(
-        key,
-        "owner",
-        1,
-        datetime.now(UTC) + timedelta(seconds=60),
-        20.0,
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        raise httpx.ReadTimeout("upstream did not respond", request=request)
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(
-            StoreError,
-            match=r"shared Store request failed during POST /v1/evidence/claims/renew",
-        ):
-            store.renew_many((claim,))
-
-
-def test_http_claim_capability_probe_error_identifies_method_and_path() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        raise httpx.ReadTimeout("capability probe did not respond", request=request)
-
-    with pytest.raises(
-        StoreError,
-        match=r"shared Store request failed during GET /v1/evidence/claims/capabilities",
-    ):
+    with pytest.raises(ValidationError):
         HttpEvidenceStore(
             "http://testserver",
             client=_claim_mock_client(httpx.MockTransport(handler)),
         )
 
 
-def test_http_claim_retries_retryable_backpressure(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("operation", ["open", "renew", "acquire", "authority"])
+def test_claim_request_rejects_response_after_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
-    _identity, key = _key("MCLAIMRETRY")
-    claim = EvidenceClaim(
-        key,
-        "owner",
-        1,
-        datetime.now(UTC) + timedelta(seconds=60),
-        20.0,
-    )
-    attempts = 0
-    sleeps: list[float] = []
-    request_timeouts: list[float] = []
-    clock = [100.0]
+    store_client_module = importlib.import_module("seqevi.store.client")
+    clock = [0.0]
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal attempts
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        attempts += 1
-        timeout = cast(dict[str, float], request.extensions["timeout"])
-        request_timeouts.append(timeout["read"])
-        if attempts == 1:
-            return httpx.Response(503, headers={"Retry-After": "6"})
-        renewed = EvidenceClaim(
-            claim.key,
-            claim.owner_token,
-            claim.generation,
-            datetime.now(UTC) + timedelta(seconds=60),
-            claim.renewal_after_seconds,
-        )
-        return httpx.Response(
-            200,
-            json={
-                "claims": [
-                    EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
-                ]
-            },
-        )
-
-    def wait_for_retry(_store: HttpEvidenceStore, delay: float) -> bool:
-        sleeps.append(delay)
-        clock[0] += delay
-        return False
-
-    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(
-        client_module.HttpEvidenceStore,
-        "_wait_for_claim_retry",
-        wait_for_retry,
-    )
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        renewed = store.renew_many((claim,))
-
-    assert len(renewed) == 1
-    assert attempts == 2
-    assert len(sleeps) == 1
-    assert 6.0 <= sleeps[0] <= 6.6
-    assert request_timeouts[0] > 30.0
-    assert request_timeouts[1] <= request_timeouts[0] - sleeps[0] / 4
-
-
-def test_http_claim_retries_finalize_backpressure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    attempts = 0
-    sleeps: list[float] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal attempts
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        attempts += 1
-        if attempts == 1:
-            return httpx.Response(503, headers={"Retry-After": "1"})
-        return httpx.Response(200, json={})
-
-    def wait_for_retry(_store: HttpEvidenceStore, delay: float) -> bool:
-        sleeps.append(delay)
-        return False
-
-    monkeypatch.setattr(HttpEvidenceStore, "_wait_for_claim_retry", wait_for_retry)
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        response = store._claim_request(  # pyright: ignore[reportPrivateUsage]
-            "POST", "/v1/evidence/claims/finalize", timeout=10.0
-        )
-
-    assert response.status_code == 200
-    assert attempts == 2
-    assert len(sleeps) == 1
-    assert sleeps[0] >= 1.0
-
-
-def test_http_finalize_uses_claim_authority_budget(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    identity, key = _key("MFINALIZEBUDGET")
-    commit = EvidenceCommit(
-        identity=identity,
-        key=key,
-        status=EvidenceStatus.NO_HIT,
-        payload_digest="a" * 64,
-        raw_artifact=write_artifact_file(
-            tmp_path / "result.tsv", b"no-hit", "text/tab-separated-values"
-        ),
-    )
-    claim = EvidenceClaim(
-        key,
-        "owner",
-        1,
-        datetime.now(UTC) - timedelta(seconds=1),
-        5.0,
-    )
-    captured: dict[str, object] = {}
-    paths: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        raise AssertionError("claim request should be patched")
-
-    def claim_request(method: str, path: str, **kwargs: object) -> httpx.Response:
-        assert method == "POST"
-        paths.append(path)
-        if path.endswith("/renew"):
-            renewed = EvidenceClaim(
-                claim.key,
-                claim.owner_token,
-                claim.generation,
-                datetime.now(UTC) + timedelta(seconds=20),
-                claim.renewal_after_seconds,
-            )
-            return httpx.Response(
-                200,
-                json={
-                    "claims": [
-                        EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
-                    ]
-                },
-            )
-        assert path.endswith("/finalize")
-        captured.update(kwargs)
-        return httpx.Response(200, json={"outcomes": ["created"]})
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        monkeypatch.setattr(store, "_upload", lambda _payload: None)
-        monkeypatch.setattr(store, "_claim_request", claim_request)
-        assert store.finalize_many((ClaimedEvidenceCommit(commit, claim),)) == (
-            CommitOutcome.CREATED,
-        )
-
-    timeout = captured["timeout"]
-    assert isinstance(timeout, float)
-    assert 0 < timeout < 20
-    assert paths == ["/v1/evidence/claims/renew", "/v1/evidence/claims/finalize"]
-
-
-def test_http_claim_retry_after_http_date_is_a_minimum(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    retry_at = datetime.now(UTC) + timedelta(seconds=30)
-    monkeypatch.setattr(client_module.random, "uniform", lambda _low, _high: 0.0)
-    response = httpx.Response(
-        503,
-        headers={"Retry-After": format_datetime(retry_at, usegmt=True)},
-    )
-
-    delay = client_module._claim_retry_delay(response)  # pyright: ignore[reportPrivateUsage]
-
-    assert 28.0 <= delay <= 30.0
-
-
-def test_http_claim_scheduler_recomputes_timeout_after_queueing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 1)
-    first_started = threading.Event()
-    release_first = threading.Event()
-    observed_timeout: list[float] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        if request.url.path.endswith("/acquire"):
-            first_started.set()
-            assert release_first.wait(timeout=2)
-        else:
-            observed_timeout.append(
-                cast(dict[str, float], request.extensions["timeout"])["read"]
-            )
-        return httpx.Response(200, json={})
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with ThreadPoolExecutor(max_workers=2) as callers:
-            first = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/acquire",
-                timeout=2.0,
-            )
-            assert first_started.wait(timeout=2)
-            second = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/renew",
-                timeout=0.5,
-            )
-            time.sleep(0.2)
-            release_first.set()
-            assert first.result(timeout=2).status_code == 200
-            assert second.result(timeout=2).status_code == 200
-
-    assert len(observed_timeout) == 1
-    assert 0.15 < observed_timeout[0] < 0.45
-
-
-def test_http_claim_scheduler_releases_slot_at_request_deadline() -> None:
-    first_started = threading.Event()
-    release_first = threading.Event()
-    second_started = threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        if request.url.path.endswith("/acquire"):
-            first_started.set()
-            assert release_first.wait(timeout=3)
-        else:
-            second_started.set()
-        return httpx.Response(200, json={})
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    store = HttpEvidenceStore("http://testserver", client=client)
-    try:
-        with ThreadPoolExecutor(max_workers=2) as callers:
-            first = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/acquire",
-                timeout=0.1,
-            )
-            assert first_started.wait(timeout=2)
-            second = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/renew",
-                timeout=1.0,
-            )
-            assert second_started.wait(timeout=1)
-            assert second.result(timeout=2).status_code == 200
-            with pytest.raises(StoreError, match="remained unavailable"):
-                first.result(timeout=2)
-    finally:
-        release_first.set()
-        store.close()
-
-
-def test_http_claim_scheduler_keeps_expired_transport_within_cap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 1)
-    first_started = threading.Event()
-    release_first = threading.Event()
-    second_started = threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        if request.url.path.endswith("/acquire"):
-            first_started.set()
-            assert release_first.wait(timeout=3)
-        else:
-            second_started.set()
-        return httpx.Response(200, json={})
-
-    store = HttpEvidenceStore(
-        "http://testserver",
-        client=_claim_mock_client(httpx.MockTransport(handler)),
-    )
-    try:
-        with ThreadPoolExecutor(max_workers=2) as callers:
-            first = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/acquire",
-                timeout=0.1,
-            )
-            assert first_started.wait(timeout=2)
-            second = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/renew",
-                timeout=0.2,
-            )
-            with pytest.raises(EvidenceClaimLostError):
-                second.result(timeout=2)
-            assert not second_started.is_set()
-            release_first.set()
-            with pytest.raises(StoreError, match="remained unavailable"):
-                first.result(timeout=2)
-    finally:
-        release_first.set()
-        store.close()
-
-
-def test_http_claim_renewal_enforces_one_wall_clock_deadline() -> None:
-    _identity, key = _key("MCLAIMTOTALDEADLINE")
-    claim = EvidenceClaim(
-        key,
-        "owner",
-        1,
-        datetime.now(UTC) + timedelta(seconds=5.25),
-        20.0,
-    )
-    request_started = threading.Event()
-    release_request = threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        request_started.set()
-        assert release_request.wait(timeout=3)
-        return httpx.Response(503, headers={"Retry-After": "1"})
-
-    store = HttpEvidenceStore(
-        "http://testserver",
-        client=_claim_mock_client(httpx.MockTransport(handler)),
-    )
-    started = time.monotonic()
-    try:
-        with pytest.raises(EvidenceClaimLostError, match="authority runway"):
-            store.renew_many((claim,))
-        elapsed = time.monotonic() - started
-        assert request_started.is_set()
-        assert elapsed < 1.0
-    finally:
-        release_request.set()
-        store.close()
-
-
-def test_http_claim_scheduler_prioritizes_renewal_and_caps_all_mutations(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 1)
-    first_started = threading.Event()
-    release_first = threading.Event()
-    order: list[str] = []
-    active = 0
-    maximum_active = 0
-    lock = threading.Lock()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal active, maximum_active
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        with lock:
-            active += 1
-            maximum_active = max(maximum_active, active)
-            order.append(request.url.path)
-        try:
-            if request.url.path.endswith("/acquire"):
-                first_started.set()
-                assert release_first.wait(timeout=3)
+    class SlowResponseClient:
+        def request(self, *_args, **_kwargs) -> httpx.Response:
+            clock[0] = 11.0
             return httpx.Response(200, json={})
-        finally:
-            with lock:
-                active -= 1
 
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with ThreadPoolExecutor(max_workers=4) as callers:
-            acquire = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/acquire",
-            )
-            assert first_started.wait(timeout=2)
-            release = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/release",
-            )
-            finalize = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/finalize",
-            )
-            deadline = time.monotonic() + 2
-            while store._claim_request_scheduler._queue.qsize() < 2:  # pyright: ignore[reportPrivateUsage]
-                assert time.monotonic() < deadline
-                time.sleep(0.001)
-            renew = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/renew",
-            )
-            deadline = time.monotonic() + 2
-            while store._claim_request_scheduler._queue.qsize() < 3:  # pyright: ignore[reportPrivateUsage]
-                assert time.monotonic() < deadline
-                time.sleep(0.001)
-            release_first.set()
-            for future in (acquire, renew, release, finalize):
-                assert future.result(timeout=3).status_code == 200
+    class Store:
+        client = SlowResponseClient()
 
-    assert maximum_active == 1
-    assert order == [
-        "/v1/evidence/claims/acquire",
-        "/v1/evidence/claims/renew",
-        "/v1/evidence/claims/release",
-        "/v1/evidence/claims/finalize",
-    ]
+    session = object.__new__(store_client_module._HttpClaimSession)
+    session.store = Store()
+    session._stop = threading.Event()
+    monkeypatch.setattr(store_client_module.time, "monotonic", lambda: clock[0])
 
-
-def test_http_claim_scheduler_requeues_mutations_while_capacity_is_full(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 4)
-    first_started = threading.Event()
-    second_started = threading.Event()
-    first_release = threading.Event()
-    second_release = threading.Event()
-    renew_started = threading.Event()
-    renew_release = threading.Event()
-    order: list[str] = []
-    lock = threading.Lock()
-    acquire_number = 0
-    renew_count = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal acquire_number, renew_count
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        with lock:
-            order.append(request.url.path)
-            if request.url.path.endswith("/acquire"):
-                acquire_number += 1
-                current_acquire = acquire_number
-            else:
-                current_acquire = 0
-        if request.url.path.endswith("/acquire"):
-            if current_acquire == 1:
-                first_started.set()
-                assert first_release.wait(timeout=3)
-            else:
-                second_started.set()
-                assert second_release.wait(timeout=3)
-        elif request.url.path.endswith("/renew"):
-            with lock:
-                renew_count += 1
-                if renew_count == 2:
-                    renew_started.set()
-            assert renew_release.wait(timeout=3)
-        return httpx.Response(200, json={})
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    store = HttpEvidenceStore("http://testserver", client=client)
-    try:
-        with ThreadPoolExecutor(max_workers=6) as callers:
-            first = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/acquire",
-                timeout=0.1,
-            )
-            assert first_started.wait(timeout=2)
-            second = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/acquire",
-                timeout=0.1,
-            )
-            assert second_started.wait(timeout=2)
-            deadline = time.monotonic() + 2
-            while len(store._claim_request_scheduler._active_transports) < 2:  # pyright: ignore[reportPrivateUsage]
-                assert time.monotonic() < deadline
-                time.sleep(0.001)
-            release = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/release",
-                timeout=2.0,
-            )
-            finalize = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/finalize",
-                timeout=2.0,
-            )
-            with pytest.raises(StoreError, match="remained unavailable"):
-                first.result(timeout=2)
-            with pytest.raises(StoreError, match="remained unavailable"):
-                second.result(timeout=2)
-            deadline = time.monotonic() + 2
-            while store._claim_request_scheduler._queue.qsize() < 2:  # pyright: ignore[reportPrivateUsage]
-                assert time.monotonic() < deadline
-                time.sleep(0.001)
-            renew = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/renew",
-                timeout=2.0,
-            )
-            renew_again = callers.submit(
-                store._claim_request,  # pyright: ignore[reportPrivateUsage]
-                "POST",
-                "/v1/evidence/claims/renew",
-                timeout=2.0,
-            )
-            # The two mutation slots are full, but two scheduler slots are
-            # reserved for a concurrent renewal wave. Both renewals must start
-            # without waiting for either active acquire to finish.
-            assert renew_started.wait(timeout=2)
-            assert order[:4] == [
-                "/v1/evidence/claims/acquire",
-                "/v1/evidence/claims/acquire",
-                "/v1/evidence/claims/renew",
-                "/v1/evidence/claims/renew",
-            ], order
-            renew_release.set()
-            first_release.set()
-            second_release.set()
-            assert renew.result(timeout=3).status_code == 200
-            assert renew_again.result(timeout=3).status_code == 200
-            assert release.result(timeout=3).status_code == 200
-            assert finalize.result(timeout=3).status_code == 200
-    finally:
-        first_release.set()
-        second_release.set()
-        store.close()
-
-    assert order[:2] == [
-        "/v1/evidence/claims/acquire",
-        "/v1/evidence/claims/acquire",
-    ]
-    assert order[2:4] == [
-        "/v1/evidence/claims/renew",
-        "/v1/evidence/claims/renew",
-    ], order
-
-
-def test_http_claim_chunks_honor_client_and_capability_limits() -> None:
-    queries = tuple(
-        EvidenceQuery(identity, key)
-        for identity, key in (_key(f"MCHUNK{letter}") for letter in "ABCDE")
-    )
-    observed_sizes: list[int] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(2))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        observed_sizes.append(len(body["queries"]))
-        results = []
-        for query_data in body["queries"]:
-            query = EvidenceQueryModel.model_validate(query_data).to_domain()
-            result = ClaimAcquireResult(
-                ClaimDisposition.ACQUIRED,
-                claim=EvidenceClaim(
-                    query.key,
-                    body["owner_token"],
-                    1,
-                    datetime.now(UTC) + timedelta(seconds=60),
-                    20.0,
-                ),
-            )
-            results.append(
-                ClaimAcquireResultModel.from_domain(result).model_dump(mode="json")
-            )
-        return httpx.Response(200, json={"results": results})
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        results = store.acquire_many(queries, owner_token="owner")
-
-    assert len(results) == 5
-    assert observed_sizes == [2, 2, 1]
-
-
-def test_http_claim_chunks_apply_internal_contention_cap() -> None:
-    queries = tuple(
-        EvidenceQuery(identity, key)
-        for identity, key in (
-            _key("MCONTENTION" + "A" * index) for index in range(1, 252)
+    with pytest.raises(EvidenceClaimLostError, match="response exceeded"):
+        session._request_until(
+            "POST", f"/v1/internal/claim-sessions/{operation}", deadline=10.0
         )
-    )
-    observed_sizes: list[int] = []
+
+
+def test_http_open_replays_malformed_success_with_same_request_id() -> None:
+    now = datetime.now(UTC)
+    open_ids: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(200, json=_claim_health())
         if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        observed_sizes.append(len(body["queries"]))
-        results = []
-        for query_data in body["queries"]:
-            query = EvidenceQueryModel.model_validate(query_data).to_domain()
-            acquired = ClaimAcquireResult(
-                ClaimDisposition.ACQUIRED,
-                claim=EvidenceClaim(
-                    query.key,
-                    body["owner_token"],
-                    1,
-                    datetime.now(UTC) + timedelta(seconds=60),
-                    20.0,
-                ),
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
             )
-            results.append(
-                ClaimAcquireResultModel.from_domain(acquired).model_dump(mode="json")
+        if request.url.path.endswith("/open"):
+            open_ids.append(json.loads(request.content)["open_request_id"])
+            if len(open_ids) == 1:
+                return httpx.Response(200, json={})
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
             )
-        return httpx.Response(200, json={"results": results})
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        results = store.acquire_many(queries, owner_token="owner")
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session():
+            pass
+    assert len(open_ids) == 2
+    assert open_ids[0] == open_ids[1]
 
-    assert len(results) == len(queries)
-    assert observed_sizes == [250, 1]
+
+def test_http_empty_finalize_is_a_noop() -> None:
+    now = datetime.now(UTC)
+    finalize_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal finalize_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            finalize_calls += 1
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            assert session.finalize_many(()) == ()
+    assert finalize_calls == 0
 
 
-def test_http_claim_chunks_renew_early_authority_while_acquisition_blocks() -> None:
-    queries = tuple(
-        EvidenceQuery(identity, key)
-        for identity, key in (_key(f"MALIVE{letter}") for letter in "AB")
-    )
-    renew_observed = threading.Event()
+def test_http_finalize_rejects_logical_duplicate_before_chunk_or_upload(
+    tmp_path: Path,
+) -> None:
+    commit = _hit_commit(tmp_path / "source", "MDUPLICATEFINALIZE")
+    now = datetime.now(UTC)
+    artifact_calls = 0
+    finalize_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal artifact_calls, finalize_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health(maximum_batch_size=1))
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.startswith("/v1/artifacts/"):
+            artifact_calls += 1
+        if request.url.path.endswith("/finalize"):
+            finalize_calls += 1
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            with pytest.raises(ValueError, match="duplicate evidence key"):
+                session.finalize_many((commit, commit))
+
+    assert artifact_calls == 0
+    assert finalize_calls == 0
+
+
+def test_claim_session_capability_clock_backpressure_is_retryable(
+    tmp_path: Path,
+) -> None:
+    class BackpressuredCapabilityPersistence(MemoryPersistence):
+        @property
+        def supports_claim_sessions(self) -> bool:
+            return True
+
+        def database_time(self) -> datetime:
+            raise StoreBackpressureError("clock unavailable")
+
+    persistence = cast(ServicePersistence, BackpressuredCapabilityPersistence())
+    with TestClient(
+        create_service_app(_settings(tmp_path), persistence=persistence)
+    ) as client:
+        response = client.get("/v1/internal/claim-sessions/capabilities")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "clock unavailable"
+    assert response.headers["Retry-After"] == "1"
+
+
+def test_http_receipt_capacity_restarts_acquire_with_new_request_id() -> None:
+    identity, key = _key("MCAPACITYCLIENT")
+    query = EvidenceQuery(identity, key)
+    acquire_ids: list[str] = []
+    now = datetime.now(UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            payload = json.loads(request.content)
+            acquire_ids.append(payload["acquire_request_id"])
+            if len(acquire_ids) == 1:
+                return httpx.Response(
+                    503,
+                    json={
+                        "detail": {
+                            "code": "claim_receipt_capacity",
+                            "detail": "wait",
+                        }
+                    },
+                    headers={"Retry-After": "0"},
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        session = store.claim_session()
+        assert (
+            session.acquire_many((query,))[0].disposition is ClaimDisposition.ACQUIRED
+        )
+        session.close()
+    assert len(acquire_ids) == 2
+    assert acquire_ids[0] != acquire_ids[1]
+
+
+@pytest.mark.parametrize(
+    "malformation", ["missing", "wrong-count", "wrong-key", "wrong-disposition"]
+)
+def test_http_acquire_replays_malformed_success_with_same_request_id(
+    malformation: str,
+) -> None:
+    identity, key = _key("MAMBIGUOUSACQUIRE")
+    query = EvidenceQuery(identity, key)
+    acquire_ids: list[str] = []
+    now = datetime.now(UTC)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            acquire_ids.append(json.loads(request.content)["acquire_request_id"])
+            if len(acquire_ids) == 1:
+                wrong_identity, wrong_key = _key("MOTHERACQUIREKEY")
+                malformed = {
+                    "missing": {},
+                    "wrong-count": {"results": []},
+                    "wrong-key": {
+                        "results": [
+                            {
+                                "disposition": "acquired",
+                                "claim": {
+                                    "key": EvidenceQueryModel.from_domain(
+                                        EvidenceQuery(wrong_identity, wrong_key)
+                                    ).key.model_dump(mode="json"),
+                                    "generation": 1,
+                                },
+                            }
+                        ]
+                    },
+                    "wrong-disposition": {
+                        "results": [
+                            {
+                                "disposition": "acquired",
+                                "busy": {
+                                    "key": EvidenceQueryModel.from_domain(
+                                        query
+                                    ).key.model_dump(mode="json"),
+                                    "expires_at": (
+                                        now + timedelta(seconds=30)
+                                    ).isoformat(),
+                                    "retry_after_seconds": 1,
+                                },
+                            }
+                        ]
+                    },
+                }[malformation]
+                return httpx.Response(
+                    200,
+                    json=malformed,
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            assert (
+                session.acquire_many((query,))[0].disposition
+                is ClaimDisposition.ACQUIRED
+            )
+    assert len(acquire_ids) == 2
+    assert acquire_ids[0] == acquire_ids[1]
+
+
+def test_http_acquire_rejects_duplicate_keys_before_logical_batch_chunking() -> None:
+    identity, key = _key("MDUPLICATELOGICALACQUIRE")
+    query = EvidenceQuery(identity, key)
+    now = datetime.now(UTC)
     acquire_calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal acquire_calls
         if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
+            return httpx.Response(200, json=_claim_health(maximum_batch_size=1))
         if request.url.path.endswith("/capabilities"):
             return httpx.Response(
                 200,
                 json={
+                    "protocol": "claim-session-v1",
                     "maximum_batch_size": 1,
-                    "lease_seconds": 60.0,
-                    "renewal_after_seconds": 20.0,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
                 },
             )
-        body = json.loads(request.content)
-        if request.url.path.endswith("/renew"):
-            renewed = []
-            for data in body["claims"]:
-                claim = EvidenceClaimModel.model_validate(data).to_domain()
-                renewed.append(
-                    EvidenceClaimModel.from_domain(
-                        EvidenceClaim(
-                            claim.key,
-                            claim.owner_token,
-                            claim.generation,
-                            datetime.now(UTC) + timedelta(seconds=60),
-                            20.0,
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            acquire_calls += 1
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            with pytest.raises(ValueError, match="duplicate evidence key"):
+                session.acquire_many((query, query))
+    assert acquire_calls == 0
+
+
+@pytest.mark.parametrize(
+    "first_outcome", ["transport", "503", "412", "transport-then-412"]
+)
+@pytest.mark.parametrize("first_lookup", ["503", "malformed"])
+@pytest.mark.parametrize("first_authority", ["valid", "malformed"])
+def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
+    tmp_path: Path,
+    first_outcome: str,
+    first_lookup: str,
+    first_authority: str,
+) -> None:
+    commit = _hit_commit(tmp_path / "source", "MUNKNOWNTHENSUCCESS")
+    query = EvidenceQuery(commit.identity, commit.key)
+    now = datetime.now(UTC)
+    finalize_calls = 0
+    lookup_calls = 0
+    authority_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal finalize_calls, lookup_calls, authority_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            finalize_calls += 1
+            if finalize_calls == 1:
+                if first_outcome in {"transport", "transport-then-412"}:
+                    raise httpx.ReadError("response lost")
+                if first_outcome == "412":
+                    return httpx.Response(412, text="authority uncertain")
+                return httpx.Response(503, text="temporarily unavailable")
+            if first_outcome == "transport-then-412":
+                return httpx.Response(412, text="authority uncertain")
+            return httpx.Response(200, json={"outcomes": ["created"]})
+        if request.url.path.endswith("/authority"):
+            authority_calls += 1
+            if first_authority == "malformed" and authority_calls == 1:
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json={"live": True})
+        if request.url.path.endswith("/lookup"):
+            lookup_calls += 1
+            if lookup_calls == 1:
+                if first_lookup == "malformed":
+                    return httpx.Response(200, json={})
+                return httpx.Response(503, text="transient readback")
+            records = []
+            if lookup_calls == 3:
+                records = [
+                    EvidenceRecordModel.from_domain(
+                        EvidenceRecord(
+                            key=commit.key,
+                            status=commit.status,
+                            payload_digest=commit.payload_digest,
+                            normalized_artifact_digest=commit.normalized_artifact.digest
+                            if commit.normalized_artifact
+                            else None,
+                            raw_artifact_digest=commit.raw_artifact.digest
+                            if commit.raw_artifact
+                            else None,
+                            created_at=now,
                         )
                     ).model_dump(mode="json")
-                )
-            renew_observed.set()
-            return httpx.Response(200, json={"claims": renewed})
-        acquire_calls += 1
-        if acquire_calls == 2:
-            assert renew_observed.wait(timeout=1)
-        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
-        acquired = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=0.2),
-                20.0,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
-                        mode="json"
-                    )
                 ]
-            },
-        )
+            return httpx.Response(200, json={"records": records})
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        results = store.acquire_many(queries, owner_token="owner")
-
-    assert renew_observed.is_set()
-    assert len(results) == 2
-
-
-def test_http_single_final_chunk_flushes_near_expiry_without_daemon_race(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    identity, key = _key("MFINALFLUSH")
-    renew_observed = threading.Event()
-    monkeypatch.setattr(
-        client_module._ChunkAcquireRenewer,  # pyright: ignore[reportPrivateUsage]
-        "_run",
-        lambda self: self._stopped.wait(),  # pyright: ignore[reportPrivateUsage]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        if request.url.path.endswith("/renew"):
-            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-            refreshed = EvidenceClaim(
-                claim.key,
-                claim.owner_token,
-                claim.generation,
-                datetime.now(UTC) + timedelta(seconds=60),
-                20.0,
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            session.acquire_many((query,))
+            store._uploaded_artifact_digests.update(
+                payload.digest
+                for payload in (commit.normalized_artifact, commit.raw_artifact)
+                if payload is not None
             )
-            renew_observed.set()
-            return httpx.Response(
-                200,
-                json={
-                    "claims": [
-                        EvidenceClaimModel.from_domain(refreshed).model_dump(
-                            mode="json"
-                        )
-                    ]
-                },
-            )
-        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
-        acquired = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=0.2),
-                20.0,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
-                        mode="json"
-                    )
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        result = store.acquire_many(
-            (EvidenceQuery(identity, key),), owner_token="owner"
-        )[0]
-
-    assert renew_observed.is_set()
-    assert result.claim is not None
-    assert result.claim.expires_at > datetime.now(UTC) + timedelta(seconds=30)
+            assert session.finalize_many((commit,)) == (CommitOutcome.EXISTING,)
+    assert finalize_calls == 2
+    assert lookup_calls == 3
+    assert authority_calls == (2 if first_authority == "malformed" else 1)
 
 
-def test_http_final_flush_reconciles_expired_terminal_and_renews_live_sibling(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("stalled_stage", ["lookup", "authority"])
+def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
+    tmp_path: Path,
+    stalled_stage: str,
 ) -> None:
-    terminal_identity, terminal_key = _key("MFLUSHTERMINAL")
-    live_identity, live_key = _key("MFLUSHLIVE")
-    terminal = EvidenceRecord(
-        terminal_key,
-        EvidenceStatus.NO_HIT,
-        sha256_digest(b"flush-terminal"),
-        None,
-        None,
-        datetime.now(UTC),
-    )
-    renewed_keys: list[EvidenceKey] = []
-    monkeypatch.setattr(
-        client_module._ChunkAcquireRenewer,  # pyright: ignore[reportPrivateUsage]
-        "_run",
-        lambda self: self._stopped.wait(),  # pyright: ignore[reportPrivateUsage]
-    )
+    commit = _hit_commit(tmp_path / "source", "MSTALLEDREADBACK")
+    query = EvidenceQuery(commit.identity, commit.key)
+    now = datetime.now(UTC)
+    lookup_timeouts: list[float] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(200, json=_claim_health())
         if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        if request.url.path.endswith("/lookup"):
-            requested = tuple(
-                EvidenceQueryModel.model_validate(data).to_domain()
-                for data in body["queries"]
-            )
-            assert tuple(query.key for query in requested) == (terminal_key,)
             return httpx.Response(
                 200,
                 json={
-                    "records": [
-                        EvidenceRecordModel.from_domain(terminal).model_dump(
-                            mode="json"
-                        )
-                    ]
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
                 },
             )
-        if request.url.path.endswith("/renew"):
-            claims = tuple(
-                EvidenceClaimModel.model_validate(data).to_domain()
-                for data in body["claims"]
-            )
-            renewed_keys.extend(claim.key for claim in claims)
-            refreshed = tuple(
-                EvidenceClaim(
-                    claim.key,
-                    claim.owner_token,
-                    claim.generation,
-                    datetime.now(UTC) + timedelta(seconds=60),
-                    20.0,
-                )
-                for claim in claims
-            )
+        if request.url.path.endswith("/open"):
             return httpx.Response(
                 200,
                 json={
-                    "claims": [
-                        EvidenceClaimModel.from_domain(claim).model_dump(mode="json")
-                        for claim in refreshed
-                    ]
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
                 },
             )
-        queries = tuple(
-            EvidenceQueryModel.model_validate(data).to_domain()
-            for data in body["queries"]
-        )
-        expires = (
-            datetime.now(UTC) - timedelta(milliseconds=1),
-            datetime.now(UTC) + timedelta(seconds=1),
-        )
-        results = tuple(
-            ClaimAcquireResult(
-                ClaimDisposition.ACQUIRED,
-                claim=EvidenceClaim(
-                    query.key,
-                    body["owner_token"],
-                    1,
-                    expiry,
-                    20.0,
-                ),
-            )
-            for query, expiry in zip(queries, expires, strict=True)
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(result).model_dump(mode="json")
-                    for result in results
-                ]
-            },
-        )
-
-    queries = (
-        EvidenceQuery(terminal_identity, terminal_key),
-        EvidenceQuery(live_identity, live_key),
-    )
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        results = store.acquire_many(queries, owner_token="owner")
-
-    assert results[0].disposition is ClaimDisposition.CACHED
-    assert results[0].record == terminal
-    assert results[1].disposition is ClaimDisposition.ACQUIRED
-    assert results[1].claim is not None
-    assert results[1].claim.expires_at > datetime.now(UTC) + timedelta(seconds=30)
-    assert renewed_keys == [live_key]
-
-
-def test_http_claim_chunk_additions_cannot_postpone_due_renewal() -> None:
-    queries = tuple(
-        EvidenceQuery(identity, key)
-        for identity, key in (_key("MSTARVE" + "A" * index) for index in range(1, 13))
-    )
-    acquire_calls = 0
-    renew_at_acquire_count: list[int] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal acquire_calls
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(
-                200,
-                json={
-                    "maximum_batch_size": 1,
-                    "lease_seconds": 60.0,
-                    "renewal_after_seconds": 0.01,
-                },
-            )
-        body = json.loads(request.content)
-        if request.url.path.endswith("/renew"):
-            renew_at_acquire_count.append(acquire_calls)
-            renewed = []
-            for data in body["claims"]:
-                claim = EvidenceClaimModel.model_validate(data).to_domain()
-                renewed.append(
-                    EvidenceClaimModel.from_domain(
-                        EvidenceClaim(
-                            claim.key,
-                            claim.owner_token,
-                            claim.generation,
-                            datetime.now(UTC) + timedelta(seconds=60),
-                            0.01,
-                        )
-                    ).model_dump(mode="json")
-                )
-            return httpx.Response(200, json={"claims": renewed})
-        acquire_calls += 1
-        time.sleep(0.003)
-        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
-        acquired = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=1),
-                0.01,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
-                        mode="json"
-                    )
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        assert len(store.acquire_many(queries, owner_token="owner")) == len(queries)
-
-    assert renew_at_acquire_count
-    assert min(renew_at_acquire_count) < len(queries)
-
-
-def test_http_renew_chunks_execute_concurrently_and_preserve_order() -> None:
-    claims = tuple(
-        EvidenceClaim(
-            key,
-            "owner",
-            1,
-            datetime.now(UTC) + timedelta(seconds=60),
-            20.0,
-        )
-        for _identity, key in (
-            _key(sequence) for sequence in ("MPARALLELA", "MPARALLELB")
-        )
-    )
-    barrier = threading.Barrier(2)
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        barrier.wait(timeout=1)
-        return httpx.Response(200, json={"claims": body["claims"]})
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        renewed = store.renew_many(claims)
-
-    assert tuple(claim.key for claim in renewed) == tuple(claim.key for claim in claims)
-
-
-def test_http_renew_bounded_scheduler_drains_fast_slots_before_blocked_chunk() -> None:
-    claims = tuple(
-        EvidenceClaim(
-            key,
-            "owner",
-            1,
-            datetime.now(UTC) + timedelta(seconds=60),
-            20.0,
-        )
-        for _identity, key in (
-            _key("MQUEUE" + "A" * (index + 1)) for index in range(33)
-        )
-    )
-    blocked_key = claims[0].key
-    final_key = claims[-1].key
-    final_started = threading.Event()
-    active = 0
-    maximum_active = 0
-    active_lock = threading.Lock()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(
-                200,
-                json={
-                    "maximum_batch_size": 1,
-                    "lease_seconds": 60.0,
-                    "renewal_after_seconds": 20.0,
-                },
-            )
-        body = json.loads(request.content)
-        returned = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-        nonlocal active, maximum_active
-        with active_lock:
-            active += 1
-            maximum_active = max(maximum_active, active)
-        try:
-            if returned.key == final_key:
-                final_started.set()
-            if returned.key == blocked_key:
-                time.sleep(0.02)
-            renewed = EvidenceClaim(
-                returned.key,
-                returned.owner_token,
-                returned.generation,
-                datetime.now(UTC) + timedelta(seconds=60),
-                returned.renewal_after_seconds,
-            )
-            return httpx.Response(
-                200,
-                json={
-                    "claims": [
-                        EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
-                    ]
-                },
-            )
-        finally:
-            with active_lock:
-                active -= 1
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        renewed = store.renew_many(claims)
-
-    assert tuple(claim.key for claim in renewed) == tuple(claim.key for claim in claims)
-    assert final_started.is_set()
-    assert maximum_active <= client_module._MAX_CONCURRENT_CLAIM_REQUESTS
-
-
-def test_http_renew_shared_executor_bounds_concurrent_logical_calls() -> None:
-    claim_groups = tuple(
-        tuple(
-            EvidenceClaim(
-                key,
-                "owner",
-                1,
-                datetime.now(UTC) + timedelta(seconds=60),
-                20.0,
-            )
-            for _identity, key in (
-                _key("MSHARED" + letter + "A" * (index + 1)) for index in range(20)
-            )
-        )
-        for letter in "ABCD"
-    )
-    active = 0
-    maximum_active = 0
-    active_lock = threading.Lock()
-    callers_ready = threading.Barrier(len(claim_groups))
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal active, maximum_active
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(
-                200,
-                json={
-                    "maximum_batch_size": 1,
-                    "lease_seconds": 60.0,
-                    "renewal_after_seconds": 20.0,
-                },
-            )
-        body = json.loads(request.content)
-        returned = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-        with active_lock:
-            active += 1
-            maximum_active = max(maximum_active, active)
-        try:
-            time.sleep(0.02)
-            renewed = EvidenceClaim(
-                returned.key,
-                returned.owner_token,
-                returned.generation,
-                datetime.now(UTC) + timedelta(seconds=60),
-                returned.renewal_after_seconds,
-            )
-            return httpx.Response(
-                200,
-                json={
-                    "claims": [
-                        EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
-                    ]
-                },
-            )
-        finally:
-            with active_lock:
-                active -= 1
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-
-        def renew_group(group):
-            callers_ready.wait(timeout=2)
-            return store.renew_many(group)
-
-        with ThreadPoolExecutor(max_workers=len(claim_groups)) as callers:
-            results = tuple(callers.map(renew_group, claim_groups))
-
-    assert maximum_active <= client_module._MAX_CONCURRENT_CLAIM_REQUESTS
-    assert maximum_active > 1
-    assert tuple(tuple(claim.key for claim in group) for group in results) == tuple(
-        tuple(claim.key for claim in group) for group in claim_groups
-    )
-
-
-def test_http_store_close_cancels_pending_renewal_then_drains_active_transport(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    claims = tuple(
-        EvidenceClaim(
-            key,
-            "owner",
-            1,
-            datetime.now(UTC) + timedelta(seconds=60),
-            20.0,
-        )
-        for _identity, key in (_key(sequence) for sequence in ("MCLOSEA", "MCLOSEB"))
-    )
-    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 1)
-    active_started = threading.Event()
-    active_finished = threading.Event()
-    release_active = threading.Event()
-    request_count = 0
-    request_lock = threading.Lock()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal request_count
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(
-                200,
-                json={
-                    "maximum_batch_size": 1,
-                    "lease_seconds": 60.0,
-                    "renewal_after_seconds": 20.0,
-                },
-            )
-        body = json.loads(request.content)
-        returned = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-        with request_lock:
-            request_count += 1
-        active_started.set()
-        assert release_active.wait(timeout=3)
-        renewed = EvidenceClaim(
-            returned.key,
-            returned.owner_token,
-            returned.generation,
-            datetime.now(UTC) + timedelta(seconds=60),
-            returned.renewal_after_seconds,
-        )
-        active_finished.set()
-        return httpx.Response(
-            200,
-            json={
-                "claims": [
-                    EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
-                ]
-            },
-        )
-
-    owned_client = _claim_mock_client(httpx.MockTransport(handler))
-    transport_closed_after_active: list[bool] = []
-    original_close = owned_client.close
-
-    def tracking_close() -> None:
-        transport_closed_after_active.append(active_finished.is_set())
-        original_close()
-
-    monkeypatch.setattr(owned_client, "close", tracking_close)
-    monkeypatch.setattr(client_module.httpx, "Client", lambda **_kwargs: owned_client)
-    store = HttpEvidenceStore("http://testserver")
-    renewal_errors: list[BaseException] = []
-
-    def renew() -> None:
-        try:
-            store.renew_many(claims)
-        except BaseException as error:
-            renewal_errors.append(error)
-
-    renewal_thread = threading.Thread(target=renew)
-    renewal_thread.start()
-    assert active_started.wait(timeout=2)
-    close_thread = threading.Thread(target=store.close)
-    close_thread.start()
-    deadline = time.monotonic() + 2
-    while not store._renewal_executor._shutdown:  # pyright: ignore[reportPrivateUsage]
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
-    assert close_thread.is_alive()
-    assert not owned_client.is_closed
-
-    release_active.set()
-    renewal_thread.join(timeout=3)
-    close_thread.join(timeout=3)
-
-    assert not renewal_thread.is_alive()
-    assert not close_thread.is_alive()
-    assert request_count == 1
-    assert len(renewal_errors) == 1
-    assert isinstance(renewal_errors[0], StoreError)
-    assert "closed during claim renewal" in str(renewal_errors[0])
-    assert transport_closed_after_active == [True]
-    assert owned_client.is_closed
-    assert not any(
-        thread.name.startswith("seqevi-claim-renewal") and thread.is_alive()
-        for thread in threading.enumerate()
-    )
-    assert not any(  # pyright: ignore[reportPrivateUsage]
-        thread.is_alive() for thread in store._claim_request_scheduler._threads
-    )
-
-
-def test_http_store_close_cancels_queued_scheduler_renewal_before_waiting(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(client_module, "_MAX_CONCURRENT_CLAIM_REQUESTS", 1)
-    active_started = threading.Event()
-    release_active = threading.Event()
-    renewal_started = threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health())
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
         if request.url.path.endswith("/acquire"):
-            active_started.set()
-            assert release_active.wait(timeout=3)
-        else:
-            renewal_started.set()
-        return httpx.Response(200, json={})
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    store = HttpEvidenceStore("http://testserver", client=client)
-    active_errors: list[BaseException] = []
-
-    def active_request() -> None:
-        try:
-            store._claim_request(  # pyright: ignore[reportPrivateUsage]
-                "POST", "/v1/evidence/claims/acquire", timeout=5.0
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
             )
-        except BaseException as error:
-            active_errors.append(error)
+        if request.url.path.endswith("/finalize"):
+            return httpx.Response(503, text="unknown")
+        if request.url.path.endswith("/lookup"):
+            lookup_timeouts.append(request.extensions["timeout"]["read"])
+            if stalled_stage == "lookup":
+                raise httpx.ReadTimeout("stalled")
+            return httpx.Response(200, json={"records": []})
+        if request.url.path.endswith("/authority"):
+            lookup_timeouts.append(request.extensions["timeout"]["read"])
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json={"live": True})
 
-    active_thread = threading.Thread(target=active_request)
-    active_thread.start()
-    assert active_started.wait(timeout=2)
-
-    _identity, key = _key("MCLOSEQUEUED")
-    claim = EvidenceClaim(
-        key,
-        "owner",
-        1,
-        datetime.now(UTC) + timedelta(seconds=60),
-        20.0,
-    )
-    renewal_errors: list[BaseException] = []
-
-    def renewal_request() -> None:
-        try:
-            store.renew_many((claim,))
-        except BaseException as error:
-            renewal_errors.append(error)
-
-    renewal_thread = threading.Thread(target=renewal_request)
-    renewal_thread.start()
-    deadline = time.monotonic() + 2
-    while store._claim_request_scheduler._queue.qsize() < 1:  # pyright: ignore[reportPrivateUsage]
-        assert time.monotonic() < deadline
-        time.sleep(0.001)
-
-    close_thread = threading.Thread(target=store.close)
-    close_thread.start()
-    renewal_thread.join(timeout=2)
-    assert not renewal_thread.is_alive()
-    assert not renewal_started.is_set()
-    assert close_thread.is_alive()
-
-    release_active.set()
-    active_thread.join(timeout=3)
-    close_thread.join(timeout=3)
-    assert not active_thread.is_alive()
-    assert not close_thread.is_alive()
-    assert not active_errors
-    assert len(renewal_errors) == 1
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            session.acquire_many((query,))
+            store._uploaded_artifact_digests.update(
+                payload.digest
+                for payload in (commit.normalized_artifact, commit.raw_artifact)
+                if payload is not None
+            )
+            session._renew_deadline = time.monotonic() + 0.4
+            with pytest.raises(StoreError):
+                session.finalize_many((commit,))
+    assert lookup_timeouts
+    assert all(0 < timeout <= 0.4 for timeout in lookup_timeouts)
 
 
-def test_http_store_close_interrupts_claim_retry_backoff(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    retry_waiting = threading.Event()
-    release_retry = threading.Event()
+def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> None:
+    commit = _hit_commit(tmp_path / "source", "MDETERMINISTICFINALIZE")
+    now = datetime.now(UTC)
+    lookup_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal lookup_calls
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": CommitModel.from_domain(commit).key.model_dump(
+                                    mode="json"
+                                ),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            return httpx.Response(422, text="invalid commit")
+        if request.url.path.endswith("/lookup"):
+            lookup_calls += 1
+            return httpx.Response(200, json={"records": []})
+        if request.method == "PUT":
+            return httpx.Response(
+                201,
+                json={
+                    "status": "created",
+                    "digest": request.url.path.rsplit("/", 1)[-1],
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        with store.claim_session() as session:
+            session.acquire_many((EvidenceQuery(commit.identity, commit.key),))
+            store._uploaded_artifact_digests.update(
+                payload.digest
+                for payload in (commit.normalized_artifact, commit.raw_artifact)
+                if payload is not None
+            )
+            with pytest.raises(StoreError, match="HTTP 422"):
+                session.finalize_many((commit,))
+    assert lookup_calls == 0
+
+
+def test_http_heartbeat_renews_before_request_deadline() -> None:
+    renewed = threading.Event()
+    now = datetime.now(UTC)
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(200, json=_claim_health())
         if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        return httpx.Response(503, headers={"Retry-After": "5"})
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 0.5,
+                },
+            )
+        if request.url.path.endswith("/renew"):
+            renewed.set()
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
-    original_wait = client_module.HttpEvidenceStore._wait_for_claim_retry
-
-    def observe_wait(store: HttpEvidenceStore, delay: float) -> bool:
-        retry_waiting.set()
-        result = original_wait(store, delay)
-        release_retry.set()
-        return result
-
-    monkeypatch.setattr(
-        client_module.HttpEvidenceStore,
-        "_wait_for_claim_retry",
-        observe_wait,
-    )
-    _identity, key = _key("MCLOSERETRY")
-    claim = EvidenceClaim(
-        key,
-        "owner",
-        1,
-        datetime.now(UTC) + timedelta(seconds=60),
-        20.0,
-    )
-    store = HttpEvidenceStore(
-        "http://testserver",
-        client=_claim_mock_client(httpx.MockTransport(handler)),
-    )
-    errors: list[BaseException] = []
-
-    def renew() -> None:
-        try:
-            store.renew_many((claim,))
-        except BaseException as error:
-            errors.append(error)
-
-    renewal_thread = threading.Thread(target=renew)
-    renewal_thread.start()
-    assert retry_waiting.wait(timeout=2)
-    store.close()
-    renewal_thread.join(timeout=2)
-
-    assert release_retry.is_set()
-    assert not renewal_thread.is_alive()
-    assert len(errors) == 1
-    assert isinstance(errors[0], StoreError)
-    assert "closed during claim request" in str(errors[0])
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        session = store.claim_session()
+        assert renewed.wait(1.0)
+        session.close()
 
 
-def test_http_renew_bounded_overload_fails_before_stale_chunk_starts(
+@pytest.mark.parametrize("renewal_failure", ["malformed", "authority-switch"])
+def test_http_heartbeat_invalid_success_is_terminal_session_loss(
+    renewal_failure: str,
+) -> None:
+    malformed = threading.Event()
+    now = datetime.now(UTC)
+    renewal_payloads: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json=_claim_health())
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 0.75,
+                },
+            )
+        if request.url.path.endswith("/renew"):
+            renewal_payloads.append(json.loads(request.content))
+            malformed.set()
+            if renewal_failure == "malformed":
+                return httpx.Response(200, json={})
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "other-session",
+                    "owner_token": "other-owner",
+                    "generation": 2,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
+
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        session = store.claim_session()
+        assert malformed.wait(1.5)
+        assert session.cancellation_signal.wait(0.5)
+        with pytest.raises(EvidenceClaimLostError):
+            session.raise_if_lost()
+        session.close()
+
+    assert len(renewal_payloads) == 1
+
+
+def test_http_heartbeat_applies_deterministic_session_jitter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    expiry = datetime.now(UTC) + timedelta(seconds=60)
-    claims = tuple(
-        EvidenceClaim(key, "owner", 1, expiry, 20.0)
-        for _identity, key in (
-            _key("MOVERLOAD" + "A" * (index + 1)) for index in range(33)
-        )
-    )
-    first_wave = threading.Barrier(client_module._MAX_CONCURRENT_CLAIM_REQUESTS)
-    active = 0
-    maximum_active = 0
-    request_count = 0
-    active_lock = threading.Lock()
-    original_budget = client_module._claim_request_budget  # pyright: ignore[reportPrivateUsage]
-
-    def controlled_budget(chunk):
-        if chunk[0].key == claims[-1].key:
-            return -1.0
-        return original_budget(chunk)
-
-    monkeypatch.setattr(client_module, "_claim_request_budget", controlled_budget)
+    renewed = threading.Event()
+    now = datetime.now(UTC)
+    started = time.monotonic()
+    monkeypatch.setattr("seqevi.store.client.random.uniform", lambda _a, _b: 0.8)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal active, maximum_active, request_count
         if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
+            return httpx.Response(200, json=_claim_health())
         if request.url.path.endswith("/capabilities"):
             return httpx.Response(
                 200,
                 json={
-                    "maximum_batch_size": 1,
-                    "lease_seconds": 60.0,
-                    "renewal_after_seconds": 20.0,
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
                 },
             )
-        body = json.loads(request.content)
-        returned = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-        with active_lock:
-            request_count += 1
-            active += 1
-            maximum_active = max(maximum_active, active)
-        try:
-            first_wave.wait(timeout=3)
-            renewed = EvidenceClaim(
-                returned.key,
-                returned.owner_token,
-                returned.generation,
-                datetime.now(UTC) + timedelta(seconds=60),
-                returned.renewal_after_seconds,
-            )
+        if request.url.path.endswith("/open") or request.url.path.endswith("/renew"):
+            if request.url.path.endswith("/renew"):
+                renewed.set()
             return httpx.Response(
                 200,
                 json={
-                    "claims": [
-                        EvidenceClaimModel.from_domain(renewed).model_dump(mode="json")
-                    ]
+                    "session_id": "session",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 0.2,
+                    "renew_deadline_seconds": 90,
                 },
             )
-        finally:
-            with active_lock:
-                active -= 1
+        return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(EvidenceClaimLostError, match="could not start"):
-            store.renew_many(claims)
-
-    assert request_count == 32
-    assert maximum_active == client_module._MAX_CONCURRENT_CLAIM_REQUESTS
-
-
-def test_http_renew_many_fails_instead_of_returning_stale_handles() -> None:
-    _identity, key = _key("MSTALERENEW")
-    claim = EvidenceClaim(
-        key,
-        "owner",
-        1,
-        datetime.now(UTC) + timedelta(seconds=60),
-        20.0,
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        stale = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-        returned = EvidenceClaim(
-            stale.key,
-            stale.owner_token,
-            stale.generation,
-            datetime.now(UTC) - timedelta(seconds=1),
-            stale.renewal_after_seconds,
-        )
-        return httpx.Response(
-            200,
-            json={
-                "claims": [
-                    EvidenceClaimModel.from_domain(returned).model_dump(mode="json")
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(EvidenceClaimLostError, match="authority runway"):
-            store.renew_many((claim,))
-
-
-def test_http_chunk_acquire_reconciles_terminal_winner_during_renewal() -> None:
-    first_identity, first_key = _key("MCHUNKTERMINAL")
-    second_identity, second_key = _key("MCHUNKREMAINDER")
-    queries = (
-        EvidenceQuery(first_identity, first_key),
-        EvidenceQuery(second_identity, second_key),
-    )
-    terminal = EvidenceRecord(
-        first_key,
-        EvidenceStatus.NO_HIT,
-        sha256_digest(b"terminal"),
-        None,
-        None,
-        datetime.now(UTC),
-    )
-    renewal_lost = threading.Event()
-    acquire_calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal acquire_calls
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(
-                200,
-                json={
-                    "maximum_batch_size": 1,
-                    "lease_seconds": 60.0,
-                    "renewal_after_seconds": 0.01,
-                },
-            )
-        if request.url.path.endswith("/renew"):
-            body = json.loads(request.content)
-            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-            if claim.key == first_key:
-                renewal_lost.set()
-                return httpx.Response(412, text="terminal won")
-            refreshed = EvidenceClaim(
-                claim.key,
-                claim.owner_token,
-                claim.generation,
-                datetime.now(UTC) + timedelta(seconds=60),
-                20.0,
-            )
-            return httpx.Response(
-                200,
-                json={
-                    "claims": [
-                        EvidenceClaimModel.from_domain(refreshed).model_dump(
-                            mode="json"
-                        )
-                    ]
-                },
-            )
-        if request.url.path.endswith("/lookup"):
-            return httpx.Response(
-                200,
-                json={
-                    "records": [
-                        EvidenceRecordModel.from_domain(terminal).model_dump(
-                            mode="json"
-                        )
-                    ]
-                },
-            )
-        body = json.loads(request.content)
-        acquire_calls += 1
-        if acquire_calls == 2:
-            assert renewal_lost.wait(timeout=1)
-        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
-        acquired = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=1),
-                0.01,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
-                        mode="json"
-                    )
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        results = store.acquire_many(queries, owner_token="owner")
-
-    assert results[0].disposition is ClaimDisposition.CACHED
-    assert results[0].record == terminal
-    assert results[1].disposition is ClaimDisposition.ACQUIRED
-
-
-def test_http_chunk_acquire_propagates_lookup_failure_and_releases_claim() -> None:
-    queries = tuple(
-        EvidenceQuery(identity, key)
-        for identity, key in (
-            _key(sequence) for sequence in ("MLOOKUPFAILA", "MLOOKUPFAILB")
-        )
-    )
-    renewal_lost = threading.Event()
-    released = threading.Event()
-    acquire_calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal acquire_calls
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(
-                200,
-                json={
-                    "maximum_batch_size": 1,
-                    "lease_seconds": 60.0,
-                    "renewal_after_seconds": 0.01,
-                },
-            )
-        if request.url.path.endswith("/renew"):
-            renewal_lost.set()
-            return httpx.Response(412, text="claim lost")
-        if request.url.path.endswith("/lookup"):
-            return httpx.Response(500, text="metadata lookup failed")
-        body = json.loads(request.content)
-        if request.url.path.endswith("/release"):
-            released.set()
-            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-            return httpx.Response(
-                200,
-                json={
-                    "released": [
-                        {
-                            "key": body["claims"][0]["key"],
-                            "generation": claim.generation,
-                        }
-                    ]
-                },
-            )
-        acquire_calls += 1
-        if acquire_calls == 2:
-            assert renewal_lost.wait(timeout=1)
-        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
-        acquired = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=1),
-                0.01,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
-                        mode="json"
-                    )
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(StoreError, match="metadata lookup failed"):
-            store.acquire_many(queries, owner_token="owner")
-
-    assert released.is_set()
-
-
-def test_http_acquire_failure_releases_earlier_chunks_without_masking_error() -> None:
-    queries = tuple(
-        EvidenceQuery(identity, key)
-        for identity, key in (_key(sequence) for sequence in ("MCLEANUPA", "MCLEANUPB"))
-    )
-    released: list[tuple[EvidenceKey, int]] = []
-    acquire_calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal acquire_calls
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        if request.url.path.endswith("/lookup"):
-            return httpx.Response(200, json={"records": []})
-        if request.url.path.endswith("/release"):
-            for data in body["claims"]:
-                claim = EvidenceClaimModel.model_validate(data).to_domain()
-                released.append((claim.key, claim.generation))
-            return httpx.Response(500, text="cleanup failed")
-        acquire_calls += 1
-        if acquire_calls == 2:
-            return httpx.Response(500, text="primary acquire failed")
-        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
-        acquired = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=60),
-                20.0,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
-                        mode="json"
-                    )
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(StoreError, match="primary acquire failed"):
-            store.acquire_many(queries, owner_token="owner")
-
-    assert released == [(queries[0].key, 1)]
-
-
-def test_http_background_renew_failure_releases_acquired_chunks() -> None:
-    queries = tuple(
-        EvidenceQuery(identity, key)
-        for identity, key in (_key(sequence) for sequence in ("MRENEWA", "MRENEWB"))
-    )
-    renew_failed = threading.Event()
-    released: list[EvidenceKey] = []
-    acquire_calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal acquire_calls
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(
-                200,
-                json={
-                    "maximum_batch_size": 1,
-                    "lease_seconds": 60.0,
-                    "renewal_after_seconds": 0.01,
-                },
-            )
-        body = json.loads(request.content)
-        if request.url.path.endswith("/renew"):
-            renew_failed.set()
-            return httpx.Response(500, text="renew failed")
-        if request.url.path.endswith("/release"):
-            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-            released.append(claim.key)
-            return httpx.Response(
-                200,
-                json={
-                    "released": [
-                        {
-                            "key": body["claims"][0]["key"],
-                            "generation": claim.generation,
-                        }
-                    ]
-                },
-            )
-        acquire_calls += 1
-        if acquire_calls == 2:
-            assert renew_failed.wait(timeout=1)
-        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
-        acquired = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=1),
-                0.01,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
-                        mode="json"
-                    )
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(StoreError, match="renew failed"):
-            store.acquire_many(queries, owner_token="owner")
-
-    assert released
-    assert queries[0].key in released
-
-
-def test_http_acquire_rejects_and_releases_expired_returned_authority() -> None:
-    identity, key = _key("MEXPIREDHTTP")
-    released = threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        if request.url.path.endswith("/lookup"):
-            return httpx.Response(200, json={"records": []})
-        if request.url.path.endswith("/release"):
-            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-            released.set()
-            return httpx.Response(
-                200,
-                json={
-                    "released": [
-                        {
-                            "key": body["claims"][0]["key"],
-                            "generation": claim.generation,
-                        }
-                    ]
-                },
-            )
-        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
-        expired = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) - timedelta(seconds=1),
-                20.0,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(expired).model_dump(mode="json")
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(EvidenceClaimLostError, match="authority runway"):
-            store.acquire_many((EvidenceQuery(identity, key),), owner_token="owner")
-
-    assert not released.is_set()
-
-
-def test_http_expired_handoff_releases_only_other_live_claims() -> None:
-    queries = tuple(
-        EvidenceQuery(identity, key)
-        for identity, key in (
-            _key(sequence) for sequence in ("MMIXEXPIRED", "MMIXLIVE")
-        )
-    )
-    released_keys: list[EvidenceKey] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(2))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        if request.url.path.endswith("/lookup"):
-            return httpx.Response(200, json={"records": []})
-        if request.url.path.endswith("/release"):
-            claims = tuple(
-                EvidenceClaimModel.model_validate(data).to_domain()
-                for data in body["claims"]
-            )
-            if any(claim.expires_at <= datetime.now(UTC) for claim in claims):
-                return httpx.Response(412, text="expired credential")
-            released_keys.extend(claim.key for claim in claims)
-            return httpx.Response(
-                200,
-                json={
-                    "released": [
-                        {"key": data["key"], "generation": claim.generation}
-                        for data, claim in zip(body["claims"], claims, strict=True)
-                    ]
-                },
-            )
-        results = []
-        for index, data in enumerate(body["queries"]):
-            query = EvidenceQueryModel.model_validate(data).to_domain()
-            claim = EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=-1 if index == 0 else 60),
-                20.0,
-            )
-            results.append(
-                ClaimAcquireResultModel.from_domain(
-                    ClaimAcquireResult(ClaimDisposition.ACQUIRED, claim=claim)
-                ).model_dump(mode="json")
-            )
-        return httpx.Response(200, json={"results": results})
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(EvidenceClaimLostError) as raised:
-            store.acquire_many(queries, owner_token="owner")
-
-    assert "expired authority runway" in str(raised.value)
-    assert released_keys == [queries[1].key]
-
-
-def test_http_handoff_rejects_six_second_lease_after_two_second_transport() -> None:
-    identity, key = _key("MTRANSPORTRUNWAY")
-    released = threading.Event()
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/health":
-            return httpx.Response(200, json=_claim_health(1))
-        if request.url.path.endswith("/capabilities"):
-            return httpx.Response(200, json=_claim_capabilities())
-        body = json.loads(request.content)
-        if request.url.path.endswith("/lookup"):
-            return httpx.Response(200, json={"records": []})
-        if request.url.path.endswith("/release"):
-            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-            released.set()
-            return httpx.Response(
-                200,
-                json={
-                    "released": [
-                        {
-                            "key": body["claims"][0]["key"],
-                            "generation": claim.generation,
-                        }
-                    ]
-                },
-            )
-        if request.url.path.endswith("/renew"):
-            claim = EvidenceClaimModel.model_validate(body["claims"][0]).to_domain()
-            delayed = EvidenceClaim(
-                claim.key,
-                claim.owner_token,
-                claim.generation,
-                datetime.now(UTC) + timedelta(seconds=6),
-                20.0,
-            )
-            time.sleep(2)
-            return httpx.Response(
-                200,
-                json={
-                    "claims": [
-                        EvidenceClaimModel.from_domain(delayed).model_dump(mode="json")
-                    ]
-                },
-            )
-        query = EvidenceQueryModel.model_validate(body["queries"][0]).to_domain()
-        acquired = ClaimAcquireResult(
-            ClaimDisposition.ACQUIRED,
-            claim=EvidenceClaim(
-                query.key,
-                body["owner_token"],
-                1,
-                datetime.now(UTC) + timedelta(seconds=6),
-                20.0,
-            ),
-        )
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    ClaimAcquireResultModel.from_domain(acquired).model_dump(
-                        mode="json"
-                    )
-                ]
-            },
-        )
-
-    client = _claim_mock_client(httpx.MockTransport(handler))
-    with HttpEvidenceStore("http://testserver", client=client) as store:
-        with pytest.raises(EvidenceClaimLostError, match="authority runway"):
-            store.acquire_many((EvidenceQuery(identity, key),), owner_token="owner")
-
-    assert released.is_set()
+    with HttpEvidenceStore(
+        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+    ) as store:
+        session = store.claim_session()
+        assert renewed.wait(1.0)
+        session.close()
+    assert time.monotonic() - started < 0.5
 
 
 def test_shared_store_configuration_requires_postgres_and_postgres_engine(
@@ -2959,18 +1650,18 @@ def test_postgres_advisory_locks_use_actual_signed_bigint_order() -> None:
             for key in keys
         }
     )
-    observed: list[int] = []
+    observed: list[list[int]] = []
 
     class RecordingConnection:
-        def execute(self, _statement: object, parameters: dict[str, int]) -> None:
-            observed.append(parameters["lock_id"])
+        def execute(self, _statement: object, parameters: dict[str, list[int]]) -> None:
+            observed.append(parameters["lock_ids"])
 
     persistence_module._lock_evidence_keys(  # pyright: ignore[reportPrivateUsage]
         cast(Connection, RecordingConnection()), reversed(keys)
     )
 
     assert any(lock_id < 0 for lock_id in expected)
-    assert observed == expected
+    assert observed == [expected]
 
 
 def test_postgres_advisory_locks_deduplicate_forced_collision(
@@ -2978,11 +1669,11 @@ def test_postgres_advisory_locks_deduplicate_forced_collision(
 ) -> None:
     keys = tuple(_key(sequence)[1] for sequence in ("MLOCKA", "MLOCKB", "MLOCKC"))
     lock_ids = {keys[0]: 4, keys[1]: -9, keys[2]: 4}
-    observed: list[int] = []
+    observed: list[list[int]] = []
 
     class RecordingConnection:
-        def execute(self, _statement: object, parameters: dict[str, int]) -> None:
-            observed.append(parameters["lock_id"])
+        def execute(self, _statement: object, parameters: dict[str, list[int]]) -> None:
+            observed.append(parameters["lock_ids"])
 
     monkeypatch.setattr(
         persistence_module, "_advisory_lock_id", lambda key: lock_ids[key]
@@ -2991,7 +1682,7 @@ def test_postgres_advisory_locks_deduplicate_forced_collision(
         cast(Connection, RecordingConnection()), reversed(keys)
     )
 
-    assert observed == [-9, 4]
+    assert observed == [[-9, 4]]
 
 
 def test_service_returns_422_for_invalid_domain_values_and_missing_raw_artifact(
@@ -3022,7 +1713,7 @@ def test_service_returns_422_for_invalid_domain_values_and_missing_raw_artifact(
             "byte_size": str(model["raw_artifact"]["byte_size"]),
         },
     }
-    app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
+    app = create_service_app(_settings(tmp_path), persistence=_memory_persistence())
 
     with TestClient(app) as client:
         invalid_response = client.post(
@@ -3065,7 +1756,7 @@ def test_annotation_results_are_equivalent_for_local_and_http_store(
             store=local_store,
         )
 
-    app = create_service_app(_settings(tmp_path), persistence=MemoryPersistence())
+    app = create_service_app(_settings(tmp_path), persistence=_memory_persistence())
     with TestClient(app) as test_client:
         remote_store = HttpEvidenceStore(
             "http://testserver",
@@ -3095,6 +1786,150 @@ def test_annotation_results_are_equivalent_for_local_and_http_store(
         read_result_table(tmp_path / "local-output", "main.sequence_map"),
         read_result_table(tmp_path / "remote-output", "main.sequence_map"),
     )
+
+
+def test_v020_request_contract_uses_only_released_legacy_routes(tmp_path: Path) -> None:
+    """Fixed request fixture derived from the released v0.2.0 HTTP client."""
+
+    persistence = _memory_persistence()
+    app = create_service_app(_settings(tmp_path), persistence=persistence)
+    _identity, key = _key("MVTWOCOMPATIBILITY")
+    key_json = EvidenceQueryModel.from_domain(
+        EvidenceQuery(_identity, key)
+    ).key.model_dump(mode="json")
+    with TestClient(app) as service:
+        health = service.get("/health")
+        lookup = service.post("/v1/evidence/lookup", json={"queries": []})
+        fetch = service.post("/v1/evidence/fetch", json={"key": key_json})
+        fetch_many = service.post("/v1/evidence/fetch-many", json={"keys": []})
+        commit = service.post("/v1/evidence/commit", json={"commits": []})
+        artifact = service.get("/v1/artifacts/" + "a" * 64)
+        removed = [
+            service.request(method, path, json={})
+            for method, path in (
+                ("GET", "/v1/evidence/claims/capabilities"),
+                ("POST", "/v1/evidence/claims/acquire"),
+                ("POST", "/v1/evidence/claims/renew"),
+                ("POST", "/v1/evidence/claims/release"),
+                ("POST", "/v1/evidence/claims/finalize"),
+            )
+        ]
+    assert health.json() == {
+        "status": "ok",
+        "api_version": "v1",
+        "maximum_batch_size": 1000,
+        "maximum_artifact_bytes": 512 * 1024 * 1024,
+    }
+    assert lookup.status_code == 200 and lookup.json() == {"records": []}
+    assert fetch.status_code == 200 and fetch.json() == {"record": None}
+    assert fetch_many.status_code == 200 and fetch_many.json() == {"records": []}
+    assert commit.status_code == 200 and commit.json() == {"outcomes": []}
+    assert artifact.status_code == 404
+    assert all(response.status_code == 404 for response in removed)
+
+
+@pytest.mark.parametrize(
+    "route",
+    ("open", "renew", "close", "acquire", "finalize"),
+)
+def test_claim_session_malformed_bodies_remain_422(tmp_path: Path, route: str) -> None:
+    app = create_service_app(_settings(tmp_path), persistence=_memory_persistence())
+    with TestClient(app) as service:
+        response = service.post(f"/v1/internal/claim-sessions/{route}", json={})
+    assert response.status_code == 422
+
+
+def test_claim_session_open_terminal_receipt_is_412(tmp_path: Path) -> None:
+    class TerminalOpenPersistence(MemoryPersistence):
+        @property
+        def supports_claim_sessions(self) -> bool:
+            return True
+
+        def open_claim_session(self, **_kwargs):
+            raise EvidenceClaimLostError("ClaimSession open receipt is terminal")
+
+    now = datetime.now(UTC)
+    app = create_service_app(
+        _settings(tmp_path),
+        persistence=cast(ServicePersistence, TerminalOpenPersistence()),
+    )
+    with TestClient(app) as service:
+        response = service.post(
+            "/v1/internal/claim-sessions/open",
+            json={
+                "open_request_id": "terminal-open",
+                "server_time": now.isoformat(),
+                "open_not_after": (now + timedelta(seconds=30)).isoformat(),
+            },
+        )
+    assert response.status_code == 412
+
+
+def test_claim_session_finalize_invalid_artifact_reference_is_422(
+    tmp_path: Path,
+) -> None:
+    commit = _hit_commit(tmp_path / "sources", "MINVALIDARTIFACT")
+    model = CommitModel.from_domain(commit).model_dump(mode="json")
+    assert model["normalized_artifact"] is not None
+    model["normalized_artifact"]["digest"] = "f" * 64
+    app = create_service_app(_settings(tmp_path), persistence=_memory_persistence())
+    with TestClient(app) as service:
+        response = service.post(
+            "/v1/internal/claim-sessions/finalize",
+            json={
+                "session_id": "session",
+                "owner_token": "owner",
+                "generation": 1,
+                "finalize_request_id": "invalid-artifact",
+                "commits": [{"commit": model, "claim_generation": 1}],
+            },
+        )
+    assert response.status_code == 422
+
+
+def test_claim_session_sweeper_retries_after_connection_failure(tmp_path: Path) -> None:
+    class RecoveringPersistence(MemoryPersistence):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sweeps = 0
+            self.recovered = threading.Event()
+
+        def sweep_claim_sessions(self) -> int:
+            self.sweeps += 1
+            if self.sweeps == 1:
+                raise StoreError("connection lost")
+            self.recovered.set()
+            return 0
+
+    persistence = RecoveringPersistence()
+    app = create_service_app(
+        _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
+    )
+    with TestClient(app):
+        assert persistence.recovered.wait(2.0)
+    assert persistence.sweeps >= 2
+
+
+def test_claim_session_authority_backpressure_is_503(tmp_path: Path) -> None:
+    class BackpressuredAuthorityPersistence(MemoryPersistence):
+        def claim_session_authority_is_live(self, _authority, _claims):
+            raise StoreBackpressureError("busy")
+
+    app = create_service_app(
+        _settings(tmp_path),
+        persistence=cast(ServicePersistence, BackpressuredAuthorityPersistence()),
+    )
+    with TestClient(app) as service:
+        response = service.post(
+            "/v1/internal/claim-sessions/authority",
+            json={
+                "session_id": "session",
+                "owner_token": "owner",
+                "generation": 1,
+                "claims": [],
+            },
+        )
+    assert response.status_code == 503
 
 
 @contextmanager
@@ -3202,28 +2037,6 @@ def _snapshot_legacy_rows(connection) -> dict[str, tuple[tuple[object, ...], ...
     }
 
 
-def test_sqlite_0002_to_0003_preserves_every_legacy_field(tmp_path: Path) -> None:
-    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'migration.sqlite3'}")
-    config = Config()
-    config.set_main_option(
-        "script_location",
-        str(Path(store_migration.__file__).with_name("migrations")),
-    )
-    try:
-        with engine.connect() as connection:
-            config.attributes["connection"] = connection
-            command.upgrade(config, "0002_artifact_byte_size_bigint")
-            _seed_0002_evidence(connection)
-            connection.commit()
-            before = _snapshot_legacy_rows(connection)
-            command.upgrade(config, "0003_evidence_claim_leases")
-            connection.commit()
-            after = _snapshot_legacy_rows(connection)
-        assert after == before
-    finally:
-        engine.dispose()
-
-
 @pytest.mark.requires_postgres
 def test_postgres_migrates_artifact_byte_size_from_integer_to_bigint() -> None:
     with _isolated_postgres_url() as database_url:
@@ -3259,10 +2072,275 @@ def test_postgres_migrates_artifact_byte_size_from_integer_to_bigint() -> None:
                 tables = inspect(connection).get_table_names()
             assert initial_type == "integer"
             assert upgraded_type == "bigint"
-            assert "evidence_claim" in tables
+            assert "evidence_claim" not in tables
+            assert {
+                "claim_sessions",
+                "session_claims",
+                "evidence_claim_generations",
+                "claim_session_open_receipts",
+                "claim_session_acquire_receipts",
+                "claim_session_acquire_receipt_items",
+            } <= set(tables)
             assert rows_after == rows_before
         finally:
             scoped_engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_upgrade_arms_syncs_resets_and_preserves_rows() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            _seed_0002_evidence(connection)
+            before = _snapshot_legacy_rows(connection)
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0003_evidence_claim_leases",
+        )
+        store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == "0004_claim_sessions"
+            )
+            assert _snapshot_legacy_rows(connection) == before
+            assert connection.exec_driver_sql(
+                "SHOW transaction_timeout"
+            ).scalar_one() in {"0", "0ms"}
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+def test_postgres_maintenance_classifies_commit_after_operation_deadline(
+    monkeypatch: pytest.MonkeyPatch, direction: str
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        source_revision = (
+            "0003_evidence_claim_leases"
+            if direction == "upgrade"
+            else "0004_claim_sessions"
+        )
+        target_revision = (
+            "0004_claim_sessions"
+            if direction == "upgrade"
+            else "0003_evidence_claim_leases"
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, source_revision)
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision=source_revision,
+        )
+        run_name = f"_run_maintenance_{direction}"
+        original = getattr(store_migration, run_name)
+
+        def committed_late(*args, **kwargs):
+            original(*args, **kwargs)
+            time.sleep(1.05)
+            raise store_migration._AmbiguousMaintenanceCommit(  # pyright: ignore[reportPrivateUsage]
+                "commit returned after operation deadline"
+            )
+
+        monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 1.0)
+        monkeypatch.setattr(
+            store_migration, "_MAINTENANCE_READBACK_TIMEOUT_SECONDS", 1.0
+        )
+        monkeypatch.setattr(store_migration, run_name, committed_late)
+        if direction == "upgrade":
+            store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        else:
+            store_migration.maintenance_downgrade_database(
+                engine, None, acknowledgement
+            )
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == target_revision
+            )
+        engine.dispose()
+
+
+def test_sqlite_maintenance_classifies_commit_after_operation_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    engine = create_engine(f"sqlite+pysqlite:///{store_root / 'store.sqlite3'}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0003_evidence_claim_leases")
+        connection.commit()
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+        expected_revision="0003_evidence_claim_leases",
+    )
+    original = store_migration._run_maintenance_upgrade  # pyright: ignore[reportPrivateUsage]
+
+    def committed_late(*args, **kwargs):
+        original(*args, **kwargs)
+        time.sleep(0.25)
+        raise store_migration._AmbiguousMaintenanceCommit(  # pyright: ignore[reportPrivateUsage]
+            "commit returned after operation deadline"
+        )
+
+    monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(store_migration, "_MAINTENANCE_READBACK_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(store_migration, "_run_maintenance_upgrade", committed_late)
+    store_migration.maintenance_upgrade_database(engine, store_root, acknowledgement)
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            == "0004_claim_sessions"
+        )
+    engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_fenced_downgrade_recreates_empty_0003_coordination() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        persistence = PostgresEvidencePersistence.open(database_url)
+        persistence.close()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0004_claim_sessions",
+        )
+        store_migration.maintenance_downgrade_database(engine, None, acknowledgement)
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == "0003_evidence_claim_leases"
+            )
+            assert (
+                connection.execute(
+                    text("SELECT count(*) FROM evidence_claim")
+                ).scalar_one()
+                == 0
+            )
+            tables = set(inspect(connection).get_table_names())
+            assert "claim_sessions" not in tables
+            assert "evidence_claim" in tables
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_upgrade_stale_ack_on_0004_is_not_reconciled_as_success() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        persistence.close()
+        engine = create_engine(database_url)
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0003_evidence_claim_leases",
+        )
+        with pytest.raises(Exception):
+            store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_downgrade_stale_ack_on_0003_is_not_reconciled_as_success() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0004_claim_sessions",
+        )
+        with pytest.raises(Exception):
+            store_migration.maintenance_downgrade_database(
+                engine, None, acknowledgement
+            )
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_reset_failure_invalidates_after_committed_upgrade() -> (
+    None
+):
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0003_evidence_claim_leases",
+        )
+        failed_connection_ids: list[int] = []
+
+        def fail_reset(
+            connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            if statement == "RESET transaction_timeout":
+                failed_connection_ids.append(id(connection))
+                raise RuntimeError("injected reset failure")
+
+        event.listen(engine, "before_cursor_execute", fail_reset)
+        with pytest.raises(RuntimeError, match="injected reset failure"):
+            store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        event.remove(engine, "before_cursor_execute", fail_reset)
+        with engine.connect() as replacement:
+            assert id(replacement.connection) not in failed_connection_ids
+            assert replacement.exec_driver_sql(
+                "SHOW transaction_timeout"
+            ).scalar_one() in {"0", "0ms"}
+            assert (
+                replacement.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == "0004_claim_sessions"
+            )
+        engine.dispose()
 
 
 @pytest.mark.requires_postgres
@@ -3334,552 +2412,635 @@ def test_postgres_concurrent_identical_commits_are_idempotent(tmp_path: Path) ->
 
 
 @pytest.mark.requires_postgres
-def test_postgres_claim_lifecycle_expiry_stale_and_terminal_convergence(
-    tmp_path: Path,
-) -> None:
+def test_postgres_http_claim_session_end_to_end(tmp_path: Path) -> None:
     with _isolated_postgres_url() as database_url:
-        commit = _hit_commit(tmp_path / "sources", "MPOSTGRESLEASE")
-        query = EvidenceQuery(commit.identity, commit.key)
-
-        def acquire(owner: str) -> ClaimAcquireResult:
-            persistence = PostgresEvidencePersistence.open(database_url)
-            try:
-                return persistence.acquire_many((query,), owner_token=owner)[0]
-            finally:
-                persistence.close()
-
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            decisions = tuple(executor.map(acquire, ("owner-a", "owner-b", "owner-c")))
-        assert [item.disposition for item in decisions].count(
-            ClaimDisposition.ACQUIRED
-        ) == 1
-        assert [item.disposition for item in decisions].count(
-            ClaimDisposition.BUSY
-        ) == 2
-        winner = next(item.claim for item in decisions if item.claim is not None)
-        assert winner is not None
-
         persistence = PostgresEvidencePersistence.open(database_url)
-        try:
-            model = CommitModel.from_domain(commit)
-            assert model.normalized_artifact is not None
-            assert model.raw_artifact is not None
-            stored = {
-                reference.digest: StoredArtifact(
-                    digest=reference.digest,
-                    media_type=reference.media_type,
-                    byte_size=reference.byte_size,
-                    relative_path=f"fixture/{reference.digest}",
-                )
-                for reference in (model.normalized_artifact, model.raw_artifact)
-            }
-            with pytest.raises(ValueError, match="duplicate"):
-                persistence.renew_many((winner, winner))
-            with pytest.raises(ValueError, match="duplicate"):
-                persistence.release_many((winner, winner))
-            duplicate_finalize = ClaimedCommitModel.from_domain(
-                ClaimedEvidenceCommit(commit, winner)
-            )
-            with pytest.raises(ValueError, match="duplicate"):
-                persistence.finalize_many(
-                    (duplicate_finalize, duplicate_finalize), stored
-                )
-            renewed = persistence.renew_many((winner,))[0]
-            with persistence.engine.begin() as connection:
-                connection.execute(
-                    update(evidence_claims).values(
-                        expires_at=datetime.now(UTC) - timedelta(seconds=1)
-                    )
-                )
-            with pytest.raises(StoreError):
-                persistence.renew_many((renewed,))
-            with pytest.raises(StoreError):
-                persistence.release_many((renewed,))
-            with pytest.raises(StoreError):
-                persistence.finalize_many(
-                    (
-                        ClaimedCommitModel.from_domain(
-                            ClaimedEvidenceCommit(commit, renewed)
-                        ),
-                    ),
-                    stored,
-                )
-
-            takeover = persistence.acquire_many(
-                (query,), owner_token=winner.owner_token
-            )[0].claim
-            assert takeover is not None
-            assert takeover.generation == renewed.generation + 1
-            persistence.release_many((takeover,))
-            reacquired = persistence.acquire_many(
-                (query,), owner_token=winner.owner_token
-            )[0].claim
-            assert reacquired is not None
-            assert reacquired.generation == takeover.generation + 1
-            with pytest.raises(StoreError):
-                persistence.renew_many((takeover,))
-            with pytest.raises(StoreError):
-                persistence.release_many((takeover,))
-            with pytest.raises(StoreError):
-                persistence.finalize_many(
-                    (
-                        ClaimedCommitModel.from_domain(
-                            ClaimedEvidenceCommit(commit, takeover)
-                        ),
-                    ),
-                    stored,
-                )
-            assert persistence.finalize_many(
-                (
-                    ClaimedCommitModel.from_domain(
-                        ClaimedEvidenceCommit(commit, reacquired)
-                    ),
-                ),
-                stored,
-            ) == (CommitOutcome.CREATED,)
-            cached = persistence.acquire_many((query,), owner_token="peer")[0]
-            with persistence.engine.connect() as connection:
-                claim_rows = connection.execute(
-                    select(func.count()).select_from(evidence_claims)
-                ).scalar_one()
-        finally:
-            persistence.close()
-
-    assert cached.disposition is ClaimDisposition.CACHED
-    assert claim_rows == 0
-
-
-@pytest.mark.requires_postgres
-def test_postgres_exact_expiry_loses_all_authority_and_reacquires(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    with _isolated_postgres_url() as database_url:
-        commit = _hit_commit(tmp_path / "sources", "MEXACTEXPIRY")
+        app = create_service_app(_settings(tmp_path), persistence=persistence)
+        commit = _hit_commit(tmp_path / "session-sources", "MPOSTGRESSESSION")
         query = EvidenceQuery(commit.identity, commit.key)
-        persistence = PostgresEvidencePersistence.open(database_url)
-        try:
-            claim = persistence.acquire_many((query,), owner_token="owner")[0].claim
-            assert claim is not None
-            model = CommitModel.from_domain(commit)
-            references = (model.normalized_artifact, model.raw_artifact)
-            stored = {
-                reference.digest: StoredArtifact(
-                    digest=reference.digest,
-                    media_type=reference.media_type,
-                    byte_size=reference.byte_size,
-                    relative_path=f"fixture/{reference.digest}",
-                )
-                for reference in references
-                if reference is not None
-            }
-            decision_time = datetime.now(UTC) + timedelta(seconds=1)
-            with persistence.engine.begin() as connection:
-                connection.execute(
-                    update(evidence_claims).values(expires_at=decision_time)
-                )
-
-            class FrozenDateTime(datetime):
-                @classmethod
-                def now(cls, tz=None):
-                    return (
-                        decision_time
-                        if tz is not None
-                        else decision_time.replace(tzinfo=None)
-                    )
-
-            monkeypatch.setattr(persistence_module, "datetime", FrozenDateTime)
-            with pytest.raises(EvidenceClaimLostError):
-                persistence.renew_many((claim,))
-            with pytest.raises(EvidenceClaimLostError):
-                persistence.release_many((claim,))
-            with pytest.raises(EvidenceClaimLostError):
-                persistence.finalize_many(
-                    (
-                        ClaimedCommitModel.from_domain(
-                            ClaimedEvidenceCommit(commit, claim)
-                        ),
-                    ),
-                    stored,
-                )
-            reacquired = persistence.acquire_many((query,), owner_token="owner")[
-                0
-            ].claim
-        finally:
-            persistence.close()
-
-    assert reacquired is not None
-    assert reacquired.generation == claim.generation + 1
-
-
-@pytest.mark.requires_postgres
-def test_postgres_legacy_commit_retires_active_claim(tmp_path: Path) -> None:
-    with _isolated_postgres_url() as database_url:
-        commit = _hit_commit(tmp_path / "sources", "MLEGACYCLAIM")
-        query = EvidenceQuery(commit.identity, commit.key)
-        persistence = PostgresEvidencePersistence.open(database_url)
-        try:
-            with pytest.raises(ValueError, match="duplicate"):
-                persistence.acquire_many(
-                    (query, _distinct_query_with_same_key(query)),
-                    owner_token="duplicate",
-                )
-            claim = persistence.acquire_many((query,), owner_token="new-client")[
-                0
-            ].claim
-            assert claim is not None
-            model = CommitModel.from_domain(commit)
-            assert model.normalized_artifact is not None
-            assert model.raw_artifact is not None
-            stored = {
-                reference.digest: StoredArtifact(
-                    digest=reference.digest,
-                    media_type=reference.media_type,
-                    byte_size=reference.byte_size,
-                    relative_path=f"fixture/{reference.digest}",
-                )
-                for reference in (model.normalized_artifact, model.raw_artifact)
-            }
-            assert persistence.commit_many((model,), stored) == (CommitOutcome.CREATED,)
-            cached = persistence.acquire_many((query,), owner_token="peer")[0]
-            with persistence.engine.connect() as connection:
-                claim_rows = connection.execute(
-                    select(func.count()).select_from(evidence_claims)
-                ).scalar_one()
-            with pytest.raises(EvidenceClaimLostError):
-                persistence.renew_many((claim,))
-        finally:
-            persistence.close()
-
-    assert cached.disposition is ClaimDisposition.CACHED
-    assert claim_rows == 0
-
-
-@pytest.mark.requires_postgres
-def test_postgres_legacy_commit_serializes_absent_claim_acquire(tmp_path: Path) -> None:
-    with _isolated_postgres_url() as database_url:
-        commit = _hit_commit(tmp_path / "sources", "MABSENTCLAIMRACE")
-        query = EvidenceQuery(commit.identity, commit.key)
-        model = CommitModel.from_domain(commit)
-        references = (model.normalized_artifact, model.raw_artifact)
-        stored = {
-            reference.digest: StoredArtifact(
-                digest=reference.digest,
-                media_type=reference.media_type,
-                byte_size=reference.byte_size,
-                relative_path=f"fixture/{reference.digest}",
-            )
-            for reference in references
-            if reference is not None
-        }
-        writer = PostgresEvidencePersistence.open(database_url)
-        acquirer = PostgresEvidencePersistence.open(database_url)
-        legacy_thread: list[int] = []
-        legacy_has_key_lock = threading.Event()
-        allow_legacy_commit = threading.Event()
-        acquirer_reached_key_lock = threading.Event()
-
-        def pause_after_key_lock(
-            _connection: object,
-            _cursor: object,
-            statement: str,
-            _parameters: object,
-            _context: object,
-            _executemany: object,
-        ) -> None:
-            if (
-                legacy_thread
-                and threading.get_ident() == legacy_thread[0]
-                and statement.lstrip().startswith("DELETE FROM evidence_claim")
-            ):
-                legacy_has_key_lock.set()
-                assert allow_legacy_commit.wait(timeout=10)
-
-        event.listen(writer.engine, "before_cursor_execute", pause_after_key_lock)
-
-        def observe_acquirer_key_lock(
-            _connection: object,
-            _cursor: object,
-            statement: str,
-            _parameters: object,
-            _context: object,
-            _executemany: object,
-        ) -> None:
-            if "pg_advisory_xact_lock" in statement:
-                acquirer_reached_key_lock.set()
-
-        event.listen(
-            acquirer.engine, "before_cursor_execute", observe_acquirer_key_lock
-        )
-        try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-
-                def publish_legacy():
-                    legacy_thread.append(threading.get_ident())
-                    return writer.commit_many((model,), stored)
-
-                published = executor.submit(publish_legacy)
-                assert legacy_has_key_lock.wait(timeout=10)
-                acquired = executor.submit(
-                    acquirer.acquire_many, (query,), owner_token="calculator"
-                )
-                assert acquirer_reached_key_lock.wait(timeout=10)
-                assert not acquired.done()
-                allow_legacy_commit.set()
-                assert published.result(timeout=10) == (CommitOutcome.CREATED,)
-                decision = acquired.result(timeout=10)[0]
-        finally:
-            allow_legacy_commit.set()
-            event.remove(writer.engine, "before_cursor_execute", pause_after_key_lock)
-            event.remove(
-                acquirer.engine, "before_cursor_execute", observe_acquirer_key_lock
-            )
-            writer.close()
-            acquirer.close()
-
-    assert decision.disposition is ClaimDisposition.CACHED
-    assert decision.claim is None
-
-
-@pytest.mark.requires_postgres
-def test_postgres_legacy_commit_and_finalize_share_lock_order(tmp_path: Path) -> None:
-    with _isolated_postgres_url() as database_url:
-        commits = (
-            _hit_commit(tmp_path / "sources-a", "MCOMMITFINALIZEORDERA"),
-            _hit_commit(tmp_path / "sources-b", "MCOMMITFINALIZEORDERB"),
-        )
-        queries = tuple(
-            EvidenceQuery(commit.identity, commit.key) for commit in commits
-        )
-        persistence = PostgresEvidencePersistence.open(database_url)
-        decisions = persistence.acquire_many(queries, owner_token="calculator")
-        claims = tuple(decision.claim for decision in decisions)
-        assert all(claim is not None for claim in claims)
-        models = tuple(CommitModel.from_domain(commit) for commit in commits)
-        references = {
-            reference.digest: reference
-            for model in models
-            for reference in (model.normalized_artifact, model.raw_artifact)
-            if reference is not None
-        }
-        stored = {
-            reference.digest: StoredArtifact(
-                digest=reference.digest,
-                media_type=reference.media_type,
-                byte_size=reference.byte_size,
-                relative_path=f"fixture/{reference.digest}",
-            )
-            for reference in references.values()
-        }
-        claimed = tuple(
-            ClaimedCommitModel.from_domain(ClaimedEvidenceCommit(commit, claim))
-            for commit, claim in zip(commits, claims, strict=True)
-            if claim is not None
-        )
-        start = threading.Barrier(2)
-        try:
-
-            def legacy_commit():
-                start.wait(timeout=10)
-                return persistence.commit_many(models, stored)
-
-            def claimed_finalize():
-                start.wait(timeout=10)
-                try:
-                    return persistence.finalize_many(tuple(reversed(claimed)), stored)
-                except EvidenceClaimLostError:
-                    return "lost"
-
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                legacy = executor.submit(legacy_commit)
-                finalize = executor.submit(claimed_finalize)
-                legacy_result = legacy.result(timeout=15)
-                finalize_result = finalize.result(timeout=15)
-        finally:
-            cached = persistence.acquire_many(queries, owner_token="peer")
-            persistence.close()
-
-    assert legacy_result in {
-        (CommitOutcome.CREATED, CommitOutcome.CREATED),
-        (CommitOutcome.EXISTING, CommitOutcome.EXISTING),
-    }
-    assert finalize_result in {
-        (CommitOutcome.CREATED, CommitOutcome.CREATED),
-        "lost",
-    }
-    assert all(item.disposition is ClaimDisposition.CACHED for item in cached)
-
-
-@pytest.mark.requires_postgres
-def test_postgres_different_keys_share_sequence_and_artifact_write_order(
-    tmp_path: Path,
-) -> None:
-    with _isolated_postgres_url() as database_url:
-        claimed_commit = _hit_commit(tmp_path / "sources", "MSHAREDROWS")
-        legacy_key = EvidenceKey.from_parameters(
-            sequence_id=claimed_commit.identity.sequence_id,
-            adapter_contract_version=claimed_commit.key.adapter_contract_version,
-            tool_runtime_digest=claimed_commit.key.tool_runtime_digest,
-            resource_id=claimed_commit.key.resource_id,
-            semantic_parameters={"threshold": 0.02},
-        )
-        legacy_commit = EvidenceCommit(
-            identity=claimed_commit.identity,
-            key=legacy_key,
-            status=claimed_commit.status,
-            payload_digest=claimed_commit.payload_digest,
-            normalized_artifact=claimed_commit.normalized_artifact,
-            raw_artifact=claimed_commit.raw_artifact,
-        )
-        finalizer = PostgresEvidencePersistence.open(database_url)
-        legacy = PostgresEvidencePersistence.open(database_url)
-        query = EvidenceQuery(claimed_commit.identity, claimed_commit.key)
-        claim = finalizer.acquire_many((query,), owner_token="calculator")[0].claim
-        assert claim is not None
-        claimed_model = ClaimedCommitModel.from_domain(
-            ClaimedEvidenceCommit(claimed_commit, claim)
-        )
-        legacy_model = CommitModel.from_domain(legacy_commit)
-        references = (legacy_model.normalized_artifact, legacy_model.raw_artifact)
-        stored = {
-            reference.digest: StoredArtifact(
-                digest=reference.digest,
-                media_type=reference.media_type,
-                byte_size=reference.byte_size,
-                relative_path=f"fixture/{reference.digest}",
-            )
-            for reference in references
-            if reference is not None
-        }
-        finalizer_inserted_sequence = threading.Event()
-        release_finalizer = threading.Event()
-        legacy_attempted_sequence = threading.Event()
-        operation_threads: dict[str, int] = {}
-        shared_insert_order: dict[int, list[str]] = {}
-
-        def record_shared_insert(
-            _connection: object,
-            _cursor: object,
-            statement: str,
-            _parameters: object,
-            _context: object,
-            _executemany: object,
-        ) -> None:
-            table = next(
-                (
-                    name
-                    for name in ("sequence", "artifact")
-                    if statement.startswith(f"INSERT INTO {name}")
-                ),
-                None,
-            )
-            if table is None:
-                return
-            thread_id = threading.get_ident()
-            shared_insert_order.setdefault(thread_id, []).append(table)
-            if thread_id == operation_threads.get("legacy") and table == "sequence":
-                legacy_attempted_sequence.set()
-
-        def pause_finalizer_after_sequence(
-            _connection: object,
-            _cursor: object,
-            statement: str,
-            _parameters: object,
-            _context: object,
-            _executemany: object,
-        ) -> None:
-            if threading.get_ident() == operation_threads.get(
-                "finalizer"
-            ) and statement.startswith("INSERT INTO sequence"):
-                finalizer_inserted_sequence.set()
-                assert release_finalizer.wait(timeout=10)
-
-        for engine in (finalizer.engine, legacy.engine):
-            event.listen(engine, "before_cursor_execute", record_shared_insert)
-        event.listen(
-            finalizer.engine, "after_cursor_execute", pause_finalizer_after_sequence
-        )
-        try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-
-                def finalize_claim():
-                    operation_threads["finalizer"] = threading.get_ident()
-                    return finalizer.finalize_many((claimed_model,), stored)
-
-                def commit_legacy():
-                    operation_threads["legacy"] = threading.get_ident()
-                    return legacy.commit_many((legacy_model,), stored)
-
-                finalized = executor.submit(finalize_claim)
-                assert finalizer_inserted_sequence.wait(timeout=10)
-                committed = executor.submit(commit_legacy)
-                assert legacy_attempted_sequence.wait(timeout=10)
-                assert not committed.done()
-                release_finalizer.set()
-                assert finalized.result(timeout=10) == (CommitOutcome.CREATED,)
-                assert committed.result(timeout=10) == (CommitOutcome.CREATED,)
-        finally:
-            release_finalizer.set()
-            for engine in (finalizer.engine, legacy.engine):
-                event.remove(engine, "before_cursor_execute", record_shared_insert)
-            event.remove(
-                finalizer.engine,
-                "after_cursor_execute",
-                pause_finalizer_after_sequence,
-            )
-            finalizer.close()
-            legacy.close()
-
-    assert shared_insert_order[operation_threads["finalizer"]][:2] == [
-        "sequence",
-        "artifact",
-    ]
-    assert shared_insert_order[operation_threads["legacy"]][:2] == [
-        "sequence",
-        "artifact",
-    ]
-
-
-@pytest.mark.requires_postgres
-def test_postgres_claim_batches_lock_in_canonical_order(tmp_path: Path) -> None:
-    with _isolated_postgres_url() as database_url:
-        commits = (
-            _hit_commit(tmp_path / "sources-a", "MLOCKORDERA"),
-            _hit_commit(tmp_path / "sources-b", "MLOCKORDERB"),
-        )
-        queries = tuple(
-            EvidenceQuery(commit.identity, commit.key) for commit in commits
-        )
-
-        first_persistence = PostgresEvidencePersistence.open(database_url)
-        second_persistence = PostgresEvidencePersistence.open(database_url)
-        start = threading.Barrier(2)
-
-        def acquire(
-            persistence: PostgresEvidencePersistence,
-            order: tuple[EvidenceQuery, ...],
-            owner: str,
+        with (
+            TestClient(app) as service,
+            HttpEvidenceStore("http://testserver", client=service) as store,
         ):
-            start.wait(timeout=10)
-            return persistence.acquire_many(order, owner_token=owner)
+            assert store.supports_claim_sessions
+            with store.claim_session() as session:
+                decision = session.acquire_many((query,))[0]
+                assert decision.disposition is ClaimDisposition.ACQUIRED
+                assert session.finalize_many((commit,)) == (CommitOutcome.CREATED,)
+            fetched = store.fetch(commit.key)
+            assert fetched is not None
+            assert fetched.record.payload_digest == commit.payload_digest
 
-        try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                first = executor.submit(acquire, first_persistence, queries, "owner-a")
-                second = executor.submit(
-                    acquire,
-                    second_persistence,
-                    tuple(reversed(queries)),
-                    "owner-b",
+
+@pytest.mark.requires_postgres
+def test_postgres_http_annotation_uses_one_claim_session(tmp_path: Path) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        app = create_service_app(_settings(tmp_path), persistence=persistence)
+        fasta = tmp_path / "claim-session.fasta"
+        fasta.write_text(">one\nMPEPTIDE\n>two\nMSEQUENCE\n", encoding="utf-8")
+        adapter = FixtureAdapter(
+            executable=write_fixture_tool(tmp_path / "fixture-tool-session"),
+            database=write_fixture_database(tmp_path / "database-session"),
+        )
+        with TestClient(app) as service:
+            capability = service.get("/v1/internal/claim-sessions/capabilities")
+            with HttpEvidenceStore("http://testserver", client=service) as store:
+                summary = run_annotation(
+                    fasta_path=fasta,
+                    output_dir=tmp_path / "session-output",
+                    adapter=adapter,
+                    store=store,
                 )
-                decisions = (first.result(timeout=15), second.result(timeout=15))
-        finally:
-            first_persistence.close()
-            second_persistence.close()
+            with persistence.engine.connect() as connection:
+                session_count = connection.execute(
+                    select(func.count()).select_from(claim_sessions)
+                ).scalar_one()
+        assert capability.status_code == 200
+        assert capability.json()["protocol"] == "claim-session-v1"
+        assert summary.computed == 2
+        assert session_count <= 1
 
-    assert sorted(
-        sum(item.disposition is ClaimDisposition.ACQUIRED for item in result)
-        for result in decisions
-    ) == [0, 2]
+
+@pytest.mark.requires_postgres
+def test_postgres_acquire_receipt_replays_fixed_width_result(tmp_path: Path) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        commit = _hit_commit(tmp_path / "receipt-sources", "MRECEIPTREPLAY")
+        query = EvidenceQuery(commit.identity, commit.key)
+        model = EvidenceQueryModel.from_domain(query)
+        digest = canonical_query_digest([model])
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-receipt-replay",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        try:
+            first = persistence.acquire_claim_session(
+                authority,
+                acquire_request_id="acquire-receipt-replay",
+                query_digest=digest,
+                queries=(query,),
+            )
+            replay = persistence.acquire_claim_session(
+                authority,
+                acquire_request_id="acquire-receipt-replay",
+                query_digest=digest,
+                queries=(query,),
+            )
+            assert replay == first
+            with persistence.engine.connect() as connection:
+                assert (
+                    connection.execute(
+                        select(claim_session_acquire_receipts.c.query_digest)
+                    ).scalar_one()
+                    == digest
+                )
+                item = (
+                    connection.execute(select(claim_session_acquire_receipt_items))
+                    .mappings()
+                    .one()
+                )
+                assert set(item) == {
+                    "session_id",
+                    "request_id",
+                    "input_index",
+                    "outcome",
+                    "generation",
+                    "busy_expires_at",
+                    "evidence_created_at",
+                }
+            persistence.close_claim_session(authority)
+            with persistence.engine.connect() as connection:
+                assert (
+                    connection.execute(select(claim_sessions.c.state)).scalar_one()
+                    == "closing"
+                )
+        finally:
+            persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_finalize_rejects_conflicting_artifact_metadata(
+    tmp_path: Path,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        commit = _hit_commit(tmp_path / "artifact-conflict", "MARTIFACTCONFLICT")
+        query = EvidenceQuery(commit.identity, commit.key)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-artifact-conflict",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        claim = persistence.acquire_claim_session(
+            authority,
+            acquire_request_id="acquire-artifact-conflict",
+            query_digest=canonical_query_digest(
+                [EvidenceQueryModel.from_domain(query)]
+            ),
+            queries=(query,),
+        )[0].claim
+        assert claim is not None and commit.normalized_artifact is not None
+        artifact = commit.normalized_artifact
+        with persistence.engine.begin() as connection:
+            connection.execute(
+                artifacts.insert().values(
+                    digest=artifact.digest,
+                    media_type="application/conflict",
+                    byte_size=artifact.byte_size,
+                    relative_path="conflict/path",
+                )
+            )
+        item = ClaimSessionFinalizeItem(
+            commit=CommitModel.from_domain(commit), claim_generation=claim.generation
+        )
+        stored = {
+            artifact.digest: StoredArtifact(
+                artifact.digest,
+                artifact.media_type,
+                artifact.byte_size,
+                "expected/path",
+            )
+        }
+        with pytest.raises(StoreIntegrityError, match="artifact metadata conflict"):
+            persistence.finalize_claim_session(authority, (item,), stored)
+        persistence.close()
+
+
+@pytest.mark.requires_postgres
+@pytest.mark.parametrize("claim_count", [0, 1, 250, 1000])
+def test_postgres_renew_and_close_statement_counts_are_o1(
+    tmp_path: Path, claim_count: int
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id=f"open-o1-{claim_count}",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        if claim_count:
+            queries = tuple(
+                EvidenceQuery(identity, key)
+                for identity, key in (
+                    _key("M" + "A" * (index + 1) + "C") for index in range(claim_count)
+                )
+            )
+            persistence.acquire_claim_session(
+                authority,
+                acquire_request_id=f"acquire-o1-{claim_count}",
+                query_digest=canonical_query_digest(
+                    [EvidenceQueryModel.from_domain(query) for query in queries]
+                ),
+                queries=queries,
+            )
+        statements: list[str] = []
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            statements.append(statement)
+
+        event.listen(persistence.engine, "before_cursor_execute", record_statement)
+        try:
+            renewed = persistence.renew_claim_session(authority)
+            renew_count = len(statements)
+            statements.clear()
+            persistence.close_claim_session(renewed)
+            close_count = len(statements)
+        finally:
+            event.remove(persistence.engine, "before_cursor_execute", record_statement)
+            persistence.close()
+        assert renew_count == 5
+        assert close_count == 5
+
+
+@pytest.mark.requires_postgres
+def test_postgres_renew_uses_live_clock_and_sweeper_skips_locked_session() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-renew-sweep-interleave",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        renew_statements: list[str] = []
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            renew_statements.append(statement)
+
+        event.listen(persistence.engine, "before_cursor_execute", record_statement)
+        try:
+            persistence.renew_claim_session(authority)
+        finally:
+            event.remove(persistence.engine, "before_cursor_execute", record_statement)
+        assert any(
+            "UPDATE claim_sessions" in statement
+            and statement.count("clock_timestamp()") >= 2
+            for statement in renew_statements
+        )
+
+        with persistence.engine.begin() as blocker:
+            blocker.execute(
+                select(claim_sessions.c.session_id)
+                .where(claim_sessions.c.session_id == authority.session_id)
+                .with_for_update()
+            )
+            blocker.execute(
+                claim_sessions.update()
+                .where(claim_sessions.c.session_id == authority.session_id)
+                .values(state="closing")
+            )
+            assert persistence.sweep_claim_sessions() == 0
+        assert persistence.sweep_claim_sessions() >= 0
+        persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_receipt_capacity_is_pre_mutation(tmp_path: Path) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-capacity",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        with persistence.engine.begin() as connection:
+            connection.execute(
+                claim_session_acquire_receipts.insert(),
+                [
+                    {
+                        "session_id": authority.session_id,
+                        "request_id": f"capacity-{index}",
+                        "query_digest": "a" * 64,
+                        "created_at": server_time,
+                    }
+                    for index in range(1000)
+                ],
+            )
+        identity, key = _key("MCAPACITY")
+        query = EvidenceQuery(identity, key)
+        with pytest.raises(ClaimReceiptCapacityError):
+            persistence.acquire_claim_session(
+                authority,
+                acquire_request_id="capacity-overflow",
+                query_digest=canonical_query_digest(
+                    [EvidenceQueryModel.from_domain(query)]
+                ),
+                queries=(query,),
+            )
+        with persistence.engine.connect() as connection:
+            assert (
+                connection.execute(
+                    select(func.count()).select_from(evidence_claim_generations)
+                ).scalar_one()
+                == 0
+            )
+        persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_exact_session_and_claim_authority_readback() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-authority-readback",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        identity, key = _key("MAUTHORITYREADBACK")
+        query = EvidenceQuery(identity, key)
+        acquired = persistence.acquire_claim_session(
+            authority,
+            acquire_request_id="acquire-authority-readback",
+            query_digest=canonical_query_digest(
+                [EvidenceQueryModel.from_domain(query)]
+            ),
+            queries=(query,),
+        )[0]
+        assert acquired.claim is not None
+        assert persistence.claim_session_authority_is_live(authority, (acquired.claim,))
+        persistence.close_claim_session(authority)
+        assert not persistence.claim_session_authority_is_live(
+            authority, (acquired.claim,)
+        )
+        persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_open_receipt_rejects_changed_timing_fields() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        persistence.open_claim_session(
+            open_request_id="timing-bound-open",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        with pytest.raises(EvidenceConflictError):
+            persistence.open_claim_session(
+                open_request_id="timing-bound-open",
+                server_time=server_time,
+                open_not_after=server_time + timedelta(seconds=29),
+            )
+        persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_http_open_receipt_changed_timing_is_409(tmp_path: Path) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        app = create_service_app(_settings(tmp_path), persistence=persistence)
+        server_time = persistence.database_time()
+        payload = {
+            "open_request_id": "http-timing-bound-open",
+            "server_time": server_time.isoformat(),
+            "open_not_after": (server_time + timedelta(seconds=30)).isoformat(),
+        }
+        with TestClient(app) as service:
+            assert (
+                service.post(
+                    "/v1/internal/claim-sessions/open", json=payload
+                ).status_code
+                == 200
+            )
+            changed = {
+                **payload,
+                "open_not_after": (server_time + timedelta(seconds=29)).isoformat(),
+            }
+            assert (
+                service.post(
+                    "/v1/internal/claim-sessions/open", json=changed
+                ).status_code
+                == 409
+            )
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_deadline_covers_advisory_lock_round_trip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0003_evidence_claim_leases",
+        )
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def delay_advisory_lock(
+            _connection, _cursor, statement, _parameters, _context, _executemany
+        ) -> None:
+            if "pg_try_advisory_lock" in statement:
+                time.sleep(0.15)
+
+        monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 0.05)
+        with pytest.raises((TimeoutError, DBAPIError)):
+            store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        with engine.connect() as connection:
+            assert (
+                connection.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == "0003_evidence_claim_leases"
+            )
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_completion_readback_uses_fresh_bounded_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0004_claim_sessions")
+            connection.commit()
+
+        revision, tables = store_migration._maintenance_state(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        )
+        assert revision == "0004_claim_sessions"
+        assert "claim_sessions" in tables
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def delay_revision_readback(
+            _connection, _cursor, statement, _parameters, _context, _executemany
+        ) -> None:
+            if "SELECT version_num FROM alembic_version" in statement:
+                time.sleep(0.15)
+
+        started = time.monotonic()
+        with pytest.raises((TimeoutError, DBAPIError)):
+            store_migration._maintenance_state(  # pyright: ignore[reportPrivateUsage]
+                engine, time.monotonic() + 0.05
+            )
+        assert time.monotonic() - started < 0.5
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_watchdog_remains_armed_through_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        acknowledgement = store_migration.MaintenanceAcknowledgement(
+            database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
+            expected_revision="0003_evidence_claim_leases",
+        )
+        original_upgrade = store_migration.command.upgrade
+
+        def stalled_upgrade(*args, **kwargs):
+            time.sleep(0.15)
+            return original_upgrade(*args, **kwargs)
+
+        monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(store_migration.command, "upgrade", stalled_upgrade)
+        with pytest.raises((TimeoutError, DBAPIError)):
+            store_migration.maintenance_upgrade_database(engine, None, acknowledgement)
+        engine.dispose()
+
+
+def test_maintenance_timeout_show_mismatch_discards_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timers = []
+
+    class FakeTimer:
+        daemon = False
+
+        def __init__(self, _delay, _callback):
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one(self):
+            return self.value
+
+    class Raw:
+        def cancel(self):
+            pass
+
+    class Holder:
+        driver_connection = Raw()
+
+    class FakeConnection:
+        connection = Holder()
+
+        def __init__(self):
+            self.invalidated = False
+
+        def execution_options(self, **_kwargs):
+            return self
+
+        def exec_driver_sql(self, statement):
+            return Result("wrong" if statement == "SHOW transaction_timeout" else None)
+
+        def invalidate(self):
+            self.invalidated = True
+
+    monkeypatch.setattr(store_migration.threading, "Timer", FakeTimer)
+    connection = FakeConnection()
+    with pytest.raises(RuntimeError, match="setup readback"):
+        store_migration._arm_postgres_transaction_timeout(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, connection), time.monotonic() + 10
+        )
+    assert connection.invalidated
+    assert timers[0].cancelled
+
+
+def test_maintenance_watchdog_classifies_expiry_during_commit_as_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTimer:
+        daemon = False
+
+        def __init__(self, _delay, _callback):
+            self.cancelled = False
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    class Raw:
+        def cancel(self):
+            pass
+
+    class Holder:
+        driver_connection = Raw()
+
+    class FakeConnection:
+        connection = Holder()
+
+        def __init__(self):
+            self.invalidated = False
+            self.watchdog: Any = None
+
+        def commit(self):
+            self.watchdog.expired.set()
+
+        def invalidate(self):
+            self.invalidated = True
+
+    monkeypatch.setattr(store_migration.threading, "Timer", FakeTimer)
+    connection = FakeConnection()
+    watchdog = store_migration._MaintenanceWatchdog(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, connection), time.monotonic() + 10
+    )
+    connection.watchdog = watchdog
+    with pytest.raises(
+        store_migration._AmbiguousMaintenanceCommit  # pyright: ignore[reportPrivateUsage]
+    ):
+        watchdog.commit()
+    assert connection.invalidated
+
+
+def test_postgres_maintenance_cleanup_watchdog_invalidates_stalled_connection() -> None:
+    cancelled = threading.Event()
+
+    class Raw:
+        def cancel(self) -> None:
+            cancelled.set()
+
+    class Holder:
+        driver_connection = Raw()
+
+    class FakeConnection:
+        connection = Holder()
+
+        def __init__(self) -> None:
+            self.invalidated = False
+
+        def rollback(self) -> None:
+            time.sleep(0.1)
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+    connection = FakeConnection()
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        store_migration._cleanup_postgres_maintenance(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, connection), False, started + 0.05
+        )
+    assert time.monotonic() - started < 0.5
+    assert cancelled.is_set()
+    assert connection.invalidated
 
 
 @pytest.mark.requires_postgres
@@ -3916,335 +3077,3 @@ def test_postgres_read_pool_timeout_returns_retryable_service_responses(
     assert all(
         "pool is saturated" in response.json()["detail"] for response in responses
     )
-
-
-@pytest.mark.requires_postgres
-def test_postgres_transaction_timeout_returns_retryable_service_response(
-    tmp_path: Path,
-) -> None:
-    with _isolated_postgres_url() as database_url:
-        identity, key = _key("MTRANSACTIONTIMEOUT")
-        query = EvidenceQuery(identity, key)
-        primary = PostgresEvidencePersistence.open(
-            database_url,
-            lock_timeout_seconds=5.0,
-            statement_timeout_seconds=5.0,
-            transaction_timeout_seconds=0.05,
-        )
-        blocker = PostgresEvidencePersistence.open(database_url)
-        blocked_claim = blocker.acquire_many((query,), owner_token="blocker")[0].claim
-        assert blocked_claim is not None
-        lock_connection = blocker.engine.connect()
-        transaction = lock_connection.begin()
-        lock_connection.execute(
-            select(evidence_claims)
-            .where(evidence_claims.c.sequence_id == key.sequence_id)
-            .with_for_update()
-        )
-        app = create_service_app(_settings(tmp_path), persistence=primary)
-        try:
-            with TestClient(app) as client:
-                response = client.post(
-                    "/v1/evidence/claims/acquire",
-                    json=ClaimAcquireRequest(
-                        owner_token="calculator",
-                        queries=[EvidenceQueryModel.from_domain(query)],
-                    ).model_dump(mode="json"),
-                )
-        finally:
-            if transaction.is_active:
-                transaction.rollback()
-            lock_connection.close()
-            blocker.close()
-
-    assert response.status_code == 503
-    assert response.headers["retry-after"] == "1"
-    assert "wait budget" in response.json()["detail"]
-
-
-@pytest.mark.requires_postgres
-def test_postgres_refreshes_acquire_expiry_after_later_row_lock_wait(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr("seqevi.service.persistence.CLAIM_LEASE_SECONDS", 0.2)
-    with _isolated_postgres_url() as database_url:
-        commits = (
-            _hit_commit(tmp_path / "sources-a", "MACQUIREWAITA"),
-            _hit_commit(tmp_path / "sources-b", "MACQUIREWAITB"),
-        )
-        queries = tuple(
-            sorted(
-                (EvidenceQuery(commit.identity, commit.key) for commit in commits),
-                key=lambda query: (
-                    query.key.sequence_id,
-                    query.key.adapter_contract_version,
-                    query.key.tool_runtime_digest,
-                    query.key.resource_id,
-                    query.key.semantic_parameters_hash,
-                ),
-            )
-        )
-        primary = PostgresEvidencePersistence.open(database_url)
-        blocker = PostgresEvidencePersistence.open(database_url)
-        blocked_claim = blocker.acquire_many((queries[1],), owner_token="blocker")[
-            0
-        ].claim
-        assert blocked_claim is not None
-        lock_connection = blocker.engine.connect()
-        transaction = lock_connection.begin()
-        lock_connection.execute(
-            select(evidence_claims)
-            .where(evidence_claims.c.sequence_id == queries[1].key.sequence_id)
-            .with_for_update()
-        )
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    primary.acquire_many, queries, owner_token="calculator"
-                )
-                time.sleep(0.3)
-                lock_released_at = datetime.now(UTC)
-                transaction.commit()
-                decisions = future.result(timeout=10)
-        finally:
-            if transaction.is_active:
-                transaction.rollback()
-            lock_connection.close()
-            primary.close()
-            blocker.close()
-
-    claims = tuple(decision.claim for decision in decisions)
-    assert all(claim is not None for claim in claims)
-    assert all(claim.expires_at > lock_released_at for claim in claims if claim)
-
-
-@pytest.mark.requires_postgres
-def test_postgres_refreshes_renewal_expiry_after_later_row_lock_wait(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr("seqevi.service.persistence.CLAIM_LEASE_SECONDS", 5.0)
-    with _isolated_postgres_url() as database_url:
-        commits = (
-            _hit_commit(tmp_path / "sources-a", "MRENEWWAITA"),
-            _hit_commit(tmp_path / "sources-b", "MRENEWWAITB"),
-        )
-        queries = tuple(
-            sorted(
-                (EvidenceQuery(commit.identity, commit.key) for commit in commits),
-                key=lambda query: (
-                    query.key.sequence_id,
-                    query.key.adapter_contract_version,
-                    query.key.tool_runtime_digest,
-                    query.key.resource_id,
-                    query.key.semantic_parameters_hash,
-                ),
-            )
-        )
-        primary = PostgresEvidencePersistence.open(database_url)
-        locker = PostgresEvidencePersistence.open(database_url)
-        decisions = primary.acquire_many(queries, owner_token="calculator")
-        claims = tuple(decision.claim for decision in decisions)
-        assert all(claim is not None for claim in claims)
-        monkeypatch.setattr("seqevi.service.persistence.CLAIM_LEASE_SECONDS", 0.2)
-        with primary.engine.begin() as connection:
-            connection.execute(
-                update(evidence_claims)
-                .where(evidence_claims.c.sequence_id == queries[1].key.sequence_id)
-                .values(expires_at=datetime.now(UTC) + timedelta(seconds=5))
-            )
-        lock_connection = locker.engine.connect()
-        transaction = lock_connection.begin()
-        lock_connection.execute(
-            select(evidence_claims)
-            .where(evidence_claims.c.sequence_id == queries[1].key.sequence_id)
-            .with_for_update()
-        )
-        try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    primary.renew_many,
-                    tuple(claim for claim in claims if claim is not None),
-                )
-                time.sleep(0.3)
-                lock_released_at = datetime.now(UTC)
-                transaction.commit()
-                renewed = future.result(timeout=10)
-        finally:
-            if transaction.is_active:
-                transaction.rollback()
-            lock_connection.close()
-            primary.close()
-            locker.close()
-
-    assert all(claim.expires_at > lock_released_at for claim in renewed)
-
-
-@pytest.mark.requires_postgres
-@pytest.mark.parametrize("operation", ["acquire", "renew"])
-def test_postgres_tail_refresh_uses_one_shared_deadline_after_update_delay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
-) -> None:
-    monkeypatch.setattr(persistence_module, "CLAIM_LEASE_SECONDS", 0.2)
-    with _isolated_postgres_url() as database_url:
-        commits = (
-            _hit_commit(tmp_path / "first", "MPGTAILFIRST"),
-            _hit_commit(tmp_path / "second", "MPGTAILSECOND"),
-        )
-        queries = tuple(
-            EvidenceQuery(commit.identity, commit.key) for commit in commits
-        )
-        persistence = PostgresEvidencePersistence.open(database_url)
-        try:
-            initial = None
-            if operation == "renew":
-                initial = persistence.acquire_many(queries, owner_token="owner")
-            delay_finished: datetime | None = None
-
-            def delay_after_shared_refresh(
-                _connection: object,
-                _cursor: object,
-                statement: str,
-                _parameters: object,
-                _context: object,
-                _executemany: object,
-            ) -> None:
-                nonlocal delay_finished
-                if (
-                    delay_finished is None
-                    and statement.lstrip().startswith("UPDATE evidence_claim")
-                    and " IN " in statement
-                ):
-                    time.sleep(0.1)
-                    delay_finished = datetime.now(UTC)
-
-            event.listen(
-                persistence.engine, "after_cursor_execute", delay_after_shared_refresh
-            )
-            try:
-                if initial is None:
-                    decisions = persistence.acquire_many(queries, owner_token="owner")
-                    refreshed = tuple(
-                        decision.claim
-                        for decision in decisions
-                        if decision.claim is not None
-                    )
-                else:
-                    refreshed = persistence.renew_many(
-                        tuple(
-                            decision.claim
-                            for decision in initial
-                            if decision.claim is not None
-                        )
-                    )
-            finally:
-                event.remove(
-                    persistence.engine,
-                    "after_cursor_execute",
-                    delay_after_shared_refresh,
-                )
-        finally:
-            persistence.close()
-
-    assert delay_finished is not None
-    assert len({claim.expires_at for claim in refreshed}) == 1
-    assert all(claim.expires_at > delay_finished for claim in refreshed)
-
-
-@pytest.mark.requires_postgres
-def test_postgres_finalize_cannot_beat_expiry_takeover(tmp_path: Path) -> None:
-    with _isolated_postgres_url() as database_url:
-        commit = _hit_commit(tmp_path / "sources", "MFINALIZERACE")
-        query = EvidenceQuery(commit.identity, commit.key)
-        persistence = PostgresEvidencePersistence.open(database_url)
-        claim = persistence.acquire_many((query,), owner_token="old-owner")[0].claim
-        assert claim is not None
-        model = CommitModel.from_domain(commit)
-        assert model.normalized_artifact is not None
-        assert model.raw_artifact is not None
-        stored = {
-            reference.digest: StoredArtifact(
-                digest=reference.digest,
-                media_type=reference.media_type,
-                byte_size=reference.byte_size,
-                relative_path=f"fixture/{reference.digest}",
-            )
-            for reference in (model.normalized_artifact, model.raw_artifact)
-        }
-        takeover_store = PostgresEvidencePersistence.open(database_url)
-        with takeover_store.engine.begin() as connection:
-            connection.execute(
-                update(evidence_claims).values(
-                    expires_at=datetime.now(UTC) - timedelta(seconds=1)
-                )
-            )
-        takeover_has_key_lock = threading.Event()
-        continue_takeover = threading.Event()
-
-        def pause_takeover_after_key_lock(
-            _connection: object,
-            _cursor: object,
-            statement: str,
-            _parameters: object,
-            _context: object,
-            _executemany: bool,
-        ) -> None:
-            if (
-                statement.startswith("SELECT evidence_claim")
-                and "FOR UPDATE" in statement
-            ):
-                takeover_has_key_lock.set()
-                assert continue_takeover.wait(10)
-
-        event.listen(
-            takeover_store.engine,
-            "before_cursor_execute",
-            pause_takeover_after_key_lock,
-        )
-        finalize_errors: list[BaseException] = []
-        takeover_results: list[ClaimAcquireResult] = []
-
-        def take_over() -> None:
-            takeover_results.extend(
-                takeover_store.acquire_many((query,), owner_token="new-owner")
-            )
-
-        def finalize() -> None:
-            try:
-                persistence.finalize_many(
-                    (
-                        ClaimedCommitModel.from_domain(
-                            ClaimedEvidenceCommit(commit, claim)
-                        ),
-                    ),
-                    stored,
-                )
-            except BaseException as error:
-                finalize_errors.append(error)
-
-        takeover_thread = threading.Thread(target=take_over)
-        finalize_thread = threading.Thread(target=finalize)
-        try:
-            takeover_thread.start()
-            assert takeover_has_key_lock.wait(10)
-            finalize_thread.start()
-            assert finalize_thread.is_alive()
-            continue_takeover.set()
-            takeover_thread.join(10)
-            finalize_thread.join(10)
-        finally:
-            continue_takeover.set()
-            event.remove(
-                takeover_store.engine,
-                "before_cursor_execute",
-                pause_takeover_after_key_lock,
-            )
-            takeover_store.close()
-            persistence.close()
-
-    assert not takeover_thread.is_alive()
-    assert not finalize_thread.is_alive()
-    assert len(finalize_errors) == 1
-    assert isinstance(finalize_errors[0], StoreError)
-    takeover = takeover_results[0].claim
-    assert takeover is not None
-    assert takeover.generation == claim.generation + 1

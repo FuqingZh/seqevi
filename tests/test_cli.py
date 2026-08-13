@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import pytest
+import sqlalchemy
 from rich.text import Text
 from typer.testing import CliRunner
 
@@ -34,6 +35,58 @@ def test_cli_without_command_describes_current_surface() -> None:
     assert "Content-addressed protein sequence annotation evidence" in result.stdout
     assert "annotate" in result.stdout
     assert "resource" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("command", "maintenance_name", "revision"),
+    [
+        (
+            "store-maintenance-upgrade",
+            "maintenance_upgrade_database",
+            "0003_evidence_claim_leases",
+        ),
+        (
+            "store-maintenance-downgrade",
+            "maintenance_downgrade_database",
+            "0004_claim_sessions",
+        ),
+    ],
+)
+def test_maintenance_commands_normalize_postgresql_url_for_psycopg3(
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    maintenance_name: str,
+    revision: str,
+) -> None:
+    urls: list[str] = []
+
+    class FakeEngine:
+        def dispose(self) -> None:
+            pass
+
+    def fake_create_engine(url: str) -> FakeEngine:
+        urls.append(url)
+        return FakeEngine()
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", fake_create_engine)
+    monkeypatch.setattr(
+        f"seqevi.store.migration.{maintenance_name}", lambda *_args: None
+    )
+    result = runner.invoke(
+        app,
+        [
+            command,
+            "--database-url",
+            "postgresql://seqevi@postgres/seqevi",
+            "--acknowledge-database",
+            "postgresql:seqevi@postgres:5432/seqevi",
+            "--acknowledge-revision",
+            revision,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert urls == ["postgresql+psycopg://seqevi@postgres/seqevi"]
 
 
 def test_annotate_help_uses_concrete_external_input_names() -> None:

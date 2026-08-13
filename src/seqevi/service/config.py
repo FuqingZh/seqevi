@@ -20,6 +20,14 @@ DEFAULT_DATABASE_TRANSACTION_TIMEOUT_SECONDS = 25.0
 MAXIMUM_DATABASE_REQUEST_WAIT_SECONDS = 30.0
 
 
+def _normalize_postgres_database_url(database_url: str) -> str:
+    if database_url.startswith("postgresql://"):
+        return database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    if not database_url.startswith("postgresql+psycopg://"):
+        raise ValueError("shared Store database_url must use PostgreSQL")
+    return database_url
+
+
 class ServiceSettings(BaseSettings):
     """Deployment configuration with bounded public request sizes."""
 
@@ -62,14 +70,11 @@ class ServiceSettings(BaseSettings):
                 "database pool and transaction timeouts must total at most "
                 f"{MAXIMUM_DATABASE_REQUEST_WAIT_SECONDS:g} seconds"
             )
-        if self.database_url.startswith("postgresql://"):
-            object.__setattr__(
-                self,
-                "database_url",
-                self.database_url.replace("postgresql://", "postgresql+psycopg://", 1),
-            )
-        elif not self.database_url.startswith("postgresql+psycopg://"):
-            raise ValueError("shared Store database_url must use PostgreSQL")
+        object.__setattr__(
+            self,
+            "database_url",
+            _normalize_postgres_database_url(self.database_url),
+        )
         object.__setattr__(
             self,
             "artifacts_dir",
