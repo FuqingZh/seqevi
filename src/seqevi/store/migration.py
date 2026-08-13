@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import random
+import socket
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Callable, Iterator, cast
 
@@ -32,6 +37,7 @@ _CLAIM_SESSION_TABLES = {
     "claim_session_acquire_receipt_items",
 }
 _POSTGRES_ACQUISITION_LOCK = threading.Lock()
+_RESOLVER_STOP_GRACE_SECONDS = 0.2
 
 
 class _AmbiguousMaintenanceCommit(RuntimeError):
@@ -729,8 +735,9 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
         ) -> Any:
             if not listener_active:
                 return None
-            bounded_cparams = dict(cparams)
-            attempts = _postgres_connect_attempts(bounded_cparams)
+            bounded_cparams, attempts = _resolve_postgres_connect_targets(
+                cparams, deadline
+            )
             connect_timeout = int(_remaining(deadline)) // attempts
             if connect_timeout < 2:
                 raise TimeoutError(
@@ -777,13 +784,138 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
         connection.close()
 
 
-def _postgres_connect_attempts(cparams: dict[str, Any]) -> int:
-    """Return libpq's maximum configured host or address attempt count."""
+def _postgres_resolver_command(host: str, port: int) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "-I",
+        "-m",
+        "seqevi.store._resolver",
+        host,
+        str(port),
+        str(socket.AF_UNSPEC),
+        str(socket.SOCK_STREAM),
+        "0",
+        "0",
+    )
 
-    def count(value: Any) -> int:
-        return len(str(value).split(",")) if value is not None else 1
 
-    return max(count(cparams.get("host")), count(cparams.get("hostaddr")))
+def _resolve_postgres_connect_targets(
+    cparams: dict[str, Any], deadline: float
+) -> tuple[dict[str, Any], int]:
+    """Resolve copied libpq targets so DNS and all attempts share one deadline."""
+
+    bounded = _effective_postgres_connect_params(cparams)
+    raw_host = bounded.get("host")
+    raw_hostaddr = bounded.get("hostaddr")
+    if raw_host is None and raw_hostaddr is None:
+        return bounded, 1
+    hosts = str(raw_host or "").split(",")
+    hostaddrs = str(raw_hostaddr or "").split(",")
+    ports = str(bounded.get("port", 5432)).split(",")
+    target_count = max(len(hosts), len(hostaddrs))
+    hosts = _align_postgres_connect_values(hosts, target_count, "host")
+    hostaddrs = _align_postgres_connect_values(hostaddrs, target_count, "hostaddr")
+    ports = _align_postgres_connect_values(ports, target_count, "port")
+    resolved_hosts: list[str] = []
+    resolved_hostaddrs: list[str] = []
+    resolved_ports: list[str] = []
+    for host, hostaddr, raw_port in zip(hosts, hostaddrs, ports, strict=True):
+        if hostaddr or not host or host.startswith("/"):
+            resolved_hosts.append(host)
+            resolved_hostaddrs.append(hostaddr)
+            resolved_ports.append(raw_port)
+            continue
+        try:
+            ip_address(host)
+        except ValueError:
+            addresses = _resolve_postgres_host(host, int(raw_port), deadline)
+        else:
+            addresses = (host,)
+        for address in addresses:
+            resolved_hosts.append(host)
+            resolved_hostaddrs.append(address)
+            resolved_ports.append(raw_port)
+    bounded["host"] = ",".join(resolved_hosts)
+    bounded["hostaddr"] = ",".join(resolved_hostaddrs)
+    bounded["port"] = ",".join(resolved_ports)
+    attempts = len(resolved_hosts)
+    if bounded.get("target_session_attrs") == "prefer-standby":
+        attempts *= 2
+    return bounded, attempts
+
+
+def _effective_postgres_connect_params(cparams: dict[str, Any]) -> dict[str, Any]:
+    """Freeze psycopg/libpq environment-derived attempt parameters."""
+
+    bounded = dict(cparams)
+    service = bounded.get("service") or os.environ.get("PGSERVICE")
+    if service:
+        raise RuntimeError(
+            "PostgreSQL maintenance cannot bound service-derived connection targets"
+        )
+    for key, envvar in (
+        ("host", "PGHOST"),
+        ("hostaddr", "PGHOSTADDR"),
+        ("port", "PGPORT"),
+        ("target_session_attrs", "PGTARGETSESSIONATTRS"),
+    ):
+        if key not in bounded and (value := os.environ.get(envvar)) is not None:
+            bounded[key] = value
+    return bounded
+
+
+def _align_postgres_connect_values(
+    values: list[str], target_count: int, name: str
+) -> list[str]:
+    if len(values) == target_count:
+        return values
+    if len(values) == 1:
+        return values * target_count
+    raise ValueError(f"PostgreSQL {name} list does not align with connection targets")
+
+
+def _resolve_postgres_host(host: str, port: int, deadline: float) -> tuple[str, ...]:
+    process = subprocess.Popen(
+        _postgres_resolver_command(host, port),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=_remaining(deadline))
+    except subprocess.TimeoutExpired as error:
+        timeout = TimeoutError(
+            "ClaimSession maintenance PostgreSQL DNS resolution exceeded deadline"
+        )
+        try:
+            _stop_postgres_resolver(process)
+        except BaseException as cleanup:
+            timeout.add_note(f"PostgreSQL resolver cleanup failed: {cleanup!r}")
+        raise timeout from error
+    _remaining(deadline)
+    if process.returncode != 0:
+        raise OSError(stderr[:4096].decode("utf-8", errors="replace"))
+    payload = json.loads(stdout)
+    addresses = tuple(dict.fromkeys(str(item[4][0]) for item in payload))
+    if not addresses:
+        raise OSError(f"PostgreSQL resolver returned no addresses for {host!r}")
+    _remaining(deadline)
+    return addresses
+
+
+def _stop_postgres_resolver(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=_RESOLVER_STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.communicate()
 
 
 def _discard_postgres_connection(

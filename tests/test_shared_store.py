@@ -5,6 +5,8 @@ import importlib
 import os
 import logging
 import json
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -3385,7 +3387,7 @@ def test_postgres_maintenance_classifies_commit_after_operation_deadline(
 
         monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 1.0)
         monkeypatch.setattr(
-            store_migration, "_MAINTENANCE_READBACK_TIMEOUT_SECONDS", 3.0
+            store_migration, "_MAINTENANCE_READBACK_TIMEOUT_SECONDS", 6.0
         )
         monkeypatch.setattr(store_migration, run_name, committed_late)
         if direction == "upgrade":
@@ -4445,6 +4447,11 @@ def test_postgres_maintenance_physical_connect_uses_phase_remainder(
     phase: str,
 ) -> None:
     with _isolated_postgres_url() as database_url:
+        database_url = (
+            make_url(database_url)
+            .set(host="127.0.0.1")
+            .render_as_string(hide_password=False)
+        )
         engine = create_engine(database_url)
         observed: list[int] = []
 
@@ -4632,39 +4639,233 @@ def test_postgres_maintenance_replaces_zero_physical_connect_timeout() -> None:
 
 
 @pytest.mark.parametrize(
-    ("connect_args", "attempts"),
+    ("connect_args", "resolved", "attempts"),
     [
-        ({"host": "one,two,three"}, 3),
-        ({"hostaddr": "192.0.2.1,192.0.2.2"}, 2),
+        ({"host": "one"}, {"one": ("192.0.2.1", "192.0.2.2")}, 2),
+        (
+            {"host": "one,two"},
+            {"one": ("192.0.2.1", "192.0.2.2"), "two": ("192.0.2.3",)},
+            3,
+        ),
+        ({"hostaddr": "192.0.2.1,192.0.2.2"}, {}, 2),
         (
             {
-                "host": "one,two",
+                "host": "one,two,three",
                 "hostaddr": "192.0.2.1,192.0.2.2,192.0.2.3",
+                "target_session_attrs": "prefer-standby",
             },
-            3,
+            {},
+            6,
         ),
     ],
 )
 def test_postgres_maintenance_divides_timeout_across_all_host_attempts(
-    connect_args: dict[str, str], attempts: int
+    monkeypatch: pytest.MonkeyPatch,
+    connect_args: dict[str, str],
+    resolved: dict[str, tuple[str, ...]],
+    attempts: int,
 ) -> None:
     engine = create_engine(
         "postgresql+psycopg://unused@/unused", connect_args=connect_args
     )
     observed: list[int] = []
+    observed_params: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(
+        store_migration,
+        "_resolve_postgres_host",
+        lambda host, _port, _deadline: resolved[host],
+    )
 
     def observe_connect_timeout(*_cargs, **cparams):
         observed.append(int(cparams["connect_timeout"]))
+        observed_params.append(dict(cparams))
         raise TimeoutError("stop after observing per-attempt timeout")
 
     engine.dialect.connect = observe_connect_timeout
+    total_budget = attempts * 2 + 1.5
     with pytest.raises(TimeoutError, match="stop after observing"):
         with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
-            engine, time.monotonic() + 7.5
+            engine, time.monotonic() + total_budget
         ):
             pytest.fail("test physical connection unexpectedly succeeded")
-    assert observed == [7 // attempts]
-    assert observed[0] * attempts <= 7
+    whole_budget = int(total_budget)
+    assert observed == [whole_budget // attempts]
+    assert observed[0] * attempts <= whole_budget
+    expected_targets = (
+        attempts // 2
+        if connect_args.get("target_session_attrs") == "prefer-standby"
+        else attempts
+    )
+    assert len(observed_params[0]["hostaddr"].split(",")) == expected_targets
+    assert len(observed_params[0]["host"].split(",")) == expected_targets
+    engine.dispose()
+
+
+def test_postgres_maintenance_stalled_dns_is_killed_and_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "postgres-resolver.pid"
+    monkeypatch.setattr(
+        store_migration,
+        "_postgres_resolver_command",
+        lambda _host, _port: (
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,signal,sys;"
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()),encoding='ascii');"
+                "signal.pause()"
+            ),
+            str(pid_file),
+        ),
+    )
+    with pytest.raises(TimeoutError, match="DNS resolution exceeded deadline"):
+        store_migration._resolve_postgres_host(  # pyright: ignore[reportPrivateUsage]
+            "stalled.invalid", 5432, time.monotonic() + 0.2
+        )
+    resolver_pid = int(pid_file.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(resolver_pid, 0)
+
+
+def test_postgres_maintenance_resolver_matches_psycopg_getaddrinfo_flags() -> None:
+    command = store_migration._postgres_resolver_command(  # pyright: ignore[reportPrivateUsage]
+        "example.invalid", 5432
+    )
+    assert command[-4:] == (
+        str(socket.AF_UNSPEC),
+        str(socket.SOCK_STREAM),
+        "0",
+        "0",
+    )
+
+
+def test_postgres_maintenance_uses_environment_attempts_and_prefer_standby(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PGHOST", "one,two")
+    monkeypatch.setenv("PGPORT", "5432,5433")
+    monkeypatch.setenv("PGTARGETSESSIONATTRS", "prefer-standby")
+    monkeypatch.setattr(
+        store_migration,
+        "_resolve_postgres_host",
+        lambda host, _port, _deadline: {
+            "one": ("192.0.2.1", "192.0.2.2"),
+            "two": ("192.0.2.3",),
+        }[host],
+    )
+    bounded, attempts = store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
+        {}, time.monotonic() + 10
+    )
+    assert attempts == 6
+    assert bounded["host"] == "one,one,two"
+    assert bounded["hostaddr"] == "192.0.2.1,192.0.2.2,192.0.2.3"
+    assert bounded["port"] == "5432,5432,5433"
+    assert bounded["target_session_attrs"] == "prefer-standby"
+
+
+@pytest.mark.parametrize("source", ["parameter", "environment"])
+def test_postgres_maintenance_rejects_service_derived_targets(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    cparams: dict[str, Any] = {}
+    if source == "parameter":
+        cparams["service"] = "seqevi"
+    else:
+        monkeypatch.setenv("PGSERVICE", "seqevi")
+    with pytest.raises(RuntimeError, match="service-derived connection targets"):
+        store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
+            cparams, time.monotonic() + 10
+        )
+
+
+def test_postgres_maintenance_late_resolver_failure_is_deadline_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LateFailureProcess:
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            assert timeout is not None
+            return b"", b"late resolver failure"
+
+    monkeypatch.setattr(
+        store_migration.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: LateFailureProcess(),
+    )
+    monkeypatch.setattr(
+        store_migration,
+        "_remaining",
+        lambda _deadline: (_ for _ in ()).throw(
+            TimeoutError("ClaimSession maintenance deadline expired")
+        ),
+    )
+    with pytest.raises(TimeoutError, match="maintenance deadline expired"):
+        store_migration._resolve_postgres_host(  # pyright: ignore[reportPrivateUsage]
+            "late.invalid", 5432, time.monotonic() + 10
+        )
+
+
+def test_postgres_maintenance_resolver_exit_race_preserves_deadline_and_reaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedResolverProcess:
+        returncode = 1
+
+        def __init__(self) -> None:
+            self.communications = 0
+            self.reaped = False
+
+        def communicate(self, timeout: float | None = None):
+            self.communications += 1
+            if self.communications == 1:
+                assert timeout is not None
+                raise subprocess.TimeoutExpired("resolver", timeout)
+            self.reaped = True
+            return b"", b"resolver exited"
+
+        def terminate(self) -> None:
+            raise ProcessLookupError
+
+    process = ExitedResolverProcess()
+    monkeypatch.setattr(
+        store_migration.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    with pytest.raises(TimeoutError, match="DNS resolution exceeded deadline"):
+        store_migration._resolve_postgres_host(  # pyright: ignore[reportPrivateUsage]
+            "raced.invalid", 5432, time.monotonic() + 10
+        )
+    assert process.communications == 2
+    assert process.reaped
+
+
+def test_postgres_maintenance_rejects_resolved_attempts_that_cannot_fit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine("postgresql+psycopg://unused@many.invalid/unused")
+    monkeypatch.setattr(
+        store_migration,
+        "_resolve_postgres_host",
+        lambda _host, _port, _deadline: ("192.0.2.1", "192.0.2.2"),
+    )
+    connected = False
+
+    def unexpected_connect(*_cargs, **_cparams):
+        nonlocal connected
+        connected = True
+        raise AssertionError("physical connect should have been rejected")
+
+    engine.dialect.connect = unexpected_connect
+    with pytest.raises(TimeoutError, match="insufficient physical-connect budget"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 3.5
+        ):
+            pytest.fail("unrepresentable resolved attempts were acquired")
+    assert not connected
     engine.dispose()
 
 
