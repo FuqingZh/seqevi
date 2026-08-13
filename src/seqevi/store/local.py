@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import and_, create_engine, delete, event, select, tuple_, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -97,6 +97,15 @@ def _configure_sqlite(dbapi_connection: Any, _connection_record: Any) -> None:
         cursor.close()
 
 
+def _reset_sqlite_after_sweep(dbapi_connection: Any, _connection_record: Any) -> None:
+    dbapi_connection.set_progress_handler(None, 0)
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA busy_timeout=30000")
+    finally:
+        cursor.close()
+
+
 class LocalStore:
     """Exact immutable evidence Store for processes on one host."""
 
@@ -134,6 +143,7 @@ class LocalStore:
         url = URL.create("sqlite+pysqlite", database=str(database_path))
         engine = create_engine(url, connect_args={"timeout": 30.0})
         event.listen(engine, "connect", _configure_sqlite)
+        event.listen(engine, "checkin", _reset_sqlite_after_sweep)
 
         try:
             upgrade_database(engine, root)
@@ -179,25 +189,45 @@ class LocalStore:
     def _drain_coordination(self, deadline: float) -> None:
         try:
             while time.monotonic() < deadline and self._sweep_once(
+                deadline=deadline,
                 busy_timeout_ms=max(
                     min(
                         int((deadline - time.monotonic()) * 1000),
                         _SWEEP_BUSY_TIMEOUT_MS,
                     ),
                     1,
-                )
+                ),
             ):
                 pass
+        except TimeoutError:
+            pass
         except OperationalError as error:
             if not _sqlite_is_busy(error):
                 raise
 
-    def _sweep_once(self, *, busy_timeout_ms: int = _SWEEP_BUSY_TIMEOUT_MS) -> int:
+    def _sweep_once(
+        self,
+        *,
+        busy_timeout_ms: int = _SWEEP_BUSY_TIMEOUT_MS,
+        deadline: float | None = None,
+    ) -> int:
+        operation_deadline = (
+            time.monotonic() + _SWEEP_SHUTDOWN_SECONDS if deadline is None else deadline
+        )
         now = datetime.now(UTC)
         removed = 0
         with self.engine.begin() as connection:
             connection.exec_driver_sql(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            raw = cast(Any, connection.connection.driver_connection)
+            raw.set_progress_handler(
+                lambda: 1 if time.monotonic() >= operation_deadline else 0,
+                100,
+            )
             try:
+                if time.monotonic() >= operation_deadline:
+                    raise TimeoutError(
+                        "SQLite coordination sweep exceeded its deadline"
+                    )
                 stale_sessions = select(claim_sessions.c.session_id).where(
                     (claim_sessions.c.state == "closing")
                     | (claim_sessions.c.expires_at <= now)
@@ -1061,7 +1091,7 @@ def _key_sort_value(key: EvidenceKey) -> tuple[str, str, str, str, str]:
 
 
 def _sqlite_is_busy(error: OperationalError) -> bool:
-    return getattr(error.orig, "sqlite_errorcode", None) in {5, 6}
+    return getattr(error.orig, "sqlite_errorcode", None) in {5, 6, 9}
 
 
 def _as_utc(value: datetime) -> datetime:

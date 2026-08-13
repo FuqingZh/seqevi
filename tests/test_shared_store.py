@@ -50,6 +50,7 @@ from seqevi.evidence import (
     EvidenceQuery,
     EvidenceRecord,
     EvidenceStatus,
+    SessionEvidenceClaim,
     StoredArtifact,
     sha256_digest,
 )
@@ -72,10 +73,12 @@ from seqevi.store.schema import (
     evidence_claim_generations,
 )
 from seqevi.store.transport import (
+    ClaimSessionAuthorityCheckRequest,
     ClaimSessionFinalizeItem,
     CommitModel,
     EvidenceRecordModel,
     EvidenceQueryModel,
+    SessionEvidenceClaimModel,
     canonical_query_digest,
 )
 
@@ -1909,6 +1912,35 @@ def test_claim_session_sweeper_retries_after_connection_failure(tmp_path: Path) 
     with TestClient(app):
         assert persistence.recovered.wait(2.0)
     assert persistence.sweeps >= 2
+
+
+@pytest.mark.parametrize("claim_count, expected_status", [(1000, 200), (1001, 422)])
+def test_claim_session_authority_request_has_fixed_batch_boundary(
+    tmp_path: Path, claim_count: int, expected_status: int
+) -> None:
+    class AuthorityPersistence(MemoryPersistence):
+        def claim_session_authority_is_live(self, _authority, claims):
+            assert len(tuple(claims)) == 1000
+            return True
+
+    _, key = _key("MAUTHORITYBOUNDARY")
+    claim = SessionEvidenceClaimModel.from_domain(SessionEvidenceClaim(key, 1))
+    payload = {
+        "session_id": "session",
+        "owner_token": "owner",
+        "generation": 1,
+        "claims": [claim.model_dump(mode="json")] * claim_count,
+    }
+    if claim_count == 1001:
+        with pytest.raises(ValidationError):
+            ClaimSessionAuthorityCheckRequest.model_validate(payload)
+    persistence = AuthorityPersistence()
+    app = create_service_app(
+        _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
+    )
+    with TestClient(app) as service:
+        response = service.post("/v1/internal/claim-sessions/authority", json=payload)
+    assert response.status_code == expected_status
 
 
 def test_claim_session_authority_backpressure_is_503(tmp_path: Path) -> None:

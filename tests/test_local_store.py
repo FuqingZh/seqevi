@@ -454,3 +454,15 @@ def test_sweeper_restores_foreground_sqlite_busy_timeout(tmp_path: Path) -> None
             assert (
                 connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 30000
             )
+
+
+def test_sweeper_deadline_interrupts_work_inside_transaction(tmp_path: Path) -> None:
+    with LocalStore.open(tmp_path / "store") as store:
+        with pytest.raises(TimeoutError, match="exceeded its deadline"):
+            store._sweep_once(  # pyright: ignore[reportPrivateUsage]
+                deadline=time.monotonic() - 1.0
+            )
+        with store.engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 30000
+            )
