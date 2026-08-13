@@ -4741,6 +4741,30 @@ def test_postgres_maintenance_resolver_matches_psycopg_getaddrinfo_flags() -> No
     )
 
 
+@pytest.mark.parametrize("source", ["parameter", "environment"])
+def test_postgres_maintenance_preserves_abstract_socket_targets(
+    monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    cparams: dict[str, Any] = {}
+    if source == "parameter":
+        cparams["host"] = "@seqevi"
+    else:
+        monkeypatch.setenv("PGHOST", "@seqevi")
+
+    def unexpected_resolution(*_args: Any) -> tuple[str, ...]:
+        pytest.fail("abstract Unix socket was sent to DNS resolution")
+
+    monkeypatch.setattr(
+        store_migration, "_resolve_postgres_host", unexpected_resolution
+    )
+    bounded, attempts = store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
+        cparams, time.monotonic() + 10
+    )
+    assert bounded["host"] == "@seqevi"
+    assert bounded["hostaddr"] == ""
+    assert attempts == 1
+
+
 def test_postgres_maintenance_uses_environment_attempts_and_prefer_standby(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4894,17 +4918,155 @@ def test_postgres_maintenance_preserves_stricter_statement_timeout() -> None:
         engine = create_engine(
             database_url,
             connect_args={"options": "-c statement_timeout=1250ms"},
+            pool_size=1,
+            max_overflow=0,
         )
+        with engine.connect():
+            pass
+        pre_ping_was_own = "_do_ping_w_event" in vars(engine.dialect)
+        original_own_pre_ping = vars(engine.dialect).get("_do_ping_w_event")
         with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
             engine, time.monotonic() + 5
         ) as connection:
             assert connection.execute(text("SHOW statement_timeout")).scalar_one() == (
                 "1250ms"
             )
+        assert ("_do_ping_w_event" in vars(engine.dialect)) is pre_ping_was_own
+        assert vars(engine.dialect).get("_do_ping_w_event") is original_own_pre_ping
         assert not any(
             thread.name == "seqevi-postgres-acquisition-watchdog" and thread.is_alive()
             for thread in threading.enumerate()
         )
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_deadline_cancels_stalled_pool_pre_ping() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(
+            database_url, pool_pre_ping=True, pool_size=1, max_overflow=0
+        )
+        with engine.connect():
+            pass
+        pre_ping_was_own = "_do_ping_w_event" in vars(engine.dialect)
+        original_own_pre_ping = vars(engine.dialect).get("_do_ping_w_event")
+        original_do_ping = engine.dialect.do_ping
+
+        def stall_pre_ping(dbapi_connection: Any) -> bool:
+            with dbapi_connection.cursor() as cursor:
+                cursor.execute("SELECT pg_sleep(10)")
+            return True
+
+        engine.dialect.do_ping = stall_pre_ping
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="initialization exceeded deadline"):
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, started + 0.5
+            ):
+                pytest.fail("stalled pool pre-ping succeeded")
+        assert 0.4 <= time.monotonic() - started < 1.5
+        assert ("_do_ping_w_event" in vars(engine.dialect)) is pre_ping_was_own
+        assert vars(engine.dialect).get("_do_ping_w_event") is original_own_pre_ping
+        assert cast(Any, engine.pool).checkedout() == 0
+        engine.dialect.do_ping = original_do_ping
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("SELECT 1").scalar_one() == 1
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_pre_ping_reconnects_stale_pooled_connection() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(
+            database_url, pool_pre_ping=True, pool_size=1, max_overflow=0
+        )
+        with engine.connect() as connection:
+            stale_raw = cast(Any, connection.connection.driver_connection)
+        stale_raw.close()
+        pre_ping_was_own = "_do_ping_w_event" in vars(engine.dialect)
+        original_own_pre_ping = vars(engine.dialect).get("_do_ping_w_event")
+
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ) as connection:
+            assert connection.exec_driver_sql("SELECT 1").scalar_one() == 1
+            assert connection.connection.driver_connection is not stale_raw
+            assert (
+                connection.exec_driver_sql("SHOW statement_timeout").scalar_one() == "0"
+            )
+        assert cast(Any, engine.pool).checkedout() == 0
+        assert ("_do_ping_w_event" in vars(engine.dialect)) is pre_ping_was_own
+        assert vars(engine.dialect).get("_do_ping_w_event") is original_own_pre_ping
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_captures_before_existing_checkout_listener() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        with engine.connect():
+            pass
+
+        def stall_checkout(
+            dbapi_connection: Any, _connection_record: Any, _connection_proxy: Any
+        ) -> None:
+            time.sleep(0.55)
+            with dbapi_connection.cursor() as cursor:
+                cursor.execute("SELECT pg_sleep(10)")
+
+        event.listen(engine, "checkout", stall_checkout)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="initialization exceeded deadline"):
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, started + 0.5
+            ):
+                pytest.fail("stalled pre-existing checkout listener succeeded")
+        assert 0.4 <= time.monotonic() - started < 1.5
+        assert cast(Any, engine.pool).checkedout() == 0
+        event.remove(engine, "checkout", stall_checkout)
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("SELECT 1").scalar_one() == 1
+        engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_watchdog_join_failure_discards_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnstoppableTimer:
+        name = ""
+        daemon = False
+
+        def __init__(self, _interval: float, _callback: Any) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            pass
+
+        def join(self, _timeout: float) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return True
+
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        with engine.connect():
+            pass
+        pre_ping_was_own = "_do_ping_w_event" in vars(engine.dialect)
+        original_own_pre_ping = vars(engine.dialect).get("_do_ping_w_event")
+        monkeypatch.setattr(store_migration.threading, "Timer", UnstoppableTimer)
+        with pytest.raises(RuntimeError, match="watchdog failed to stop"):
+            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+                engine, time.monotonic() + 5
+            ):
+                pytest.fail("unstopped watchdog yielded a connection")
+        assert cast(Any, engine.pool).checkedout() == 0
+        assert ("_do_ping_w_event" in vars(engine.dialect)) is pre_ping_was_own
+        assert vars(engine.dialect).get("_do_ping_w_event") is original_own_pre_ping
         engine.dispose()
 
 
