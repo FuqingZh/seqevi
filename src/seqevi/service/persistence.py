@@ -438,14 +438,22 @@ class PostgresEvidencePersistence:
             expected = {
                 (*_key_sort_value(claim.key), claim.generation) for claim in requested
             }
+            key_values = tuple(
+                dict.fromkeys(_key_sort_value(claim.key) for claim in requested)
+            )
             rows = connection.execute(
                 select(
                     *(session_claims.c[name] for name in _CLAIM_KEY_NAMES),
                     session_claims.c.generation,
-                ).where(session_claims.c.session_id == authority.session_id)
+                ).where(
+                    session_claims.c.session_id == authority.session_id,
+                    tuple_(*(session_claims.c[name] for name in _CLAIM_KEY_NAMES)).in_(
+                        key_values
+                    ),
+                )
             ).all()
             actual = {tuple(row) for row in rows}
-            return expected <= actual
+            return actual == expected
 
     def sweep_claim_sessions(self) -> int:
         """Reclaim at most one fixed-width chunk of each coordination row type."""

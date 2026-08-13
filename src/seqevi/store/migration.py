@@ -116,8 +116,41 @@ def _pristine(connection: Connection) -> bool:
     return not names or names == {"alembic_version"} and _revision(connection) is None
 
 
-def _database_identity(engine: Engine) -> str:
-    return engine.url.render_as_string(hide_password=True)
+def _database_identity(engine: Engine, store_root: Path | None = None) -> str:
+    if engine.dialect.name != "sqlite":
+        return engine.url.render_as_string(hide_password=True)
+    database_path = _canonical_sqlite_database_path(engine, store_root)
+    return engine.url.set(database=str(database_path)).render_as_string(
+        hide_password=True
+    )
+
+
+def _canonical_sqlite_database_path(engine: Engine, store_root: Path | None) -> Path:
+    database = engine.url.database
+    if not database or database == ":memory:" or engine.url.query:
+        raise RuntimeError("SQLite maintenance requires one unambiguous file database")
+    lexical_database = Path(database).expanduser()
+    if lexical_database.is_symlink():
+        raise RuntimeError("SQLite maintenance refuses a symlink database target")
+    try:
+        database_path = lexical_database.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise RuntimeError("SQLite maintenance database target is missing") from error
+    if not database_path.is_file():
+        raise RuntimeError("SQLite maintenance target is not a regular database file")
+    if store_root is not None:
+        try:
+            canonical_root = store_root.expanduser().resolve(strict=True)
+        except FileNotFoundError as error:
+            raise RuntimeError("SQLite maintenance Store root is missing") from error
+        if not canonical_root.is_dir():
+            raise RuntimeError("SQLite maintenance Store root is not a directory")
+        expected_path = canonical_root / "store.sqlite3"
+        if database_path != expected_path:
+            raise RuntimeError(
+                "SQLite maintenance database is not the Store database under store_root"
+            )
+    return database_path
 
 
 def upgrade_database(engine: Engine, store_root: Path) -> None:
@@ -192,7 +225,7 @@ def maintenance_upgrade_database(
 ) -> None:
     """Apply 0004 under a bounded persistence fence after operator quiescence."""
 
-    if acknowledgement.database_identity != _database_identity(engine):
+    if acknowledgement.database_identity != _database_identity(engine, store_root):
         raise RuntimeError("maintenance acknowledgement targets another database")
     deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
     if engine.dialect.name == "sqlite":
@@ -240,7 +273,7 @@ def maintenance_downgrade_database(
 ) -> None:
     """Downgrade 0004 to empty 0003 coordination under the same bounded fence."""
 
-    if acknowledgement.database_identity != _database_identity(engine):
+    if acknowledgement.database_identity != _database_identity(engine, store_root):
         raise RuntimeError("maintenance acknowledgement targets another database")
     deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
     if engine.dialect.name == "sqlite":

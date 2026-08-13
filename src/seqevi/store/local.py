@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import and_, create_engine, delete, event, select, tuple_, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, Engine, RowMapping, URL
+from sqlalchemy.exc import OperationalError
 
 from seqevi.errors import (
     EvidenceClaimLostError,
@@ -57,6 +58,9 @@ _LOOKUP_CHUNK_SIZE = 400
 _CLAIM_LEASE_SECONDS = 120.0
 _CLAIM_RENEWAL_SECONDS = 30.0
 _CLAIM_RETRY_SECONDS = 1.0
+_SWEEP_BUSY_TIMEOUT_MS = 100
+_SWEEP_SHUTDOWN_SECONDS = 1.0
+_SWEEP_DRAIN_SECONDS = 1.0
 
 
 def resolve_store_path(
@@ -146,7 +150,7 @@ class LocalStore:
                 engine=engine,
                 artifact_store=PosixArtifactStore(root / "artifacts"),
             )
-            store._drain_coordination()
+            store._drain_coordination(time.monotonic() + _SWEEP_DRAIN_SECONDS)
             store._sweeper.start()
             return store
         except Exception:
@@ -156,25 +160,43 @@ class LocalStore:
     def close(self) -> None:
         self._sweeper_stop.set()
         self._sweeper_wake.set()
-        self._sweeper.join()
-        self._drain_coordination()
+        self._sweeper.join(timeout=_SWEEP_SHUTDOWN_SECONDS)
+        if not self._sweeper.is_alive():
+            self._drain_coordination(time.monotonic() + _SWEEP_DRAIN_SECONDS)
         self.engine.dispose()
 
     def _sweep_loop(self) -> None:
         while not self._sweeper_stop.is_set():
             self._sweeper_wake.wait(timeout=1.0)
             self._sweeper_wake.clear()
-            while not self._sweeper_stop.is_set() and self._sweep_once():
+            try:
+                while not self._sweeper_stop.is_set() and self._sweep_once():
+                    pass
+            except OperationalError as error:
+                if not _sqlite_is_busy(error):
+                    raise
+
+    def _drain_coordination(self, deadline: float) -> None:
+        try:
+            while time.monotonic() < deadline and self._sweep_once(
+                busy_timeout_ms=max(
+                    min(
+                        int((deadline - time.monotonic()) * 1000),
+                        _SWEEP_BUSY_TIMEOUT_MS,
+                    ),
+                    1,
+                )
+            ):
                 pass
+        except OperationalError as error:
+            if not _sqlite_is_busy(error):
+                raise
 
-    def _drain_coordination(self) -> None:
-        while self._sweep_once():
-            pass
-
-    def _sweep_once(self) -> int:
+    def _sweep_once(self, *, busy_timeout_ms: int = _SWEEP_BUSY_TIMEOUT_MS) -> int:
         now = datetime.now(UTC)
         removed = 0
         with self.engine.begin() as connection:
+            connection.exec_driver_sql(f"PRAGMA busy_timeout={busy_timeout_ms}")
             stale_sessions = select(claim_sessions.c.session_id).where(
                 (claim_sessions.c.state == "closing")
                 | (claim_sessions.c.expires_at <= now)
@@ -289,7 +311,7 @@ class LocalStore:
                 )
             )
             removed += result.rowcount
-        return removed
+            return removed
 
     @property
     def supports_claim_sessions(self) -> bool:
@@ -1031,6 +1053,10 @@ def _key_sort_value(key: EvidenceKey) -> tuple[str, str, str, str, str]:
         key.resource_id,
         key.semantic_parameters_hash,
     )
+
+
+def _sqlite_is_busy(error: OperationalError) -> bool:
+    return getattr(error.orig, "sqlite_errorcode", None) in {5, 6}
 
 
 def _as_utc(value: datetime) -> datetime:

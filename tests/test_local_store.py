@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 import threading
 import time
@@ -407,3 +408,40 @@ def test_concurrent_identical_commits_are_idempotent(tmp_path: Path) -> None:
         outcomes = list(executor.map(lambda _index: commit_once(), range(2)))
 
     assert sorted(outcomes) == [CommitOutcome.CREATED, CommitOutcome.EXISTING]
+
+
+def test_sweeper_close_is_bounded_by_writer_contention_and_recovers_next_open(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "store"
+    store = LocalStore.open(root)
+    with store.engine.begin() as connection:
+        connection.execute(
+            claim_sessions.insert().values(
+                session_id="stale-session",
+                owner_token="owner",
+                generation=1,
+                state="closing",
+                expires_at=datetime.now(UTC),
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    blocker = store.engine.connect()
+    blocker.exec_driver_sql("BEGIN IMMEDIATE")
+    store._sweeper_wake.set()  # pyright: ignore[reportPrivateUsage]
+    time.sleep(0.05)
+    started = time.monotonic()
+    store.close()
+    assert time.monotonic() - started < 2.5
+    blocker.rollback()
+    blocker.close()
+
+    with LocalStore.open(root) as recovered:
+        with recovered.engine.connect() as connection:
+            assert (
+                connection.execute(
+                    select(func.count()).select_from(claim_sessions)
+                ).scalar_one()
+                == 0
+            )
