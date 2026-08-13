@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import logging
 import json
+import sys
 import threading
 import time
 from collections.abc import Iterable, Iterator
@@ -12,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from inspect import signature
 from typing import Any, cast
 
 import httpx
@@ -272,7 +275,8 @@ def test_http_store_matches_lookup_commit_and_fetch_contract(tmp_path: Path) -> 
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         assert store.commit_many((commit,)) == (CommitOutcome.CREATED,)
         assert store.commit_many((commit,)) == (CommitOutcome.EXISTING,)
@@ -310,7 +314,8 @@ def test_http_store_preserves_no_hit_without_normalized_artifact(
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         store.commit_many((commit,))
         fetched = store.fetch(key)
@@ -338,7 +343,8 @@ def test_http_fetch_many_chunks_metadata_requests_without_n_plus_one(
         store = HttpEvidenceStore(
             "http://testserver",
             maximum_batch_size=2,
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         store.commit_many((first, second))
         store.commit_many((third,))
@@ -364,7 +370,8 @@ def test_http_lookup_and_commit_follow_discovered_service_batch_size(
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         assert store.maximum_batch_size == 2
         assert store.commit_many(commits) == (CommitOutcome.CREATED,) * 3
@@ -397,7 +404,8 @@ def test_http_store_uses_discovered_artifact_limit_and_formats_stream_errors(
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         assert store.maximum_artifact_bytes == 1234
         with pytest.raises(StoreError, match="HTTP 404"):
@@ -629,6 +637,1064 @@ def _claim_health(maximum_batch_size: int = 1000) -> dict[str, object]:
     }
 
 
+def test_http_store_released_constructor_compatibility_boundary() -> None:
+    parameters = signature(HttpEvidenceStore).parameters
+    assert [name for name in parameters if not name.startswith("_")] == [
+        "base_url",
+        "timeout_seconds",
+        "maximum_artifact_bytes",
+        "maximum_batch_size",
+    ]
+    assert "client" not in parameters
+    with httpx.Client() as released_client:
+        with pytest.raises(TypeError, match="client"):
+            HttpEvidenceStore(
+                "http://testserver",
+                client=released_client,  # type: ignore[call-arg]
+            )
+    store_module = importlib.import_module("seqevi.store")
+    assert not hasattr(store_module, "ClaimCapableEvidenceStore")
+    assert not hasattr(store_module, "is_claim_capable_store")
+
+
+class _BlockingAsyncBody(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self.started = threading.Event()
+
+    async def __aiter__(self):
+        self.started.set()
+        yield b"{"
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
+
+
+def test_claim_transport_deadline_aborts_body_and_joins_runtime() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    body = _BlockingAsyncBody()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=body)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        runtime.request("GET", "/slow", deadline=started + 0.05)
+    assert time.monotonic() - started < 0.5
+    assert body.cancelled.wait(0.1)
+    runtime.close()
+    assert not runtime._thread.is_alive()
+
+
+def test_claim_transport_cancellation_is_request_local() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    blocked = threading.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/slow":
+            blocked.set()
+            await asyncio.Event().wait()
+        return httpx.Response(200, json={"path": request.url.path})
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    failures: list[BaseException] = []
+
+    def slow_request() -> None:
+        try:
+            runtime.request("GET", "/slow", deadline=time.monotonic() + 0.1)
+        except BaseException as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=slow_request)
+    worker.start()
+    assert blocked.wait(0.2)
+    response = runtime.request("GET", "/fast", deadline=time.monotonic() + 0.2)
+    worker.join(0.5)
+    assert response.json() == {"path": "/fast"}
+    assert len(failures) == 1 and isinstance(failures[0], TimeoutError)
+    assert not worker.is_alive()
+    runtime.close()
+
+
+def test_claim_transport_close_cancels_and_joins_outstanding_request() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    blocked = threading.Event()
+    cancelled = threading.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        blocked.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        raise AssertionError("blocked request unexpectedly resumed")
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    worker = threading.Thread(
+        target=lambda: pytest.raises(
+            BaseException,
+            runtime.request,
+            "GET",
+            "/blocked",
+            deadline=time.monotonic() + 10.0,
+        )
+    )
+    worker.start()
+    assert blocked.wait(0.2)
+    runtime.close()
+    worker.join(0.2)
+    assert cancelled.is_set()
+    assert not worker.is_alive()
+    assert not runtime._thread.is_alive()
+
+
+def test_artifact_reader_timeout_kills_and_reaps_stalled_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    artifact = tmp_path / "artifact"
+    artifact.write_bytes(b"payload")
+    pid_file = tmp_path / "reader.pid"
+    monkeypatch.setattr(
+        store_client_module,
+        "_artifact_reader_command",
+        lambda path: (
+            sys.executable,
+            "-c",
+            (
+                "import os, pathlib, signal, sys; "
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), "
+                "encoding='ascii'); signal.pause()"
+            ),
+            str(pid_file),
+        ),
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        return httpx.Response(200)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    errors: list[BaseException] = []
+
+    def request_upload() -> None:
+        try:
+            runtime.request(
+                "PUT",
+                "/upload",
+                deadline=time.monotonic() + 10.0,
+                content=store_client_module._async_file_chunks(artifact),
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(
+        target=request_upload,
+    )
+    worker.start()
+    for _attempt in range(50):
+        if pid_file.exists() and pid_file.stat().st_size:
+            break
+        time.sleep(0.01)
+    reader_pid = int(pid_file.read_text(encoding="ascii"))
+    runtime.close()
+    worker.join(1.0)
+    assert not worker.is_alive()
+    assert errors
+    with pytest.raises(ProcessLookupError):
+        os.kill(reader_pid, 0)
+
+
+def test_artifact_reader_streams_more_than_one_chunk_exactly(tmp_path: Path) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    content = os.urandom(store_client_module._TRANSFER_CHUNK_SIZE + 17)
+    artifact = tmp_path / "artifact"
+    artifact.write_bytes(content)
+    observed: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(await request.aread())
+        return httpx.Response(200)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    runtime.request(
+        "PUT",
+        "/upload",
+        deadline=time.monotonic() + 10.0,
+        content=store_client_module._async_file_chunks(artifact),
+    )
+    runtime.close()
+    assert observed == [content]
+
+
+def test_private_helpers_ignore_shadow_package_in_cwd_and_pythonpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    shadow_root = tmp_path / "shadow"
+    shadow_package = shadow_root / "seqevi" / "store"
+    shadow_package.mkdir(parents=True)
+    marker = tmp_path / "shadow-loaded"
+    (shadow_root / "seqevi" / "__init__.py").write_text(
+        f"from pathlib import Path; Path({str(marker)!r}).write_text('loaded')\n",
+        encoding="utf-8",
+    )
+    (shadow_package / "__init__.py").write_text("", encoding="utf-8")
+    (shadow_package / "_artifact_reader.py").write_text(
+        "raise RuntimeError('shadow artifact reader loaded')\n", encoding="utf-8"
+    )
+    (shadow_package / "_resolver.py").write_text(
+        "raise RuntimeError('shadow resolver loaded')\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(shadow_root)
+    monkeypatch.setenv("PYTHONPATH", str(shadow_root))
+    artifact = tmp_path / "artifact"
+    artifact.write_bytes(b"isolated payload")
+    observed: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(await request.aread())
+        return httpx.Response(200)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    runtime.request(
+        "PUT",
+        "/upload",
+        deadline=time.monotonic() + 10.0,
+        content=store_client_module._async_file_chunks(artifact),
+    )
+    resolved = runtime.run(runtime._loop.getaddrinfo(b"localhost", 443, type=1))
+    runtime.close()
+    assert observed == [b"isolated payload"]
+    assert resolved
+    assert not marker.exists()
+
+
+def test_request_closes_upload_stream_when_transport_returns_early(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    artifact = tmp_path / "artifact"
+    artifact.write_bytes(b"payload")
+    pid_file = tmp_path / "reader.pid"
+    monkeypatch.setattr(
+        store_client_module,
+        "_artifact_reader_command",
+        lambda _path: (
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,signal,struct,sys;"
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()),encoding='ascii');"
+                "sys.stdout.buffer.write(struct.pack('!q',7)+b'payload');"
+                "sys.stdout.buffer.flush();signal.pause()"
+            ),
+            str(pid_file),
+        ),
+    )
+
+    class EarlyResponseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            stream = cast(httpx.AsyncByteStream, request.stream).__aiter__()
+            assert await stream.__anext__() == b"payload"
+            return httpx.Response(200, json={"accepted": True})
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, EarlyResponseTransport()
+    )
+    response = runtime.request(
+        "PUT",
+        "/upload",
+        deadline=time.monotonic() + 10.0,
+        content=store_client_module._async_file_chunks(artifact),
+    )
+    assert response.json() == {"accepted": True}
+    reader_pid = int(pid_file.read_text(encoding="ascii"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(reader_pid, 0)
+    runtime.close()
+
+
+def test_artifact_reader_reports_error_and_is_reaped(tmp_path: Path) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        return httpx.Response(200)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    with pytest.raises(StoreIntegrityError, match="artifact reader failed"):
+        runtime.request(
+            "PUT",
+            "/upload",
+            deadline=time.monotonic() + 10.0,
+            content=store_client_module._async_file_chunks(tmp_path / "missing"),
+        )
+    runtime.close()
+
+
+def test_claim_transport_request_close_admission_race_does_not_strand() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver",
+        10.0,
+        httpx.MockTransport(lambda _request: httpx.Response(200)),
+    )
+    runtime._admission_lock.acquire()
+    request_done = threading.Event()
+    close_done = threading.Event()
+    request_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+
+    def request_once() -> None:
+        try:
+            runtime.request("GET", "/race", deadline=time.monotonic() + 1.0)
+        except BaseException as error:
+            request_errors.append(error)
+        finally:
+            request_done.set()
+
+    def close_once() -> None:
+        try:
+            runtime.close()
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    request = threading.Thread(target=request_once)
+    close = threading.Thread(target=close_once)
+    request.start()
+    close.start()
+    runtime._admission_lock.release()
+    request.join(0.5)
+    close.join(0.5)
+    assert request_done.is_set()
+    assert close_done.is_set()
+    assert not request.is_alive()
+    assert not close.is_alive()
+    assert not close_errors
+    assert not request_errors or all(
+        isinstance(error, RuntimeError) for error in request_errors
+    )
+    runtime.close()
+
+
+def test_claim_resolver_normal_result_shape() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://127.0.0.1", 10.0, httpx.MockTransport(lambda _: httpx.Response(200))
+    )
+    resolved = runtime.run(runtime._loop.getaddrinfo(b"localhost", 443, type=1))
+    runtime.close()
+    assert resolved
+    assert all(len(item) == 5 and isinstance(item[4], tuple) for item in resolved)
+
+
+def test_claim_resolver_close_kills_and_reaps_stalled_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    pid_file = tmp_path / "resolver.pid"
+    monkeypatch.setattr(
+        store_client_module,
+        "_resolver_command",
+        lambda *_args: (
+            sys.executable,
+            "-c",
+            (
+                "import os,pathlib,signal,sys;"
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()),encoding='ascii');"
+                "signal.pause()"
+            ),
+            str(pid_file),
+        ),
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        await asyncio.get_running_loop().getaddrinfo(b"stalled.invalid", 443)
+        return httpx.Response(200)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://127.0.0.1", 10.0, httpx.MockTransport(handler)
+    )
+    errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    close_done = threading.Event()
+
+    def resolve() -> None:
+        try:
+            runtime.request("GET", "/resolve", deadline=time.monotonic() + 0.2)
+        except BaseException as error:
+            errors.append(error)
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    worker = threading.Thread(target=resolve)
+    worker.start()
+    for _attempt in range(50):
+        if pid_file.exists() and pid_file.stat().st_size:
+            break
+        time.sleep(0.01)
+    resolver_pid = int(pid_file.read_text(encoding="ascii"))
+    closer = threading.Thread(target=close_runtime)
+    closer.start()
+    worker.join(1.0)
+    closer.join(1.0)
+    assert len(errors) == 1 and isinstance(errors[0], TimeoutError)
+    assert not close_errors
+    assert not worker.is_alive()
+    assert not closer.is_alive()
+    assert close_done.is_set()
+    with pytest.raises(ProcessLookupError):
+        os.kill(resolver_pid, 0)
+
+
+def test_claim_transport_concurrent_close_waits_for_owner() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://127.0.0.1", 10.0, httpx.MockTransport(lambda _: httpx.Response(200))
+    )
+    operation_started = threading.Event()
+    release = threading.Event()
+
+    def operation() -> None:
+        with runtime.operation():
+            operation_started.set()
+            release.wait()
+
+    worker = threading.Thread(target=operation)
+    worker.start()
+    assert operation_started.wait(0.2)
+    closed: list[int] = []
+    close_errors: list[BaseException] = []
+
+    def close_runtime(index: int) -> None:
+        try:
+            runtime.close()
+            closed.append(index)
+        except BaseException as error:
+            close_errors.append(error)
+
+    closers = [
+        threading.Thread(target=close_runtime, args=(index,)) for index in range(2)
+    ]
+    for closer in closers:
+        closer.start()
+    time.sleep(0.05)
+    assert not closed
+    release.set()
+    for closer in closers:
+        closer.join(0.5)
+    worker.join(0.5)
+    assert not worker.is_alive()
+    assert all(not closer.is_alive() for closer in closers)
+    assert not close_errors
+    assert sorted(closed) == [0, 1]
+
+
+def test_http_store_concurrent_close_waits_for_all_cleanup_and_shares_error() -> None:
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(lambda _: httpx.Response(404)),
+    )
+    download_root = store._download_root
+    close_started = threading.Event()
+    release_close = threading.Event()
+
+    class BlockingFailingClient:
+        def close(self) -> None:
+            close_started.set()
+            release_close.wait()
+            raise RuntimeError("sync close failed")
+
+    store.client = cast(Any, BlockingFailingClient())
+    store._owns_client = True
+    errors: list[BaseException] = []
+    done = [threading.Event(), threading.Event()]
+
+    def close_store(index: int) -> None:
+        try:
+            store.close()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            done[index].set()
+
+    closers = [
+        threading.Thread(target=close_store, args=(index,)) for index in range(2)
+    ]
+    closers[0].start()
+    assert close_started.wait(0.5)
+    closers[1].start()
+    time.sleep(0.05)
+    assert not done[0].is_set()
+    assert not done[1].is_set()
+    assert download_root.exists()
+    release_close.set()
+    for closer in closers:
+        closer.join(1.0)
+    assert all(not closer.is_alive() for closer in closers)
+    assert all(event.is_set() for event in done)
+    assert len(errors) == 2
+    assert all(str(error) == "sync close failed" for error in errors)
+    assert not download_root.exists()
+
+
+def test_http_store_close_publishes_unexpected_cleanup_failure_to_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(lambda _: httpx.Response(404)),
+    )
+    original_cleanup = store._cleanup_resources
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    errors: list[BaseException] = []
+
+    def fail_cleanup() -> BaseException | None:
+        cleanup_started.set()
+        release_cleanup.wait()
+        raise RuntimeError("unexpected cleanup failure")
+
+    def close_store() -> None:
+        try:
+            store.close()
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(store, "_cleanup_resources", fail_cleanup)
+    closers = [threading.Thread(target=close_store) for _index in range(2)]
+    closers[0].start()
+    assert cleanup_started.wait(0.5)
+    closers[1].start()
+    release_cleanup.set()
+    for closer in closers:
+        closer.join(1.0)
+    assert all(not closer.is_alive() for closer in closers)
+    assert len(errors) == 2
+    assert all(str(error) == "unexpected cleanup failure" for error in errors)
+    assert store._closed
+    original_cleanup()
+
+
+def test_http_store_reentrant_close_does_not_publish_or_clean_up() -> None:
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(lambda _: httpx.Response(404)),
+    )
+    runtime = store._claim_transport
+    download_root = store._download_root
+    with runtime.operation():
+        with pytest.raises(RuntimeError, match="from an operation"):
+            store.close()
+        assert runtime._thread.is_alive()
+        assert download_root.exists()
+        assert not store._closing.is_set()
+        assert not store._close_started
+        assert not store._closed
+    store.close()
+    assert not runtime._thread.is_alive()
+    assert not download_root.exists()
+    assert store._closed
+
+
+def test_http_store_initialization_error_survives_complete_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    real_temporary_directory = store_client_module.tempfile.TemporaryDirectory
+    real_cleanup_resources = HttpEvidenceStore._cleanup_resources
+    roots: list[Path] = []
+    runtimes: list[Any] = []
+    sync_closed = threading.Event()
+
+    def tracking_temporary_directory(*args: Any, **kwargs: Any) -> Any:
+        directory = real_temporary_directory(*args, dir=tmp_path, **kwargs)
+        roots.append(Path(directory.name))
+        return directory
+
+    class TrackingRuntime(store_client_module._ClaimTransportRuntime):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            runtimes.append(self)
+
+    class OwningClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def close(self) -> None:
+            sync_closed.set()
+
+    class FailingAsyncClose(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            del request
+            return httpx.Response(200)
+
+        async def aclose(self) -> None:
+            raise RuntimeError("async cleanup failed")
+
+    def cleanup_then_fail(store: HttpEvidenceStore) -> BaseException | None:
+        real_cleanup_resources(store)
+        raise RuntimeError("unexpected cleanup wrapper failure")
+
+    monkeypatch.setattr(
+        store_client_module.tempfile,
+        "TemporaryDirectory",
+        tracking_temporary_directory,
+    )
+    monkeypatch.setattr(store_client_module, "_ClaimTransportRuntime", TrackingRuntime)
+    monkeypatch.setattr(store_client_module.httpx, "Client", OwningClient)
+    monkeypatch.setattr(HttpEvidenceStore, "_cleanup_resources", cleanup_then_fail)
+    with pytest.raises(ValueError, match="maximum_artifact_bytes must be positive"):
+        HttpEvidenceStore(
+            "http://testserver",
+            maximum_artifact_bytes=0,
+            maximum_batch_size=1,
+            _async_transport=FailingAsyncClose(),
+        )
+    assert sync_closed.is_set()
+    assert len(roots) == 1 and not roots[0].exists()
+    assert len(runtimes) == 1 and not runtimes[0]._thread.is_alive()
+
+
+def test_claim_transport_aclose_failure_still_joins_runtime() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+
+    class FailingCloseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            del request
+            return httpx.Response(200)
+
+        async def aclose(self) -> None:
+            raise RuntimeError("close failed")
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://127.0.0.1", 10.0, FailingCloseTransport()
+    )
+    with pytest.raises(RuntimeError, match="close failed"):
+        runtime.close()
+    assert not runtime._thread.is_alive()
+    with pytest.raises(RuntimeError, match="close failed"):
+        runtime.close()
+
+
+def test_claim_artifact_upload_reserves_reconciliation_runway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    payload = write_artifact_file(
+        tmp_path / "artifact", b"payload", "application/octet-stream"
+    )
+    session = object.__new__(store_client_module._HttpClaimSession)
+    upload_deadline = 104.0
+    observed: list[float] = []
+    monkeypatch.setattr(store_client_module.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        session,
+        "_upload_until",
+        lambda _payload, *, deadline: observed.append(deadline),
+    )
+
+    session._upload_artifact(payload, deadline=upload_deadline)
+
+    assert observed == [upload_deadline]
+
+
+def test_claim_artifact_upload_rejects_insufficient_runway_before_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    payload = write_artifact_file(
+        tmp_path / "artifact", b"payload", "application/octet-stream"
+    )
+    session = object.__new__(store_client_module._HttpClaimSession)
+    upload_called = False
+    monkeypatch.setattr(store_client_module.time, "monotonic", lambda: 100.0)
+
+    def record_upload(_payload: object, *, deadline: float) -> None:
+        nonlocal upload_called
+        upload_called = True
+
+    monkeypatch.setattr(session, "_upload_until", record_upload)
+
+    with pytest.raises(EvidenceClaimLostError, match="no reconciliation runway"):
+        session._upload_artifact(payload, deadline=100.0)
+    assert not upload_called
+
+
+def test_slow_renew_body_promptly_publishes_session_loss() -> None:
+    now = datetime.now(UTC)
+    renew_body = _BlockingAsyncBody()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "slow-renew",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 5.2,
+                    "heartbeat_after_seconds": 0.01,
+                    "renew_deadline_seconds": 0.1,
+                },
+            )
+        if request.url.path.endswith("/renew"):
+            return httpx.Response(200, stream=renew_body)
+        return httpx.Response(200, json={"closed": True})
+
+    with HttpEvidenceStore(
+        "http://testserver",
+        timeout_seconds=1.0,
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    ) as store:
+        session = store.claim_session()
+        assert session.cancellation_signal.wait(0.5)
+        assert renew_body.cancelled.wait(0.1)
+        with pytest.raises(EvidenceClaimLostError):
+            session.raise_if_lost()
+        session.close()
+        assert not session._thread.is_alive()
+
+
+def test_session_close_after_store_close_stops_heartbeat_without_admission() -> None:
+    now = datetime.now(UTC)
+    remote_close_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal remote_close_calls
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "close-after-store",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 1000,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/close"):
+            remote_close_calls += 1
+        return httpx.Response(200, json={"closed": True})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    )
+    session = store.claim_session()
+    store.close()
+    started = time.monotonic()
+    session.close()
+    assert time.monotonic() - started < 0.5
+    assert not session._thread.is_alive()
+    assert remote_close_calls == 0
+
+
+def test_session_close_sends_remote_close_once_and_is_idempotent() -> None:
+    now = datetime.now(UTC)
+    remote_close_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal remote_close_calls
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "close-once",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 1000,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/close"):
+            remote_close_calls += 1
+        return httpx.Response(200, json={"closed": True})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    )
+    session = store.claim_session()
+    session.close()
+    session.close()
+    assert remote_close_calls == 1
+    assert not session._thread.is_alive()
+    store.close()
+
+
+def test_session_close_replays_unexpected_admission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "close-error",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 1000,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        return httpx.Response(200, json={"closed": True})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    )
+    session = store.claim_session()
+
+    @contextmanager
+    def fail_admission() -> Iterator[None]:
+        raise RuntimeError("unexpected admission failure")
+        yield
+
+    monkeypatch.setattr(store._claim_transport, "operation", fail_admission)
+    for _attempt in range(2):
+        with pytest.raises(RuntimeError, match="unexpected admission failure"):
+            session.close()
+    assert not session._thread.is_alive()
+    monkeypatch.undo()
+    store.close()
+
+
+def test_finalize_commit_then_slow_body_reconciles_inside_original_budget(
+    tmp_path: Path,
+) -> None:
+    commit = _hit_commit(tmp_path / "source", "MSLOWFINALIZEBODY")
+    assert commit.normalized_artifact is not None
+    assert commit.raw_artifact is not None
+    normalized_artifact = commit.normalized_artifact
+    raw_artifact = commit.raw_artifact
+    query = EvidenceQuery(commit.identity, commit.key)
+    now = datetime.now(UTC)
+    slow_body = _BlockingAsyncBody()
+    lookup_remaining: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "slow-finalize",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            return httpx.Response(200, stream=slow_body)
+        if request.url.path.endswith("/lookup"):
+            lookup_remaining.append(request.extensions["timeout"]["read"])
+            record = EvidenceRecord(
+                key=commit.key,
+                status=commit.status,
+                payload_digest=commit.payload_digest,
+                normalized_artifact_digest=normalized_artifact.digest,
+                raw_artifact_digest=raw_artifact.digest,
+                created_at=now,
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "records": [
+                        EvidenceRecordModel.from_domain(record).model_dump(mode="json")
+                    ]
+                },
+            )
+        return httpx.Response(
+            200, json={"session_id": "slow-finalize", "generation": 1}
+        )
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    )
+    session = store.claim_session()
+    session.acquire_many((query,))
+    store._uploaded_artifact_digests.update(
+        (normalized_artifact.digest, raw_artifact.digest)
+    )
+    session._renew_deadline = time.monotonic() + 1.3
+    outcomes: list[tuple[CommitOutcome, ...]] = []
+    errors: list[BaseException] = []
+
+    def finalize_once() -> None:
+        try:
+            outcomes.append(session.finalize_many((commit,)))
+        except BaseException as error:
+            errors.append(error)
+
+    def close_once() -> None:
+        try:
+            store.close()
+            closed.set()
+        except BaseException as error:
+            errors.append(error)
+
+    finalize = threading.Thread(target=finalize_once)
+    finalize.start()
+    assert slow_body.started.wait(0.5)
+    closed = threading.Event()
+    close = threading.Thread(target=close_once)
+    close.start()
+    time.sleep(0.05)
+    assert not closed.is_set()
+    finalize.join(2.0)
+    close.join(2.0)
+    session._stop.set()
+    session._thread.join(0.5)
+    assert outcomes == [(CommitOutcome.EXISTING,)]
+    assert not finalize.is_alive()
+    assert not close.is_alive()
+    assert not errors
+    assert closed.is_set()
+    assert slow_body.cancelled.is_set()
+    assert lookup_remaining and all(
+        0 < remaining <= 1.0 for remaining in lookup_remaining
+    )
+
+
 def test_http_claim_session_refresh_uses_bounded_capability_timeout() -> None:
     now = datetime.now(UTC)
     capability_timeouts: list[float] = []
@@ -667,11 +1733,13 @@ def test_http_claim_session_refresh_uses_bounded_capability_timeout() -> None:
     with HttpEvidenceStore(
         "http://testserver",
         timeout_seconds=120,
-        client=_claim_mock_client(httpx.MockTransport(handler)),
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session():
             pass
-    assert capability_timeouts == [30.0, 30.0]
+    assert len(capability_timeouts) == 2
+    assert all(29.9 < timeout <= 30.0 for timeout in capability_timeouts)
 
 
 @pytest.mark.parametrize(
@@ -706,7 +1774,8 @@ def test_http_claim_session_rejects_partial_capability_advertisement(
     with pytest.raises(ValidationError):
         HttpEvidenceStore(
             "http://testserver",
-            client=_claim_mock_client(httpx.MockTransport(handler)),
+            _client=_claim_mock_client(httpx.MockTransport(handler)),
+            _async_transport=httpx.MockTransport(handler),
         )
 
 
@@ -723,16 +1792,20 @@ def test_claim_request_rejects_response_after_absolute_deadline(
             return httpx.Response(200, json={})
 
     class Store:
-        client = SlowResponseClient()
+        _claim_transport = SlowResponseClient()
 
     session = object.__new__(store_client_module._HttpClaimSession)
     session.store = Store()
     session._stop = threading.Event()
     monkeypatch.setattr(store_client_module.time, "monotonic", lambda: clock[0])
 
-    with pytest.raises(EvidenceClaimLostError, match="response exceeded"):
+    expected_error = StoreError if operation == "acquire" else EvidenceClaimLostError
+    with pytest.raises(expected_error, match="response exceeded"):
         session._request_until(
-            "POST", f"/v1/internal/claim-sessions/{operation}", deadline=10.0
+            "POST",
+            f"/v1/internal/claim-sessions/{operation}",
+            deadline=10.0,
+            deadline_loses_authority=operation != "acquire",
         )
 
 
@@ -774,7 +1847,9 @@ def test_http_open_replays_malformed_success_with_same_request_id() -> None:
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session():
             pass
@@ -820,7 +1895,9 @@ def test_http_empty_finalize_is_a_noop() -> None:
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             assert session.finalize_many(()) == ()
@@ -871,7 +1948,9 @@ def test_http_finalize_rejects_logical_duplicate_before_chunk_or_upload(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             with pytest.raises(ValueError, match="duplicate evidence key"):
@@ -970,7 +2049,9 @@ def test_http_receipt_capacity_restarts_acquire_with_new_request_id() -> None:
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         session = store.claim_session()
         assert (
@@ -1080,7 +2161,9 @@ def test_http_acquire_replays_malformed_success_with_same_request_id(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             assert (
@@ -1131,7 +2214,9 @@ def test_http_acquire_rejects_duplicate_keys_before_logical_batch_chunking() -> 
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             with pytest.raises(ValueError, match="duplicate evidence key"):
@@ -1247,7 +2332,9 @@ def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             session.acquire_many((query,))
@@ -1330,7 +2417,9 @@ def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
         return httpx.Response(200, json={"live": True})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             session.acquire_many((query,))
@@ -1339,11 +2428,107 @@ def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
                 for payload in (commit.normalized_artifact, commit.raw_artifact)
                 if payload is not None
             )
-            session._renew_deadline = time.monotonic() + 0.4
+            session._renew_deadline = time.monotonic() + 1.4
             with pytest.raises(StoreError):
                 session.finalize_many((commit,))
     assert lookup_timeouts
-    assert all(0 < timeout <= 0.4 for timeout in lookup_timeouts)
+    assert all(0 < timeout <= 1.4 for timeout in lookup_timeouts)
+
+
+def test_finalize_batch_split_and_artifacts_share_one_absolute_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    commits = (
+        _hit_commit(tmp_path / "first", "MSHAREDBUDGETONE"),
+        _hit_commit(tmp_path / "second", "MSHAREDBUDGETTWO"),
+    )
+    queries = tuple(EvidenceQuery(commit.identity, commit.key) for commit in commits)
+    now = datetime.now(UTC)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "shared-budget",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            payload = json.loads(await request.aread())
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {"key": model["key"], "generation": 1},
+                        }
+                        for model in payload["queries"]
+                    ]
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            return httpx.Response(200, json={"outcomes": ["created"]})
+        return httpx.Response(200, json={"closed": True})
+
+    store = HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    )
+    session = store.claim_session()
+    session.acquire_many(queries)
+    clock = [100.0]
+    deadlines: list[tuple[str, float]] = []
+    monkeypatch.setattr(store_client_module.time, "monotonic", lambda: clock[0])
+    session._renew_deadline = 125.0
+    original_request = store._claim_transport.request
+
+    def capture_request(
+        method: str, path: str, *, deadline: float, **kwargs: Any
+    ) -> httpx.Response:
+        if path.endswith("/finalize"):
+            deadlines.append(("finalize", deadline))
+            clock[0] += 3.0
+        return original_request(method, path, deadline=deadline, **kwargs)
+
+    def capture_upload(_payload: object, *, deadline: float) -> None:
+        deadlines.append(("upload", deadline))
+        clock[0] += 3.0
+
+    monkeypatch.setattr(store._claim_transport, "request", capture_request)
+    monkeypatch.setattr(session, "_upload_until", capture_upload)
+    assert session.finalize_many(commits) == (
+        CommitOutcome.CREATED,
+        CommitOutcome.CREATED,
+    )
+    cutoff = 125.0 - store_client_module._FINALIZE_RECONCILIATION_RUNWAY_SECONDS
+    assert len([kind for kind, _ in deadlines if kind == "upload"]) >= 2
+    assert deadlines == [(kind, cutoff) for kind, _deadline in deadlines]
+    session._stop.set()
+    session._thread.join(0.5)
+    store.close()
 
 
 def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> None:
@@ -1413,7 +2598,9 @@ def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> N
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             session.acquire_many((EvidenceQuery(commit.identity, commit.key),))
@@ -1476,7 +2663,9 @@ def test_http_heartbeat_renews_before_request_deadline() -> None:
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         session = store.claim_session()
         assert renewed.wait(1.0)
@@ -1539,7 +2728,9 @@ def test_http_heartbeat_invalid_success_is_terminal_session_loss(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         session = store.claim_session()
         assert malformed.wait(1.5)
@@ -1592,7 +2783,9 @@ def test_http_heartbeat_applies_deterministic_session_jitter(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         session = store.claim_session()
         assert renewed.wait(1.0)
@@ -1764,7 +2957,8 @@ def test_annotation_results_are_equivalent_for_local_and_http_store(
     with TestClient(app) as test_client:
         remote_store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         first = run_annotation(
             fasta_path=fasta,
@@ -2594,7 +3788,8 @@ def test_postgres_service_commit_lookup_fetch_contract(tmp_path: Path) -> None:
         with TestClient(app) as test_client:
             store = HttpEvidenceStore(
                 "http://testserver",
-                client=cast(httpx.Client, test_client),
+                _client=cast(httpx.Client, test_client),
+                _async_transport=httpx.ASGITransport(app=app),
             )
             assert store.commit_many((commit,)) in {
                 (CommitOutcome.CREATED,),
@@ -2656,7 +3851,11 @@ def test_postgres_http_claim_session_end_to_end(tmp_path: Path) -> None:
         query = EvidenceQuery(commit.identity, commit.key)
         with (
             TestClient(app) as service,
-            HttpEvidenceStore("http://testserver", client=service) as store,
+            HttpEvidenceStore(
+                "http://testserver",
+                _client=service,
+                _async_transport=httpx.ASGITransport(app=app),
+            ) as store,
         ):
             assert store.supports_claim_sessions
             with store.claim_session() as session:
@@ -2681,7 +3880,11 @@ def test_postgres_http_annotation_uses_one_claim_session(tmp_path: Path) -> None
         )
         with TestClient(app) as service:
             capability = service.get("/v1/internal/claim-sessions/capabilities")
-            with HttpEvidenceStore("http://testserver", client=service) as store:
+            with HttpEvidenceStore(
+                "http://testserver",
+                _client=service,
+                _async_transport=httpx.ASGITransport(app=app),
+            ) as store:
                 summary = run_annotation(
                     fasta_path=fasta,
                     output_dir=tmp_path / "session-output",
