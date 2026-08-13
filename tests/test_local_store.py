@@ -445,3 +445,12 @@ def test_sweeper_close_is_bounded_by_writer_contention_and_recovers_next_open(
                 ).scalar_one()
                 == 0
             )
+
+
+def test_sweeper_restores_foreground_sqlite_busy_timeout(tmp_path: Path) -> None:
+    with LocalStore.open(tmp_path / "store") as store:
+        store._sweep_once()  # pyright: ignore[reportPrivateUsage]
+        with store.engine.connect() as connection:
+            assert (
+                connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one() == 30000
+            )

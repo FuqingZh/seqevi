@@ -2305,6 +2305,44 @@ def test_sqlite_maintenance_identity_fails_closed_before_ddl(
     engine.dispose()
 
 
+def test_sqlite_maintenance_revalidates_target_after_file_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    replacement_path = tmp_path / "replacement.sqlite3"
+    config = Config()
+    config.set_main_option(
+        "script_location", str(Path(store_migration.__file__).with_name("migrations"))
+    )
+    for path in (database_path, replacement_path):
+        seeded = create_engine(f"sqlite+pysqlite:///{path}")
+        with seeded.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0003_evidence_claim_leases")
+            connection.commit()
+        seeded.dispose()
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    acknowledgement = store_migration.MaintenanceAcknowledgement(
+        store_migration._database_identity(engine, store_root),  # pyright: ignore[reportPrivateUsage]
+        "0003_evidence_claim_leases",
+    )
+
+    @contextmanager
+    def replace_after_fence(_store_root: Path, _deadline: float):
+        database_path.replace(tmp_path / "original.sqlite3")
+        replacement_path.replace(database_path)
+        yield
+
+    monkeypatch.setattr(store_migration, "_bounded_file_lock", replace_after_fence)
+    with pytest.raises(RuntimeError, match="target changed before fencing"):
+        store_migration.maintenance_upgrade_database(
+            engine, store_root, acknowledgement
+        )
+    engine.dispose()
+
+
 @pytest.mark.requires_postgres
 def test_postgres_fenced_downgrade_recreates_empty_0003_coordination() -> None:
     with _isolated_postgres_url() as database_url:

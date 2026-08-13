@@ -153,6 +153,29 @@ def _canonical_sqlite_database_path(engine: Engine, store_root: Path | None) -> 
     return database_path
 
 
+def _sqlite_file_identity(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino
+
+
+def _validate_opened_sqlite_target(
+    connection: Connection, expected_path: Path, expected_identity: tuple[int, int]
+) -> None:
+    databases = connection.exec_driver_sql("PRAGMA database_list").all()
+    main_paths = [row[2] for row in databases if row[1] == "main"]
+    if len(main_paths) != 1 or not main_paths[0]:
+        raise RuntimeError("SQLite maintenance opened an ambiguous database target")
+    try:
+        opened_path = Path(main_paths[0]).resolve(strict=True)
+        opened_identity = _sqlite_file_identity(opened_path)
+    except (FileNotFoundError, OSError) as error:
+        raise RuntimeError(
+            "SQLite maintenance opened target cannot be verified"
+        ) from error
+    if opened_path != expected_path or opened_identity != expected_identity:
+        raise RuntimeError("SQLite maintenance database target changed before fencing")
+
+
 def upgrade_database(engine: Engine, store_root: Path) -> None:
     """Bootstrap pristine SQLite to 0004; fail closed for existing pre-0004 Stores."""
 
@@ -231,11 +254,16 @@ def maintenance_upgrade_database(
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
+        database_path = _canonical_sqlite_database_path(engine, store_root)
+        database_identity = _sqlite_file_identity(database_path)
         try:
             with (
                 _bounded_file_lock(store_root, deadline),
                 engine.connect() as connection,
             ):
+                _validate_opened_sqlite_target(
+                    connection, database_path, database_identity
+                )
                 remaining = _remaining(deadline)
                 connection.exec_driver_sql(
                     f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
@@ -279,11 +307,16 @@ def maintenance_downgrade_database(
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
+        database_path = _canonical_sqlite_database_path(engine, store_root)
+        database_identity = _sqlite_file_identity(database_path)
         try:
             with (
                 _bounded_file_lock(store_root, deadline),
                 engine.connect() as connection,
             ):
+                _validate_opened_sqlite_target(
+                    connection, database_path, database_identity
+                )
                 connection.exec_driver_sql(
                     f"PRAGMA busy_timeout={max(int(_remaining(deadline) * 1000), 1)}"
                 )

@@ -197,121 +197,126 @@ class LocalStore:
         removed = 0
         with self.engine.begin() as connection:
             connection.exec_driver_sql(f"PRAGMA busy_timeout={busy_timeout_ms}")
-            stale_sessions = select(claim_sessions.c.session_id).where(
-                (claim_sessions.c.state == "closing")
-                | (claim_sessions.c.expires_at <= now)
-            )
-            claim_ids = (
-                select(
-                    session_claims.c.sequence_id,
-                    session_claims.c.adapter_contract_version,
-                    session_claims.c.tool_runtime_digest,
-                    session_claims.c.resource_id,
-                    session_claims.c.semantic_parameters_hash,
+            try:
+                stale_sessions = select(claim_sessions.c.session_id).where(
+                    (claim_sessions.c.state == "closing")
+                    | (claim_sessions.c.expires_at <= now)
                 )
-                .where(session_claims.c.session_id.in_(stale_sessions))
-                .order_by(*session_claims.primary_key.columns)
-                .limit(1000)
-            )
-            result = connection.execute(
-                delete(session_claims).where(
-                    tuple_(*session_claims.primary_key.columns).in_(claim_ids)
+                claim_ids = (
+                    select(
+                        session_claims.c.sequence_id,
+                        session_claims.c.adapter_contract_version,
+                        session_claims.c.tool_runtime_digest,
+                        session_claims.c.resource_id,
+                        session_claims.c.semantic_parameters_hash,
+                    )
+                    .where(session_claims.c.session_id.in_(stale_sessions))
+                    .order_by(*session_claims.primary_key.columns)
+                    .limit(1000)
                 )
-            )
-            removed += result.rowcount
-            cutoff = now - timedelta(seconds=60)
-            item_ids = (
-                select(
-                    claim_session_acquire_receipt_items.c.session_id,
-                    claim_session_acquire_receipt_items.c.request_id,
-                    claim_session_acquire_receipt_items.c.input_index,
+                result = connection.execute(
+                    delete(session_claims).where(
+                        tuple_(*session_claims.primary_key.columns).in_(claim_ids)
+                    )
                 )
-                .join(claim_session_acquire_receipts)
-                .where(claim_session_acquire_receipts.c.created_at <= cutoff)
-                .order_by(
-                    claim_session_acquire_receipts.c.created_at,
-                    claim_session_acquire_receipt_items.c.session_id,
-                    claim_session_acquire_receipt_items.c.request_id,
-                    claim_session_acquire_receipt_items.c.input_index,
-                )
-                .limit(1000)
-            )
-            result = connection.execute(
-                delete(claim_session_acquire_receipt_items).where(
-                    tuple_(
+                removed += result.rowcount
+                cutoff = now - timedelta(seconds=60)
+                item_ids = (
+                    select(
                         claim_session_acquire_receipt_items.c.session_id,
                         claim_session_acquire_receipt_items.c.request_id,
                         claim_session_acquire_receipt_items.c.input_index,
-                    ).in_(item_ids)
-                )
-            )
-            removed += result.rowcount
-            header_ids = (
-                select(
-                    claim_session_acquire_receipts.c.session_id,
-                    claim_session_acquire_receipts.c.request_id,
-                )
-                .where(
-                    claim_session_acquire_receipts.c.created_at <= cutoff,
-                    ~select(claim_session_acquire_receipt_items.c.input_index)
-                    .where(
-                        claim_session_acquire_receipt_items.c.session_id
-                        == claim_session_acquire_receipts.c.session_id,
-                        claim_session_acquire_receipt_items.c.request_id
-                        == claim_session_acquire_receipts.c.request_id,
                     )
-                    .exists(),
+                    .join(claim_session_acquire_receipts)
+                    .where(claim_session_acquire_receipts.c.created_at <= cutoff)
+                    .order_by(
+                        claim_session_acquire_receipts.c.created_at,
+                        claim_session_acquire_receipt_items.c.session_id,
+                        claim_session_acquire_receipt_items.c.request_id,
+                        claim_session_acquire_receipt_items.c.input_index,
+                    )
+                    .limit(1000)
                 )
-                .limit(1000)
-            )
-            result = connection.execute(
-                delete(claim_session_acquire_receipts).where(
-                    tuple_(
+                result = connection.execute(
+                    delete(claim_session_acquire_receipt_items).where(
+                        tuple_(
+                            claim_session_acquire_receipt_items.c.session_id,
+                            claim_session_acquire_receipt_items.c.request_id,
+                            claim_session_acquire_receipt_items.c.input_index,
+                        ).in_(item_ids)
+                    )
+                )
+                removed += result.rowcount
+                header_ids = (
+                    select(
                         claim_session_acquire_receipts.c.session_id,
                         claim_session_acquire_receipts.c.request_id,
-                    ).in_(header_ids)
-                )
-            )
-            removed += result.rowcount
-            empty_sessions = (
-                select(claim_sessions.c.session_id)
-                .where(
-                    (
-                        (claim_sessions.c.state == "closing")
-                        | (claim_sessions.c.expires_at <= now)
-                    ),
-                    ~select(session_claims.c.sequence_id)
-                    .where(session_claims.c.session_id == claim_sessions.c.session_id)
-                    .exists(),
-                    ~select(claim_session_acquire_receipts.c.request_id)
+                    )
                     .where(
-                        claim_session_acquire_receipts.c.session_id
-                        == claim_sessions.c.session_id
-                    )
-                    .exists(),
-                )
-                .limit(1000)
-            )
-            result = connection.execute(
-                delete(claim_sessions).where(
-                    claim_sessions.c.session_id.in_(empty_sessions)
-                )
-            )
-            removed += result.rowcount
-            result = connection.execute(
-                delete(claim_session_open_receipts).where(
-                    claim_session_open_receipts.c.open_request_id.in_(
-                        select(claim_session_open_receipts.c.open_request_id)
+                        claim_session_acquire_receipts.c.created_at <= cutoff,
+                        ~select(claim_session_acquire_receipt_items.c.input_index)
                         .where(
-                            claim_session_open_receipts.c.created_at
-                            <= now - timedelta(seconds=120)
+                            claim_session_acquire_receipt_items.c.session_id
+                            == claim_session_acquire_receipts.c.session_id,
+                            claim_session_acquire_receipt_items.c.request_id
+                            == claim_session_acquire_receipts.c.request_id,
                         )
-                        .limit(1000)
+                        .exists(),
+                    )
+                    .limit(1000)
+                )
+                result = connection.execute(
+                    delete(claim_session_acquire_receipts).where(
+                        tuple_(
+                            claim_session_acquire_receipts.c.session_id,
+                            claim_session_acquire_receipts.c.request_id,
+                        ).in_(header_ids)
                     )
                 )
-            )
-            removed += result.rowcount
-            return removed
+                removed += result.rowcount
+                empty_sessions = (
+                    select(claim_sessions.c.session_id)
+                    .where(
+                        (
+                            (claim_sessions.c.state == "closing")
+                            | (claim_sessions.c.expires_at <= now)
+                        ),
+                        ~select(session_claims.c.sequence_id)
+                        .where(
+                            session_claims.c.session_id == claim_sessions.c.session_id
+                        )
+                        .exists(),
+                        ~select(claim_session_acquire_receipts.c.request_id)
+                        .where(
+                            claim_session_acquire_receipts.c.session_id
+                            == claim_sessions.c.session_id
+                        )
+                        .exists(),
+                    )
+                    .limit(1000)
+                )
+                result = connection.execute(
+                    delete(claim_sessions).where(
+                        claim_sessions.c.session_id.in_(empty_sessions)
+                    )
+                )
+                removed += result.rowcount
+                result = connection.execute(
+                    delete(claim_session_open_receipts).where(
+                        claim_session_open_receipts.c.open_request_id.in_(
+                            select(claim_session_open_receipts.c.open_request_id)
+                            .where(
+                                claim_session_open_receipts.c.created_at
+                                <= now - timedelta(seconds=120)
+                            )
+                            .limit(1000)
+                        )
+                    )
+                )
+                removed += result.rowcount
+                return removed
+            finally:
+                connection.exec_driver_sql("PRAGMA busy_timeout=30000")
 
     @property
     def supports_claim_sessions(self) -> bool:
