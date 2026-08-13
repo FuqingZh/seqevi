@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import logging
@@ -12,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from inspect import signature
 from typing import Any, cast
 
 import httpx
@@ -272,7 +274,8 @@ def test_http_store_matches_lookup_commit_and_fetch_contract(tmp_path: Path) -> 
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         assert store.commit_many((commit,)) == (CommitOutcome.CREATED,)
         assert store.commit_many((commit,)) == (CommitOutcome.EXISTING,)
@@ -310,7 +313,8 @@ def test_http_store_preserves_no_hit_without_normalized_artifact(
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         store.commit_many((commit,))
         fetched = store.fetch(key)
@@ -338,7 +342,8 @@ def test_http_fetch_many_chunks_metadata_requests_without_n_plus_one(
         store = HttpEvidenceStore(
             "http://testserver",
             maximum_batch_size=2,
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         store.commit_many((first, second))
         store.commit_many((third,))
@@ -364,7 +369,8 @@ def test_http_lookup_and_commit_follow_discovered_service_batch_size(
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         assert store.maximum_batch_size == 2
         assert store.commit_many(commits) == (CommitOutcome.CREATED,) * 3
@@ -397,7 +403,8 @@ def test_http_store_uses_discovered_artifact_limit_and_formats_stream_errors(
     with TestClient(app) as test_client:
         store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         assert store.maximum_artifact_bytes == 1234
         with pytest.raises(StoreError, match="HTTP 404"):
@@ -629,6 +636,240 @@ def _claim_health(maximum_batch_size: int = 1000) -> dict[str, object]:
     }
 
 
+def test_http_store_released_constructor_compatibility_boundary() -> None:
+    parameters = signature(HttpEvidenceStore).parameters
+    assert [name for name in parameters if not name.startswith("_")] == [
+        "base_url",
+        "timeout_seconds",
+        "maximum_artifact_bytes",
+        "maximum_batch_size",
+    ]
+    assert "client" not in parameters
+    with httpx.Client() as released_client:
+        with pytest.raises(TypeError, match="client"):
+            HttpEvidenceStore(
+                "http://testserver",
+                client=released_client,  # type: ignore[call-arg]
+            )
+    store_module = importlib.import_module("seqevi.store")
+    assert not hasattr(store_module, "ClaimCapableEvidenceStore")
+    assert not hasattr(store_module, "is_claim_capable_store")
+
+
+class _BlockingAsyncBody(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+
+    async def __aiter__(self):
+        yield b"{"
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cancelled.set()
+
+
+def test_claim_transport_deadline_aborts_body_and_joins_runtime() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    body = _BlockingAsyncBody()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=body)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        runtime.request("GET", "/slow", deadline=started + 0.05)
+    assert time.monotonic() - started < 0.5
+    assert body.cancelled.wait(0.1)
+    runtime.close()
+    assert not runtime._thread.is_alive()
+
+
+def test_claim_transport_cancellation_is_request_local() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    blocked = threading.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/slow":
+            blocked.set()
+            await asyncio.Event().wait()
+        return httpx.Response(200, json={"path": request.url.path})
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    failures: list[BaseException] = []
+
+    def slow_request() -> None:
+        try:
+            runtime.request("GET", "/slow", deadline=time.monotonic() + 0.1)
+        except BaseException as error:
+            failures.append(error)
+
+    worker = threading.Thread(target=slow_request)
+    worker.start()
+    assert blocked.wait(0.2)
+    response = runtime.request("GET", "/fast", deadline=time.monotonic() + 0.2)
+    worker.join(0.5)
+    assert response.json() == {"path": "/fast"}
+    assert len(failures) == 1 and isinstance(failures[0], TimeoutError)
+    assert not worker.is_alive()
+    runtime.close()
+
+
+def test_slow_renew_body_promptly_publishes_session_loss() -> None:
+    now = datetime.now(UTC)
+    renew_body = _BlockingAsyncBody()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "slow-renew",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 5.2,
+                    "heartbeat_after_seconds": 0.01,
+                    "renew_deadline_seconds": 0.1,
+                },
+            )
+        if request.url.path.endswith("/renew"):
+            return httpx.Response(200, stream=renew_body)
+        return httpx.Response(200, json={"closed": True})
+
+    with HttpEvidenceStore(
+        "http://testserver",
+        timeout_seconds=1.0,
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    ) as store:
+        session = store.claim_session()
+        assert session.cancellation_signal.wait(0.5)
+        assert renew_body.cancelled.wait(0.1)
+        with pytest.raises(EvidenceClaimLostError):
+            session.raise_if_lost()
+        session.close()
+        assert not session._thread.is_alive()
+
+
+def test_finalize_commit_then_slow_body_reconciles_inside_original_budget(
+    tmp_path: Path,
+) -> None:
+    commit = _hit_commit(tmp_path / "source", "MSLOWFINALIZEBODY")
+    assert commit.normalized_artifact is not None
+    assert commit.raw_artifact is not None
+    normalized_artifact = commit.normalized_artifact
+    raw_artifact = commit.raw_artifact
+    query = EvidenceQuery(commit.identity, commit.key)
+    now = datetime.now(UTC)
+    slow_body = _BlockingAsyncBody()
+    lookup_remaining: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(
+                200,
+                json={
+                    "session_id": "slow-finalize",
+                    "owner_token": "owner",
+                    "generation": 1,
+                    "expires_at": (now + timedelta(seconds=120)).isoformat(),
+                    "remaining_lease_seconds": 120,
+                    "heartbeat_after_seconds": 30,
+                    "renew_deadline_seconds": 90,
+                },
+            )
+        if request.url.path.endswith("/acquire"):
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "disposition": "acquired",
+                            "claim": {
+                                "key": EvidenceQueryModel.from_domain(
+                                    query
+                                ).key.model_dump(mode="json"),
+                                "generation": 1,
+                            },
+                        }
+                    ]
+                },
+            )
+        if request.url.path.endswith("/finalize"):
+            return httpx.Response(200, stream=slow_body)
+        if request.url.path.endswith("/lookup"):
+            lookup_remaining.append(request.extensions["timeout"]["read"])
+            record = EvidenceRecord(
+                key=commit.key,
+                status=commit.status,
+                payload_digest=commit.payload_digest,
+                normalized_artifact_digest=normalized_artifact.digest,
+                raw_artifact_digest=raw_artifact.digest,
+                created_at=now,
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "records": [
+                        EvidenceRecordModel.from_domain(record).model_dump(mode="json")
+                    ]
+                },
+            )
+        return httpx.Response(
+            200, json={"session_id": "slow-finalize", "generation": 1}
+        )
+
+    with HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    ) as store:
+        with store.claim_session() as session:
+            session.acquire_many((query,))
+            store._uploaded_artifact_digests.update(
+                (normalized_artifact.digest, raw_artifact.digest)
+            )
+            session._renew_deadline = time.monotonic() + 1.3
+            assert session.finalize_many((commit,)) == (CommitOutcome.EXISTING,)
+    assert slow_body.cancelled.is_set()
+    assert lookup_remaining and all(
+        0 < remaining <= 1.0 for remaining in lookup_remaining
+    )
+
+
 def test_http_claim_session_refresh_uses_bounded_capability_timeout() -> None:
     now = datetime.now(UTC)
     capability_timeouts: list[float] = []
@@ -667,11 +908,13 @@ def test_http_claim_session_refresh_uses_bounded_capability_timeout() -> None:
     with HttpEvidenceStore(
         "http://testserver",
         timeout_seconds=120,
-        client=_claim_mock_client(httpx.MockTransport(handler)),
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session():
             pass
-    assert capability_timeouts == [30.0, 30.0]
+    assert len(capability_timeouts) == 2
+    assert all(29.9 < timeout <= 30.0 for timeout in capability_timeouts)
 
 
 @pytest.mark.parametrize(
@@ -706,7 +949,8 @@ def test_http_claim_session_rejects_partial_capability_advertisement(
     with pytest.raises(ValidationError):
         HttpEvidenceStore(
             "http://testserver",
-            client=_claim_mock_client(httpx.MockTransport(handler)),
+            _client=_claim_mock_client(httpx.MockTransport(handler)),
+            _async_transport=httpx.MockTransport(handler),
         )
 
 
@@ -723,16 +967,20 @@ def test_claim_request_rejects_response_after_absolute_deadline(
             return httpx.Response(200, json={})
 
     class Store:
-        client = SlowResponseClient()
+        _claim_transport = SlowResponseClient()
 
     session = object.__new__(store_client_module._HttpClaimSession)
     session.store = Store()
     session._stop = threading.Event()
     monkeypatch.setattr(store_client_module.time, "monotonic", lambda: clock[0])
 
-    with pytest.raises(EvidenceClaimLostError, match="response exceeded"):
+    expected_error = StoreError if operation == "acquire" else EvidenceClaimLostError
+    with pytest.raises(expected_error, match="response exceeded"):
         session._request_until(
-            "POST", f"/v1/internal/claim-sessions/{operation}", deadline=10.0
+            "POST",
+            f"/v1/internal/claim-sessions/{operation}",
+            deadline=10.0,
+            deadline_loses_authority=operation != "acquire",
         )
 
 
@@ -774,7 +1022,9 @@ def test_http_open_replays_malformed_success_with_same_request_id() -> None:
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session():
             pass
@@ -820,7 +1070,9 @@ def test_http_empty_finalize_is_a_noop() -> None:
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             assert session.finalize_many(()) == ()
@@ -871,7 +1123,9 @@ def test_http_finalize_rejects_logical_duplicate_before_chunk_or_upload(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             with pytest.raises(ValueError, match="duplicate evidence key"):
@@ -970,7 +1224,9 @@ def test_http_receipt_capacity_restarts_acquire_with_new_request_id() -> None:
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         session = store.claim_session()
         assert (
@@ -1080,7 +1336,9 @@ def test_http_acquire_replays_malformed_success_with_same_request_id(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             assert (
@@ -1131,7 +1389,9 @@ def test_http_acquire_rejects_duplicate_keys_before_logical_batch_chunking() -> 
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             with pytest.raises(ValueError, match="duplicate evidence key"):
@@ -1247,7 +1507,9 @@ def test_http_finalize_reconciles_apparent_success_after_unknown_outcome(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             session.acquire_many((query,))
@@ -1330,7 +1592,9 @@ def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
         return httpx.Response(200, json={"live": True})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             session.acquire_many((query,))
@@ -1339,11 +1603,11 @@ def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
                 for payload in (commit.normalized_artifact, commit.raw_artifact)
                 if payload is not None
             )
-            session._renew_deadline = time.monotonic() + 0.4
+            session._renew_deadline = time.monotonic() + 1.4
             with pytest.raises(StoreError):
                 session.finalize_many((commit,))
     assert lookup_timeouts
-    assert all(0 < timeout <= 0.4 for timeout in lookup_timeouts)
+    assert all(0 < timeout <= 1.4 for timeout in lookup_timeouts)
 
 
 def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> None:
@@ -1413,7 +1677,9 @@ def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> N
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         with store.claim_session() as session:
             session.acquire_many((EvidenceQuery(commit.identity, commit.key),))
@@ -1476,7 +1742,9 @@ def test_http_heartbeat_renews_before_request_deadline() -> None:
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         session = store.claim_session()
         assert renewed.wait(1.0)
@@ -1539,7 +1807,9 @@ def test_http_heartbeat_invalid_success_is_terminal_session_loss(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         session = store.claim_session()
         assert malformed.wait(1.5)
@@ -1592,7 +1862,9 @@ def test_http_heartbeat_applies_deterministic_session_jitter(
         return httpx.Response(200, json={"session_id": "session", "generation": 1})
 
     with HttpEvidenceStore(
-        "http://testserver", client=_claim_mock_client(httpx.MockTransport(handler))
+        "http://testserver",
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
     ) as store:
         session = store.claim_session()
         assert renewed.wait(1.0)
@@ -1764,7 +2036,8 @@ def test_annotation_results_are_equivalent_for_local_and_http_store(
     with TestClient(app) as test_client:
         remote_store = HttpEvidenceStore(
             "http://testserver",
-            client=cast(httpx.Client, test_client),
+            _client=cast(httpx.Client, test_client),
+            _async_transport=httpx.ASGITransport(app=app),
         )
         first = run_annotation(
             fasta_path=fasta,
@@ -2594,7 +2867,8 @@ def test_postgres_service_commit_lookup_fetch_contract(tmp_path: Path) -> None:
         with TestClient(app) as test_client:
             store = HttpEvidenceStore(
                 "http://testserver",
-                client=cast(httpx.Client, test_client),
+                _client=cast(httpx.Client, test_client),
+                _async_transport=httpx.ASGITransport(app=app),
             )
             assert store.commit_many((commit,)) in {
                 (CommitOutcome.CREATED,),
@@ -2656,7 +2930,11 @@ def test_postgres_http_claim_session_end_to_end(tmp_path: Path) -> None:
         query = EvidenceQuery(commit.identity, commit.key)
         with (
             TestClient(app) as service,
-            HttpEvidenceStore("http://testserver", client=service) as store,
+            HttpEvidenceStore(
+                "http://testserver",
+                _client=service,
+                _async_transport=httpx.ASGITransport(app=app),
+            ) as store,
         ):
             assert store.supports_claim_sessions
             with store.claim_session() as session:
@@ -2681,7 +2959,11 @@ def test_postgres_http_annotation_uses_one_claim_session(tmp_path: Path) -> None
         )
         with TestClient(app) as service:
             capability = service.get("/v1/internal/claim-sessions/capabilities")
-            with HttpEvidenceStore("http://testserver", client=service) as store:
+            with HttpEvidenceStore(
+                "http://testserver",
+                _client=service,
+                _async_transport=httpx.ASGITransport(app=app),
+            ) as store:
                 summary = run_annotation(
                     fasta_path=fasta,
                     output_dir=tmp_path / "session-output",
