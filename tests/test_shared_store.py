@@ -5,6 +5,7 @@ import importlib
 import os
 import logging
 import json
+import sys
 import threading
 import time
 from collections.abc import Iterable, Iterator
@@ -753,53 +754,153 @@ def test_claim_transport_close_cancels_and_joins_outstanding_request() -> None:
     assert not runtime._thread.is_alive()
 
 
-def test_async_artifact_read_does_not_block_other_requests(
+def test_artifact_reader_timeout_kills_and_reaps_stalled_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store_client_module = importlib.import_module("seqevi.store.client")
     artifact = tmp_path / "artifact"
     artifact.write_bytes(b"payload")
-    real_open = Path.open
-    read_started = threading.Event()
-    release_read = threading.Event()
-
-    class SlowHandle:
-        def __init__(self, path: Path) -> None:
-            self._handle = real_open(path, "rb")
-
-        def read(self, size: int) -> bytes:
-            read_started.set()
-            release_read.wait(0.5)
-            return self._handle.read(size)
-
-        def close(self) -> None:
-            self._handle.close()
-
-    monkeypatch.setattr(Path, "open", lambda path, _mode: SlowHandle(path))
+    pid_file = tmp_path / "reader.pid"
+    monkeypatch.setattr(
+        store_client_module,
+        "_artifact_reader_command",
+        lambda path: (
+            sys.executable,
+            "-c",
+            (
+                "import os, pathlib, signal, sys; "
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), "
+                "encoding='ascii'); signal.pause()"
+            ),
+            str(pid_file),
+        ),
+    )
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/upload":
-            await request.aread()
-        return httpx.Response(200, json={"path": request.url.path})
+        await request.aread()
+        return httpx.Response(200)
 
     runtime = store_client_module._ClaimTransportRuntime(
         "http://testserver", 10.0, httpx.MockTransport(handler)
     )
+    errors: list[BaseException] = []
+
+    def request_upload() -> None:
+        try:
+            runtime.request(
+                "PUT",
+                "/upload",
+                deadline=time.monotonic() + 10.0,
+                content=store_client_module._async_file_chunks(artifact),
+            )
+        except BaseException as error:
+            errors.append(error)
+
     worker = threading.Thread(
-        target=runtime.request,
-        args=("PUT", "/upload"),
-        kwargs={
-            "deadline": time.monotonic() + 1.0,
-            "content": store_client_module._async_file_chunks(artifact),
-        },
+        target=request_upload,
     )
     worker.start()
-    assert read_started.wait(0.2)
-    response = runtime.request("GET", "/fast", deadline=time.monotonic() + 0.2)
-    release_read.set()
-    worker.join(0.5)
-    assert response.json() == {"path": "/fast"}
+    for _attempt in range(50):
+        if pid_file.exists():
+            break
+        time.sleep(0.01)
+    reader_pid = int(pid_file.read_text(encoding="ascii"))
+    runtime.close()
+    worker.join(1.0)
     assert not worker.is_alive()
+    assert errors
+    with pytest.raises(ProcessLookupError):
+        os.kill(reader_pid, 0)
+
+
+def test_artifact_reader_streams_more_than_one_chunk_exactly(tmp_path: Path) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    content = os.urandom(store_client_module._TRANSFER_CHUNK_SIZE + 17)
+    artifact = tmp_path / "artifact"
+    artifact.write_bytes(content)
+    observed: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(await request.aread())
+        return httpx.Response(200)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    runtime.request(
+        "PUT",
+        "/upload",
+        deadline=time.monotonic() + 10.0,
+        content=store_client_module._async_file_chunks(artifact),
+    )
+    runtime.close()
+    assert observed == [content]
+
+
+def test_artifact_reader_reports_error_and_is_reaped(tmp_path: Path) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await request.aread()
+        return httpx.Response(200)
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    with pytest.raises(StoreIntegrityError, match="artifact reader failed"):
+        runtime.request(
+            "PUT",
+            "/upload",
+            deadline=time.monotonic() + 10.0,
+            content=store_client_module._async_file_chunks(tmp_path / "missing"),
+        )
+    runtime.close()
+
+
+def test_claim_transport_request_close_admission_race_does_not_strand() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver",
+        10.0,
+        httpx.MockTransport(lambda _request: httpx.Response(200)),
+    )
+    runtime._admission_lock.acquire()
+    request_done = threading.Event()
+    close_done = threading.Event()
+    request_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+
+    def request_once() -> None:
+        try:
+            runtime.request("GET", "/race", deadline=time.monotonic() + 1.0)
+        except BaseException as error:
+            request_errors.append(error)
+        finally:
+            request_done.set()
+
+    def close_once() -> None:
+        try:
+            runtime.close()
+        except BaseException as error:
+            close_errors.append(error)
+        finally:
+            close_done.set()
+
+    request = threading.Thread(target=request_once)
+    close = threading.Thread(target=close_once)
+    request.start()
+    close.start()
+    runtime._admission_lock.release()
+    request.join(0.5)
+    close.join(0.5)
+    assert request_done.is_set()
+    assert close_done.is_set()
+    assert not request.is_alive()
+    assert not close.is_alive()
+    assert not close_errors
+    assert not request_errors or all(
+        isinstance(error, RuntimeError) for error in request_errors
+    )
     runtime.close()
 
 

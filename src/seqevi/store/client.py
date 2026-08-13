@@ -7,6 +7,8 @@ import hashlib
 import math
 import os
 import random
+import struct
+import sys
 import tempfile
 import threading
 import time
@@ -88,6 +90,14 @@ _DEFAULT_CLAIM_RETRY_SECONDS = 0.25
 _CLAIM_RETRY_JITTER_RATIO = 0.1
 _TRANSFER_CHUNK_SIZE = 1024 * 1024
 _FINALIZE_RECONCILIATION_RUNWAY_SECONDS = 1.0
+_READER_STOP_GRACE_SECONDS = 0.2
+_READER_HEADER = struct.Struct("!q")
+_READER_EOF = -1
+_READER_ERROR = -2
+
+
+def _artifact_reader_command(path: Path) -> tuple[str, ...]:
+    return (sys.executable, "-m", "seqevi.store._artifact_reader", str(path))
 
 
 class _ClaimTransportRuntime:
@@ -102,6 +112,7 @@ class _ClaimTransportRuntime:
         self._loop = asyncio.new_event_loop()
         self._started = threading.Event()
         self._closing = threading.Event()
+        self._admission_lock = threading.Lock()
         self._requests: set[asyncio.Task[object]] = set()
         self._thread = threading.Thread(
             target=self._run,
@@ -139,9 +150,13 @@ class _ClaimTransportRuntime:
     def request(
         self, method: str, path: str, *, deadline: float, **kwargs: Any
     ) -> httpx.Response:
-        if self._closing.is_set():
-            raise RuntimeError("ClaimSession transport is closed")
-        return self.run(self._request(method, path, deadline=deadline, **kwargs))
+        with self._admission_lock:
+            if self._closing.is_set():
+                raise RuntimeError("ClaimSession transport is closed")
+            future: Future[httpx.Response] = asyncio.run_coroutine_threadsafe(
+                self._request(method, path, deadline=deadline, **kwargs), self._loop
+            )
+        return future.result()
 
     async def _request(
         self, method: str, path: str, *, deadline: float, **kwargs: Any
@@ -175,8 +190,12 @@ class _ClaimTransportRuntime:
     def close(self) -> None:
         if not self._thread.is_alive():
             return
-        self._closing.set()
-        self.run(self._shutdown())
+        with self._admission_lock:
+            if self._closing.is_set():
+                return
+            self._closing.set()
+            shutdown = asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
+        shutdown.result()
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join()
 
@@ -1109,12 +1128,78 @@ def _file_chunks(path: Path) -> Iterator[bytes]:
 
 
 async def _async_file_chunks(path: Path) -> Any:
-    handle = await asyncio.to_thread(path.open, "rb")
+    process = await asyncio.create_subprocess_exec(
+        *_artifact_reader_command(path),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    complete = False
     try:
-        while chunk := await asyncio.to_thread(handle.read, _TRANSFER_CHUNK_SIZE):
-            yield chunk
+        while True:
+            try:
+                header = await process.stdout.readexactly(_READER_HEADER.size)
+            except asyncio.IncompleteReadError as error:
+                raise StoreIntegrityError(
+                    "artifact reader closed its pipe unexpectedly"
+                ) from error
+            marker = _READER_HEADER.unpack(header)[0]
+            if marker == _READER_EOF:
+                complete = True
+                break
+            if marker == _READER_ERROR:
+                size = _READER_HEADER.unpack(
+                    await process.stdout.readexactly(_READER_HEADER.size)
+                )[0]
+                detail = (await process.stdout.readexactly(size)).decode(
+                    "utf-8", errors="replace"
+                )
+                raise StoreIntegrityError(f"artifact reader failed: {detail}")
+            if marker < 0 or marker > _TRANSFER_CHUNK_SIZE:
+                raise StoreIntegrityError("artifact reader returned an invalid frame")
+            yield await process.stdout.readexactly(marker)
     finally:
-        await asyncio.to_thread(handle.close)
+        cleanup = asyncio.create_task(
+            _stop_artifact_reader(process, cancel=not complete)
+        )
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
+
+
+async def _stop_artifact_reader(
+    process: asyncio.subprocess.Process, *, cancel: bool
+) -> None:
+    wait_task = asyncio.create_task(process.wait())
+    if cancel and process.returncode is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(wait_task), _READER_STOP_GRACE_SECONDS
+            )
+        except TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    # Deliberately unbounded for Linux D-state: this synchronous owner may not
+    # claim deadline completion while its reader still exists.
+    returncode = await wait_task
+    if not cancel and returncode != 0:
+        stderr = b""
+        if process.stderr is not None:
+            stderr = await process.stderr.read(4096)
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise StoreIntegrityError(
+            f"artifact reader exited with status {returncode}"
+            + (f": {detail}" if detail else "")
+        )
 
 
 def _raise_for_store_status(
