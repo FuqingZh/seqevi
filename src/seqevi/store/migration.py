@@ -716,6 +716,12 @@ def _maintenance_upgrade_postgres(
 def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Connection]:
     """Acquire one pooled PostgreSQL connection inside an absolute deadline."""
 
+    from psycopg import capabilities
+
+    if not capabilities.has_cancel_safe():
+        raise RuntimeError(
+            "PostgreSQL maintenance requires libpq 17 bounded cancellation"
+        )
     if not _POSTGRES_ACQUISITION_LOCK.acquire(timeout=_remaining(deadline)):
         raise TimeoutError(
             "ClaimSession maintenance connection serialization exceeded deadline"
@@ -962,15 +968,23 @@ def _resolve_postgres_connect_targets(
         try:
             ip_address(host)
         except ValueError:
-            addresses = _resolve_postgres_host(
-                host, int(raw_port) if raw_port else 5432, deadline
-            )
+            try:
+                addresses = _resolve_postgres_host(
+                    host, int(raw_port) if raw_port else 5432, deadline
+                )
+            except TimeoutError:
+                raise
+            except OSError:
+                _remaining(deadline)
+                continue
         else:
             addresses = (host,)
         for address in addresses:
             resolved_hosts.append(host)
             resolved_hostaddrs.append(address)
             resolved_ports.append(raw_port)
+    if not resolved_hosts:
+        raise OSError("PostgreSQL resolver returned no usable connection targets")
     bounded["host"] = ",".join(resolved_hosts)
     bounded["hostaddr"] = ",".join(resolved_hostaddrs)
     bounded["port"] = ",".join(resolved_ports)

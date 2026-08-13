@@ -4638,6 +4638,29 @@ def test_postgres_maintenance_replaces_zero_physical_connect_timeout() -> None:
     engine.dispose()
 
 
+def test_postgres_maintenance_rejects_unbounded_client_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from psycopg import capabilities
+
+    engine = create_engine("postgresql+psycopg://unused@127.0.0.1/unused")
+    connected = False
+
+    def unexpected_connect(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal connected
+        connected = True
+
+    monkeypatch.setattr(capabilities, "has_cancel_safe", lambda: False)
+    monkeypatch.setattr(engine, "connect", unexpected_connect)
+    with pytest.raises(RuntimeError, match="libpq 17 bounded cancellation"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pytest.fail("unsupported client cancellation acquired a connection")
+    assert not connected
+    engine.dispose()
+
+
 @pytest.mark.parametrize(
     ("connect_args", "resolved", "attempts"),
     [
@@ -4787,6 +4810,38 @@ def test_postgres_maintenance_uses_environment_attempts_and_prefer_standby(
     assert bounded["hostaddr"] == "192.0.2.1,192.0.2.2,192.0.2.3"
     assert bounded["port"] == "5432,5432,5433"
     assert bounded["target_session_attrs"] == "prefer-standby"
+
+
+def test_postgres_maintenance_skips_failed_dns_target_when_another_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def resolve(host: str, _port: int, _deadline: float) -> tuple[str, ...]:
+        if host == "missing.invalid":
+            raise OSError("name not found")
+        return ("192.0.2.10",)
+
+    monkeypatch.setattr(store_migration, "_resolve_postgres_host", resolve)
+    bounded, attempts = store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
+        {"host": "missing.invalid,healthy.example"}, time.monotonic() + 10
+    )
+    assert attempts == 1
+    assert bounded["host"] == "healthy.example"
+    assert bounded["hostaddr"] == "192.0.2.10"
+
+
+def test_postgres_maintenance_fails_when_all_dns_targets_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        store_migration,
+        "_resolve_postgres_host",
+        lambda *_args: (_ for _ in ()).throw(OSError("name not found")),
+    )
+    with pytest.raises(OSError, match="no usable connection targets"):
+        store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
+            {"host": "missing.invalid,also-missing.invalid"},
+            time.monotonic() + 10,
+        )
 
 
 @pytest.mark.parametrize("source", ["parameter", "environment"])
