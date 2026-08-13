@@ -719,38 +719,44 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
                 "PostgreSQL maintenance requires a timeout-capable connection pool"
             )
         original_pool_timeout = pool._timeout
+        listener_active = True
 
-        def clamp_physical_connect(
-            _dialect: Any,
+        def bounded_physical_connect(
+            dialect: Any,
             _connection_record: Any,
-            _cargs: list[Any],
+            cargs: list[Any],
             cparams: dict[str, Any],
-        ) -> None:
-            connect_timeout = int(_remaining(deadline))
+        ) -> Any:
+            if not listener_active:
+                return None
+            bounded_cparams = dict(cparams)
+            attempts = _postgres_connect_attempts(bounded_cparams)
+            connect_timeout = int(_remaining(deadline)) // attempts
             if connect_timeout < 2:
                 raise TimeoutError(
                     "ClaimSession maintenance has insufficient physical-connect budget"
                 )
-            configured = cparams.get("connect_timeout")
-            cparams["connect_timeout"] = (
+            configured = bounded_cparams.get("connect_timeout")
+            bounded_cparams["connect_timeout"] = (
                 min(int(configured), connect_timeout)
                 if configured is not None and int(configured) > 0
                 else connect_timeout
             )
-            return None
+            return dialect.connect(*cargs, **bounded_cparams)
 
         connection: Connection | None = None
         listener_registered = False
         try:
             pool._timeout = min(float(original_pool_timeout), remaining)
             try:
-                event.listen(engine, "do_connect", clamp_physical_connect)
+                event.listen(engine, "do_connect", bounded_physical_connect)
                 listener_registered = True
                 connection = engine.connect()
             finally:
                 try:
+                    listener_active = False
                     if listener_registered:
-                        event.remove(engine, "do_connect", clamp_physical_connect)
+                        event.remove(engine, "do_connect", bounded_physical_connect)
                 finally:
                     pool._timeout = original_pool_timeout
         except BaseException as error:
@@ -769,6 +775,15 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
         yield connection
     finally:
         connection.close()
+
+
+def _postgres_connect_attempts(cparams: dict[str, Any]) -> int:
+    """Return libpq's maximum configured host or address attempt count."""
+
+    def count(value: Any) -> int:
+        return len(str(value).split(",")) if value is not None else 1
+
+    return max(count(cparams.get("host")), count(cparams.get("hostaddr")))
 
 
 def _discard_postgres_connection(

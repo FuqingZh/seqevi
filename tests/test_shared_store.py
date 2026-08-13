@@ -4631,6 +4631,68 @@ def test_postgres_maintenance_replaces_zero_physical_connect_timeout() -> None:
     engine.dispose()
 
 
+@pytest.mark.parametrize(
+    ("connect_args", "attempts"),
+    [
+        ({"host": "one,two,three"}, 3),
+        ({"hostaddr": "192.0.2.1,192.0.2.2"}, 2),
+        (
+            {
+                "host": "one,two",
+                "hostaddr": "192.0.2.1,192.0.2.2,192.0.2.3",
+            },
+            3,
+        ),
+    ],
+)
+def test_postgres_maintenance_divides_timeout_across_all_host_attempts(
+    connect_args: dict[str, str], attempts: int
+) -> None:
+    engine = create_engine(
+        "postgresql+psycopg://unused@/unused", connect_args=connect_args
+    )
+    observed: list[int] = []
+
+    def observe_connect_timeout(*_cargs, **cparams):
+        observed.append(int(cparams["connect_timeout"]))
+        raise TimeoutError("stop after observing per-attempt timeout")
+
+    engine.dialect.connect = observe_connect_timeout
+    with pytest.raises(TimeoutError, match="stop after observing"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 7.5
+        ):
+            pytest.fail("test physical connection unexpectedly succeeded")
+    assert observed == [7 // attempts]
+    assert observed[0] * attempts <= 7
+    engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_physical_connect_does_not_mutate_later_params() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        original_connect = engine.dialect.connect
+        observed: list[dict[str, Any]] = []
+
+        def observe_connect_params(*cargs, **cparams):
+            observed.append(dict(cparams))
+            return original_connect(*cargs, **cparams)
+
+        engine.dialect.connect = observe_connect_params
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pass
+        engine.dispose()
+        with engine.connect():
+            pass
+        assert int(observed[0]["connect_timeout"]) <= 4
+        assert "connect_timeout" not in observed[1]
+        engine.dialect.connect = original_connect
+        engine.dispose()
+
+
 def test_postgres_maintenance_listener_setup_failure_restores_pool_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4671,6 +4733,15 @@ def test_postgres_maintenance_listener_removal_failure_restores_and_discards(
                 pytest.fail("listener removal failure yielded a connection")
         assert cast(Any, engine.pool)._timeout == 0.25
         assert cast(Any, engine.pool).checkedout() == 0
+        monkeypatch.setattr(
+            store_migration,
+            "_remaining",
+            lambda _deadline: (_ for _ in ()).throw(
+                TimeoutError("captured acquisition deadline expired")
+            ),
+        )
+        with engine.connect() as later_connection:
+            assert later_connection.exec_driver_sql("SELECT 1").scalar_one() == 1
         engine.dispose()
 
 
