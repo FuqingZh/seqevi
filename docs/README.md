@@ -40,7 +40,7 @@ later feature work.
 | managed onboarding | dbCAN only for 0.2.0; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
 | shared Store cache seeding | approved staged execution plan; execution not started | [cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
 | evidence claim leases | per-EvidenceKey duplicate-suppression implementation validation accepted | [evidence contract v1.2](architecture/20260810-v1.2-sequence-evidence-contract.md), [claim-lease plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md) |
-| shared Store claim contention hardening | delivery rebaselined after PR #31 review convergence exhaustion: synchronous public Store/private cancellable ClaimSession HTTP ownership is settled; #33/#34/#35 remain independent; #37 owns external-tool cleanup and final PostgreSQL pressure/C2 acceptance and merges last | [delivery rebaseline addendum and settled boundaries](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md), [ClaimSession technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md), [superseded per-key hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md) |
+| shared Store claim contention hardening | PR #31 is frozen unchanged; #39 closes four late PR A blockers independently before #33/#34/#35; #37 owns external-tool cleanup and final PostgreSQL pressure/C2 acceptance and merges last | [current v1.2 delivery authority](implementation-plan/20260813-v1.2-claim-session-delivery-closure-addendum.md), [v1.1 settled boundaries](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md), [ClaimSession technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md), [superseded per-key hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md) |
 
 ## Start Here
 
@@ -81,9 +81,10 @@ later feature work.
 35. [Managed dbCAN Slice D public release gate](benchmarks/20260806-v1.4-dbcan-public-release-gate.md)
 36. [Shared Store cache-seeding implementation plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md)
 37. [Evidence claim lease implementation plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md)
-38. [ClaimSession delivery rebaseline addendum](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md)
-39. [ClaimSession and tool cancellation technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md)
-40. [Superseded shared Store claim contention hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md)
+38. [Current ClaimSession delivery closure addendum](implementation-plan/20260813-v1.2-claim-session-delivery-closure-addendum.md)
+39. [ClaimSession delivery rebaseline addendum v1.1](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md)
+40. [ClaimSession and tool cancellation technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md)
+41. [Superseded shared Store claim contention hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md)
 
 ## Managed Boundary Contracts
 
