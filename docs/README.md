@@ -33,8 +33,11 @@ later feature work.
 > addendum](implementation-plan/20260813-v1.2-claim-session-delivery-closure-addendum.md)
 > plus the [v1.3 conflict-unfreeze
 > addendum](implementation-plan/20260813-v1.3-claim-session-conflict-unfreeze-addendum.md)
-> supersede the temporary compatibility lines in the capability table and
-> numbered index below until PR #31 merges unchanged.
+> and the [v1.4 strict-gate exception
+> addendum](implementation-plan/20260813-v1.4-claim-session-strict-gate-exception-addendum.md)
+> govern the unchanged PR #31 delivery. The v1.4 addendum supersedes only the
+> unexecutable strict-status freshness assumption; v1.2/v1.3 otherwise remain
+> authoritative, including the temporary compatibility-line treatment below.
 
 ## Capability Status
 
