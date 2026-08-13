@@ -719,6 +719,90 @@ def test_claim_transport_cancellation_is_request_local() -> None:
     runtime.close()
 
 
+def test_claim_transport_close_cancels_and_joins_outstanding_request() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    blocked = threading.Event()
+    cancelled = threading.Event()
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        blocked.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        raise AssertionError("blocked request unexpectedly resumed")
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    worker = threading.Thread(
+        target=lambda: pytest.raises(
+            BaseException,
+            runtime.request,
+            "GET",
+            "/blocked",
+            deadline=time.monotonic() + 10.0,
+        )
+    )
+    worker.start()
+    assert blocked.wait(0.2)
+    runtime.close()
+    worker.join(0.2)
+    assert cancelled.is_set()
+    assert not worker.is_alive()
+    assert not runtime._thread.is_alive()
+
+
+def test_async_artifact_read_does_not_block_other_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    artifact = tmp_path / "artifact"
+    artifact.write_bytes(b"payload")
+    real_open = Path.open
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    class SlowHandle:
+        def __init__(self, path: Path) -> None:
+            self._handle = real_open(path, "rb")
+
+        def read(self, size: int) -> bytes:
+            read_started.set()
+            release_read.wait(0.5)
+            return self._handle.read(size)
+
+        def close(self) -> None:
+            self._handle.close()
+
+    monkeypatch.setattr(Path, "open", lambda path, _mode: SlowHandle(path))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/upload":
+            await request.aread()
+        return httpx.Response(200, json={"path": request.url.path})
+
+    runtime = store_client_module._ClaimTransportRuntime(
+        "http://testserver", 10.0, httpx.MockTransport(handler)
+    )
+    worker = threading.Thread(
+        target=runtime.request,
+        args=("PUT", "/upload"),
+        kwargs={
+            "deadline": time.monotonic() + 1.0,
+            "content": store_client_module._async_file_chunks(artifact),
+        },
+    )
+    worker.start()
+    assert read_started.wait(0.2)
+    response = runtime.request("GET", "/fast", deadline=time.monotonic() + 0.2)
+    release_read.set()
+    worker.join(0.5)
+    assert response.json() == {"path": "/fast"}
+    assert not worker.is_alive()
+    runtime.close()
+
+
 def test_slow_renew_body_promptly_publishes_session_loss() -> None:
     now = datetime.now(UTC)
     renew_body = _BlockingAsyncBody()

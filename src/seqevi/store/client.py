@@ -101,6 +101,8 @@ class _ClaimTransportRuntime:
     ) -> None:
         self._loop = asyncio.new_event_loop()
         self._started = threading.Event()
+        self._closing = threading.Event()
+        self._requests: set[asyncio.Task[object]] = set()
         self._thread = threading.Thread(
             target=self._run,
             name="seqevi-claim-http-runtime",
@@ -137,24 +139,44 @@ class _ClaimTransportRuntime:
     def request(
         self, method: str, path: str, *, deadline: float, **kwargs: Any
     ) -> httpx.Response:
+        if self._closing.is_set():
+            raise RuntimeError("ClaimSession transport is closed")
         return self.run(self._request(method, path, deadline=deadline, **kwargs))
 
     async def _request(
         self, method: str, path: str, *, deadline: float, **kwargs: Any
     ) -> httpx.Response:
+        if self._closing.is_set():
+            raise RuntimeError("ClaimSession transport is closed")
+        task = asyncio.current_task()
+        assert task is not None
+        self._requests.add(task)
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError
-        kwargs.setdefault("timeout", httpx.Timeout(remaining))
-        # asyncio.timeout covers connection, headers, and complete body consumption.
-        # Leaving it cancels and awaits httpx/httpcore before the sync caller resumes.
-        async with asyncio.timeout(remaining):
-            return await self._client.request(method, path, **kwargs)
+        try:
+            if remaining <= 0:
+                raise TimeoutError
+            kwargs.setdefault("timeout", httpx.Timeout(remaining))
+            # asyncio.timeout covers connection, headers, and complete body
+            # consumption. Leaving it cancels and awaits httpx/httpcore before
+            # the sync caller resumes.
+            async with asyncio.timeout(remaining):
+                return await self._client.request(method, path, **kwargs)
+        finally:
+            self._requests.discard(task)
+
+    async def _shutdown(self) -> None:
+        requests = tuple(self._requests)
+        for task in requests:
+            task.cancel()
+        if requests:
+            await asyncio.gather(*requests, return_exceptions=True)
+        await self._client.aclose()
 
     def close(self) -> None:
         if not self._thread.is_alive():
             return
-        self.run(self._client.aclose())
+        self._closing.set()
+        self.run(self._shutdown())
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join()
 
@@ -736,8 +758,14 @@ class _HttpClaimSession:
                         self._authority_request_and_deadline()
                     )
                     upload_deadline = min(
-                        upload_started + 30.0, upload_authority_deadline
+                        upload_started + 30.0,
+                        upload_authority_deadline
+                        - _FINALIZE_RECONCILIATION_RUNWAY_SECONDS,
                     )
+                    if upload_deadline <= upload_started:
+                        raise EvidenceClaimLostError(
+                            "ClaimSession artifact upload has no reconciliation runway"
+                        )
                     self._upload_until(payload, deadline=upload_deadline)
                     self.store._uploaded_artifact_digests.add(payload.digest)
         items = []
@@ -1081,9 +1109,12 @@ def _file_chunks(path: Path) -> Iterator[bytes]:
 
 
 async def _async_file_chunks(path: Path) -> Any:
-    with path.open("rb") as handle:
-        while chunk := handle.read(_TRANSFER_CHUNK_SIZE):
+    handle = await asyncio.to_thread(path.open, "rb")
+    try:
+        while chunk := await asyncio.to_thread(handle.read, _TRANSFER_CHUNK_SIZE):
             yield chunk
+    finally:
+        await asyncio.to_thread(handle.close)
 
 
 def _raise_for_store_status(
