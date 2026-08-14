@@ -20,6 +20,7 @@ import psycopg
 from seqevi.sequence import read_fasta
 
 _REQUIRED_THREADS = 64
+_REQUIRED_PROFILE = "eggnog-5.0.2"
 _FROZEN_INPUT_SHA256 = {
     "blf": "9dc23bc3d230e097243110ac8e3a77df3e7f69c181d29290ed1d8d20e3e268d5",
     "uniprot": "a21f7da241177ebc75ab182e6ad77ff974ed4d21c41807953e0535266f0a7509",
@@ -48,6 +49,11 @@ def _validate_frozen_inputs(paths: dict[str, Path]) -> dict[str, str]:
 def _validate_threads(threads: int) -> None:
     if threads != _REQUIRED_THREADS:
         raise ValueError(f"accepted C2 requires exactly {_REQUIRED_THREADS} threads")
+
+
+def _validate_profile(profile: str) -> None:
+    if profile != _REQUIRED_PROFILE:
+        raise ValueError(f"accepted C2 requires profile {_REQUIRED_PROFILE}")
 
 
 def _identity_set(path: Path) -> set[str]:
@@ -274,6 +280,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         _validate_threads(args.threads)
+        _validate_profile(args.profile)
     except ValueError as error:
         parser.error(str(error))
     if args.output_root.exists():

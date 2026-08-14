@@ -89,6 +89,9 @@ def test_c2_frozen_input_digests_and_threads_are_hard_gates(tmp_path: Path) -> N
     module["_validate_threads"](64)
     with pytest.raises(ValueError, match="exactly 64"):
         module["_validate_threads"](1)
+    module["_validate_profile"]("eggnog-5.0.2")
+    with pytest.raises(ValueError, match="profile eggnog-5.0.2"):
+        module["_validate_profile"]("diagnostic-profile")
 
 
 def test_pressure_listener_includes_final_cleanup_deletes() -> None:
