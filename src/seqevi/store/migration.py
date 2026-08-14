@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import random
+import socket
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Callable, Iterator, cast
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import DBAPIError
 
@@ -31,6 +36,11 @@ _CLAIM_SESSION_TABLES = {
     "claim_session_acquire_receipts",
     "claim_session_acquire_receipt_items",
 }
+_POSTGRES_ACQUISITION_LOCK = threading.Lock()
+_RESOLVER_STOP_GRACE_SECONDS = 0.2
+_ACQUISITION_CANCEL_TIMEOUT_SECONDS = 0.05
+_ACQUISITION_CANCEL_INTERVAL_SECONDS = 0.075
+_ACQUISITION_WATCHDOG_JOIN_SECONDS = 0.15
 
 
 class _AmbiguousMaintenanceCommit(RuntimeError):
@@ -41,7 +51,18 @@ class _MaintenanceWatchdog:
     def __init__(self, connection: Connection, deadline: float) -> None:
         self.connection = connection
         self.expired = threading.Event()
-        raw = cast(Any, connection.connection.driver_connection)
+        if connection.invalidated:
+            raise RuntimeError(
+                "PostgreSQL maintenance cannot arm a watchdog for an "
+                "invalidated connection"
+            )
+        dbapi_connection = cast(Any, connection)._dbapi_connection
+        if dbapi_connection is None:
+            raise RuntimeError(
+                "PostgreSQL maintenance cannot arm a watchdog without an "
+                "existing DBAPI connection"
+            )
+        raw = dbapi_connection.driver_connection
 
         def cancel_stalled_operation() -> None:
             self.expired.set()
@@ -427,7 +448,12 @@ def _maintenance_state(
 ) -> tuple[str | None, set[str]]:
     if engine.dialect.name == "sqlite":
         engine.dispose()
-    with engine.connect() as connection:
+    connection_context = (
+        engine.connect()
+        if engine.dialect.name == "sqlite"
+        else _bounded_postgres_connect(engine, deadline)
+    )
+    with connection_context as connection:
         if engine.dialect.name == "sqlite":
             if sqlite_binding is None:
                 raise RuntimeError("SQLite maintenance readback requires file binding")
@@ -609,7 +635,7 @@ def _maintenance_upgrade_postgres(
     *,
     downgrade: bool = False,
 ) -> None:
-    with engine.connect() as connection:
+    with _bounded_postgres_connect(engine, deadline) as connection:
         acquired = False
         primary: BaseException | None = None
         cleanup: BaseException | None = None
@@ -697,9 +723,461 @@ def _maintenance_upgrade_postgres(
             raise cleanup
 
 
+@contextmanager
+def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Connection]:
+    """Acquire one pooled PostgreSQL connection inside an absolute deadline."""
+
+    from psycopg import capabilities
+
+    if (
+        engine.pool.dispatch.checkout.listeners
+        or engine.dialect.dispatch.do_connect.listeners
+    ):
+        raise RuntimeError(
+            "PostgreSQL maintenance requires a fresh Engine without instance "
+            "checkout or do_connect listeners"
+        )
+    if not capabilities.has_cancel_safe():
+        raise RuntimeError(
+            "PostgreSQL maintenance requires libpq 17 bounded cancellation"
+        )
+    if not _POSTGRES_ACQUISITION_LOCK.acquire(timeout=_remaining(deadline)):
+        raise TimeoutError(
+            "ClaimSession maintenance connection serialization exceeded deadline"
+        )
+    try:
+        pool = cast(Any, engine.pool)
+        if not hasattr(pool, "_timeout"):
+            raise RuntimeError(
+                "PostgreSQL maintenance requires a timeout-capable connection pool"
+            )
+        original_pool_timeout = pool._timeout
+        pre_ping_was_own_attribute = "_do_ping_w_event" in vars(engine.dialect)
+        original_own_pre_ping = vars(engine.dialect).get("_do_ping_w_event")
+        original_pre_ping = engine.dialect._do_ping_w_event
+        listener_active = True
+        acquisition_raw: Any | None = None
+        acquisition_expired = threading.Event()
+        acquisition_finished = threading.Event()
+        acquisition_state_lock = threading.Lock()
+
+        def cancel_raw(raw: Any) -> None:
+            cancel_safe = getattr(raw, "cancel_safe", None)
+            if not callable(cancel_safe):
+                return
+            try:
+                cancel_safe(timeout=_ACQUISITION_CANCEL_TIMEOUT_SECONDS)
+            except BaseException:
+                pass
+
+        def cancel_checkout_initialization() -> None:
+            with acquisition_state_lock:
+                acquisition_expired.set()
+            while not acquisition_finished.is_set():
+                with acquisition_state_lock:
+                    raw = acquisition_raw
+                if raw is not None:
+                    cancel_raw(raw)
+                acquisition_finished.wait(_ACQUISITION_CANCEL_INTERVAL_SECONDS)
+
+        def publish_pooled_raw(raw: Any) -> bool:
+            nonlocal acquisition_raw
+            if not listener_active:
+                return False
+            if not callable(getattr(raw, "cancel_safe", None)):
+                raise RuntimeError(
+                    "PostgreSQL maintenance requires bounded psycopg cancellation"
+                )
+            with acquisition_state_lock:
+                if acquisition_expired.is_set():
+                    raise TimeoutError(
+                        "ClaimSession maintenance connection initialization "
+                        "exceeded deadline"
+                    )
+                acquisition_raw = raw
+            return True
+
+        def bounded_pre_ping(dbapi_connection: Any) -> bool:
+            if not publish_pooled_raw(dbapi_connection):
+                return original_pre_ping(dbapi_connection)
+            return original_pre_ping(dbapi_connection)
+
+        def capture_before_checkout_hooks(
+            raw: Any, _connection_record: Any, _connection_proxy: Any
+        ) -> None:
+            publish_pooled_raw(raw)
+
+        def quiesce_acquisition_timer(timer: threading.Timer) -> None:
+            timer.cancel()
+            acquisition_finished.set()
+            timer.join(_ACQUISITION_WATCHDOG_JOIN_SECONDS)
+            if timer.is_alive():
+                raise RuntimeError(
+                    "PostgreSQL maintenance acquisition watchdog failed to stop"
+                )
+
+        def bounded_physical_connect(
+            dialect: Any,
+            _connection_record: Any,
+            cargs: list[Any],
+            cparams: dict[str, Any],
+        ) -> Any:
+            if not listener_active:
+                return None
+            if any(str(arg) for arg in cargs) or cparams.get("conninfo"):
+                raise RuntimeError(
+                    "PostgreSQL maintenance rejects embedded conninfo targets"
+                )
+            bounded_cparams, attempts = _resolve_postgres_connect_targets(
+                cparams, deadline
+            )
+            with acquisition_state_lock:
+                if acquisition_expired.is_set():
+                    raise TimeoutError(
+                        "ClaimSession maintenance connection initialization "
+                        "exceeded deadline"
+                    )
+                connect_timeout = int(_remaining(deadline)) // attempts
+                if connect_timeout < 2:
+                    raise TimeoutError(
+                        "ClaimSession maintenance has insufficient "
+                        "physical-connect budget"
+                    )
+                configured = bounded_cparams.get("connect_timeout")
+                configured_timeout = (
+                    _parse_postgres_connect_timeout(configured)
+                    if configured is not None
+                    else 0
+                )
+                bounded_cparams["connect_timeout"] = (
+                    min(configured_timeout, connect_timeout)
+                    if configured_timeout > 0
+                    else connect_timeout
+                )
+            if acquisition_expired.is_set():
+                raise TimeoutError(
+                    "ClaimSession maintenance connection initialization "
+                    "exceeded deadline"
+                )
+            raw = dialect.connect(*cargs, **bounded_cparams)
+            if not callable(getattr(raw, "cancel_safe", None)):
+                raw.close()
+                raise RuntimeError(
+                    "PostgreSQL maintenance requires bounded psycopg cancellation"
+                )
+            nonlocal acquisition_raw
+            with acquisition_state_lock:
+                if acquisition_expired.is_set():
+                    late = True
+                else:
+                    acquisition_raw = raw
+                    late = False
+            if late:
+                raw.close()
+                raise TimeoutError(
+                    "ClaimSession maintenance connection initialization "
+                    "exceeded deadline"
+                )
+            return raw
+
+        connection: Connection | None = None
+        connect_listener_registered = False
+        checkout_listener_registered = False
+        acquisition_timer = threading.Timer(
+            _remaining(deadline), cancel_checkout_initialization
+        )
+        acquisition_timer.name = "seqevi-postgres-acquisition-watchdog"
+        acquisition_timer.daemon = True
+        acquisition_timer.start()
+        try:
+            try:
+                engine.dialect._do_ping_w_event = bounded_pre_ping
+                event.listen(
+                    pool,
+                    "checkout",
+                    capture_before_checkout_hooks,
+                    insert=True,
+                )
+                checkout_listener_registered = True
+                event.listen(
+                    engine,
+                    "do_connect",
+                    bounded_physical_connect,
+                )
+                connect_listener_registered = True
+                pool._timeout = min(float(original_pool_timeout), _remaining(deadline))
+                connection = engine.connect()
+            finally:
+                try:
+                    listener_active = False
+                    if checkout_listener_registered:
+                        event.remove(pool, "checkout", capture_before_checkout_hooks)
+                finally:
+                    try:
+                        if connect_listener_registered:
+                            event.remove(engine, "do_connect", bounded_physical_connect)
+                    finally:
+                        if pre_ping_was_own_attribute:
+                            setattr(
+                                engine.dialect,
+                                "_do_ping_w_event",
+                                original_own_pre_ping,
+                            )
+                        else:
+                            del engine.dialect._do_ping_w_event
+                        pool._timeout = original_pool_timeout
+        except BaseException as error:
+            try:
+                quiesce_acquisition_timer(acquisition_timer)
+            except BaseException as cleanup:
+                error.add_note(f"maintenance watchdog cleanup failed: {cleanup!r}")
+            if connection is not None:
+                _discard_postgres_connection(connection, error)
+            if acquisition_expired.is_set() and not isinstance(error, TimeoutError):
+                raise TimeoutError(
+                    "ClaimSession maintenance connection initialization "
+                    "exceeded deadline"
+                ) from error
+            raise
+        else:
+            try:
+                quiesce_acquisition_timer(acquisition_timer)
+            except BaseException as error:
+                assert connection is not None
+                _discard_postgres_connection(connection, error)
+                raise
+        assert connection is not None
+        if acquisition_expired.is_set():
+            timeout = TimeoutError(
+                "ClaimSession maintenance connection initialization exceeded deadline"
+            )
+            _discard_postgres_connection(connection, timeout)
+            raise timeout
+        try:
+            _remaining(deadline)
+        except BaseException as error:
+            _discard_postgres_connection(connection, error)
+            raise
+    finally:
+        _POSTGRES_ACQUISITION_LOCK.release()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def _postgres_resolver_command(host: str, port: int) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        "-I",
+        "-m",
+        "seqevi.store._resolver",
+        host,
+        str(port),
+        str(socket.AF_UNSPEC),
+        str(socket.SOCK_STREAM),
+        "0",
+        "0",
+    )
+
+
+def _resolve_postgres_connect_targets(
+    cparams: dict[str, Any], deadline: float
+) -> tuple[dict[str, Any], int]:
+    """Resolve copied libpq targets so DNS and all attempts share one deadline."""
+
+    bounded = _effective_postgres_connect_params(cparams)
+    raw_host = bounded.get("host")
+    raw_hostaddr = bounded.get("hostaddr")
+    if raw_host is None and raw_hostaddr is None:
+        attempts = 2 if bounded.get("target_session_attrs") == "prefer-standby" else 1
+        return bounded, attempts
+    hosts = str(raw_host or "").split(",")
+    hostaddrs = str(raw_hostaddr or "").split(",")
+    ports = str(bounded.get("port", "")).split(",")
+    if any(host.startswith("@") for host in hosts):
+        raise RuntimeError(
+            "PostgreSQL maintenance does not support abstract Unix socket targets"
+        )
+    if any(hosts) and any(hostaddrs) and len(hosts) != len(hostaddrs):
+        raise ValueError(
+            "PostgreSQL explicit host and hostaddr lists must have equal lengths"
+        )
+    target_count = max(len(hosts), len(hostaddrs))
+    hosts = _align_postgres_connect_values(hosts, target_count, "host")
+    hostaddrs = _align_postgres_connect_values(hostaddrs, target_count, "hostaddr")
+    ports = _align_postgres_connect_values(ports, target_count, "port")
+    resolved_hosts: list[str] = []
+    resolved_hostaddrs: list[str] = []
+    resolved_ports: list[str] = []
+    for host, hostaddr, raw_port in zip(hosts, hostaddrs, ports, strict=True):
+        if hostaddr or not host or host.startswith("/"):
+            resolved_hosts.append(host)
+            resolved_hostaddrs.append(hostaddr)
+            resolved_ports.append(raw_port)
+            continue
+        try:
+            ip_address(host)
+        except ValueError:
+            try:
+                addresses = _resolve_postgres_host(
+                    host,
+                    int(raw_port) if raw_port else _postgres_default_port(),
+                    deadline,
+                )
+            except TimeoutError:
+                raise
+            except OSError:
+                _remaining(deadline)
+                continue
+        else:
+            addresses = (host,)
+        for address in addresses:
+            resolved_hosts.append(host)
+            resolved_hostaddrs.append(address)
+            resolved_ports.append(raw_port)
+    if not resolved_hosts:
+        raise OSError("PostgreSQL resolver returned no usable connection targets")
+    bounded["host"] = ",".join(resolved_hosts)
+    bounded["hostaddr"] = ",".join(resolved_hostaddrs)
+    bounded["port"] = ",".join(resolved_ports)
+    attempts = len(resolved_hosts)
+    if bounded.get("target_session_attrs") == "prefer-standby":
+        attempts *= 2
+    return bounded, attempts
+
+
+def _effective_postgres_connect_params(cparams: dict[str, Any]) -> dict[str, Any]:
+    """Freeze psycopg/libpq environment-derived attempt parameters."""
+
+    bounded = dict(cparams)
+    service = bounded.get("service") or os.environ.get("PGSERVICE")
+    if service:
+        raise RuntimeError(
+            "PostgreSQL maintenance cannot bound service-derived connection targets"
+        )
+    for key, envvar in (
+        ("host", "PGHOST"),
+        ("hostaddr", "PGHOSTADDR"),
+        ("port", "PGPORT"),
+        ("target_session_attrs", "PGTARGETSESSIONATTRS"),
+        ("connect_timeout", "PGCONNECT_TIMEOUT"),
+    ):
+        if bounded.get(key) in (None, ""):
+            bounded.pop(key, None)
+            if (value := os.environ.get(envvar)) not in (None, ""):
+                bounded[key] = value
+    return bounded
+
+
+def _postgres_default_port() -> int:
+    """Return the default port compiled into the active client libpq."""
+
+    from psycopg import pq
+
+    for option in pq.Conninfo.get_defaults():
+        if option.keyword == b"port" and option.compiled is not None:
+            return int(option.compiled)
+    raise RuntimeError("PostgreSQL client libpq did not report a default port")
+
+
+def _parse_postgres_connect_timeout(value: Any) -> int:
+    """Parse a timeout with the locked Psycopg driver's conversion semantics."""
+
+    return int(float(value))
+
+
+def _align_postgres_connect_values(
+    values: list[str], target_count: int, name: str
+) -> list[str]:
+    if len(values) == target_count:
+        return values
+    if len(values) == 1:
+        return values * target_count
+    raise ValueError(f"PostgreSQL {name} list does not align with connection targets")
+
+
+def _resolve_postgres_host(host: str, port: int, deadline: float) -> tuple[str, ...]:
+    process = subprocess.Popen(
+        _postgres_resolver_command(host, port),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=_remaining(deadline))
+    except subprocess.TimeoutExpired as error:
+        timeout = TimeoutError(
+            "ClaimSession maintenance PostgreSQL DNS resolution exceeded deadline"
+        )
+        try:
+            _stop_postgres_resolver(process)
+        except BaseException as cleanup:
+            timeout.add_note(f"PostgreSQL resolver cleanup failed: {cleanup!r}")
+        raise timeout from error
+    except BaseException as error:
+        try:
+            _stop_postgres_resolver(process)
+        except BaseException as cleanup:
+            error.add_note(f"PostgreSQL resolver cleanup failed: {cleanup!r}")
+        raise
+    _remaining(deadline)
+    if process.returncode != 0:
+        raise OSError(stderr[:4096].decode("utf-8", errors="replace"))
+    payload = json.loads(stdout)
+    resolved_addresses: list[str] = []
+    for item in payload:
+        address = str(item[4][0])
+        if (
+            int(item[0]) == socket.AF_INET6
+            and len(item[4]) >= 4
+            and int(item[4][3]) != 0
+            and "%" not in address
+        ):
+            address = f"{address}%{int(item[4][3])}"
+        resolved_addresses.append(address)
+    addresses = tuple(dict.fromkeys(resolved_addresses))
+    if not addresses:
+        raise OSError(f"PostgreSQL resolver returned no addresses for {host!r}")
+    _remaining(deadline)
+    return addresses
+
+
+def _stop_postgres_resolver(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=_RESOLVER_STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.communicate()
+
+
+def _discard_postgres_connection(
+    connection: Connection, primary: BaseException
+) -> None:
+    """Attempt all discard steps while retaining the acquisition failure."""
+
+    try:
+        connection.invalidate()
+    except BaseException as cleanup:
+        primary.add_note(f"maintenance connection invalidation failed: {cleanup!r}")
+    try:
+        connection.close()
+    except BaseException as cleanup:
+        primary.add_note(f"maintenance connection close failed: {cleanup!r}")
+
+
 def _cleanup_postgres_maintenance(
     connection: Connection, acquired: bool, deadline: float
 ) -> None:
+    if connection.invalidated:
+        return
     watchdog: _MaintenanceWatchdog | None = None
     try:
         watchdog = _MaintenanceWatchdog(connection, deadline)
