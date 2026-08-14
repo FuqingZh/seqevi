@@ -44,7 +44,7 @@ later feature work.
 | Surface | Current state | Contract or plan |
 | --- | --- | --- |
 | result consumption | single-file DuckDB and native Python relation; real local/shared runtime acceptance passed | [result contract v1.1](architecture/20260804-v1.1-result-consumption-contract.md), [acceptance](benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md) |
-| eggNOG and InterPro/Pfam | official-runtime parity accepted | [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
+| eggNOG and InterPro/Pfam | official-runtime parity accepted; generic external-tool cancellation and complete ordinary process-group cleanup implemented, final acceptance pending | [adapter contract v1.2](architecture/20260814-v1.2-adapter-contract.md), [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
 | dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; managed onboarding remains separate | [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [dbCAN plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
 | execution profiles | v1 host profiles remain compatible; managed v2.2 setup and OCI execution are implemented and accepted | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md), [managed profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
 | managed onboarding | dbCAN only for 0.2.0; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
@@ -62,7 +62,7 @@ invariant. See the [HTTP review-convergence addendum](implementation-plan/202608
 
 1. [Architecture overview](architecture/20260720-v1.0-seqevi-architecture.md)
 2. [Sequence and evidence contract](architecture/20260814-v1.6-sequence-evidence-contract.md)
-3. [Adapter contract](architecture/20260804-v1.1-adapter-contract.md)
+3. [Adapter contract](architecture/20260814-v1.2-adapter-contract.md)
 4. [Result consumption contract](architecture/20260804-v1.1-result-consumption-contract.md)
 5. [Execution profile contract](architecture/20260724-v1.0-execution-profile-contract.md)
 6. [Storage and deployment architecture](architecture/20260814-v1.6-storage-deployment-architecture.md)

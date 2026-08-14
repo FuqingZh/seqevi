@@ -50,5 +50,32 @@ PYTHONPATH=src pdm run python benchmarks/annotate_real.py \
   --database /data/eggnog/5.0.2 \
   --store /tmp/seqevi-real/store \
   --threads 8 \
-  --report /tmp/seqevi-real/benchmark.json
+    --report /tmp/seqevi-real/benchmark.json
+```
+
+`claim_session_pressure.py` runs the approved PostgreSQL ClaimSession matrix
+through the production persistence implementation. It records per-operation
+SQL execution counts and latency while renew traffic overlaps acquire/finalize,
+then waits for retained receipts and proves zero residual coordination:
+
+```bash
+PYTHONPATH=src:. pdm run python benchmarks/claim_session_pressure.py \
+  --database-url postgresql+psycopg://seqevi@127.0.0.1/seqevi_pressure \
+  --report /tmp/seqevi-pressure.json
+```
+
+`c2_acceptance.py` owns the frozen real two-process C2 launch and independent
+replays. The Store endpoint and database must be fresh, isolated, and served by
+the exact candidate head; the two caller-owned FASTAs and named execution
+profile remain external:
+
+```bash
+PYTHONPATH=src:. pdm run python benchmarks/c2_acceptance.py \
+  --blf /path/to/Trichoderma_reesei_BLF.fasta \
+  --uniprot /path/to/Trichoderma_reesei_uniprot.fasta \
+  --profile eggnog-5.0.2 \
+  --store http://127.0.0.1:18085 \
+  --database-url postgresql+psycopg://seqevi@127.0.0.1/seqevi_c2 \
+  --threads 64 \
+  --output-root /tmp/seqevi-c2
 ```

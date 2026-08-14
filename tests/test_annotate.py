@@ -14,6 +14,7 @@ from seqevi.annotate import run_annotation
 from seqevi.errors import (
     AdapterError,
     AnnotationError,
+    EvidenceClaimLostError,
     FastaValidationError,
 )
 from seqevi.evidence import (
@@ -25,6 +26,7 @@ from seqevi.evidence import (
     FetchedEvidence,
 )
 from seqevi.sequence import identify_protein_sequence
+from seqevi.runner import ToolCommand
 from seqevi.store import ClaimSession, LocalStore
 
 from .support import (
@@ -158,6 +160,82 @@ class _RecordingThreadsAdapter:
         assert isinstance(threads, int)
         self.threads.append(threads)
         return self.delegate.run_batch(**kwargs)  # type: ignore[arg-type]
+
+
+class _SlowToolAdapter:
+    def __init__(self, delegate: FixtureAdapter) -> None:
+        self.contract = delegate.contract
+        self.evidence_schema = delegate.evidence_schema
+
+    def run_batch(self, **kwargs: object) -> AdapterBatchResult:
+        work_dir = kwargs["work_dir"]
+        runner = kwargs["runner"]
+        assert isinstance(work_dir, Path)
+        runner.run(  # type: ignore[union-attr]
+            ToolCommand(
+                arguments=(
+                    __import__("sys").executable,
+                    "-c",
+                    "import time; time.sleep(10)",
+                ),
+                working_dir=work_dir,
+                stdout_path=work_dir / "slow.stdout",
+                stderr_path=work_dir / "slow.stderr",
+            )
+        )
+        raise AssertionError("cancelled tool unexpectedly returned")
+
+
+class _AuthorityLosingStore(_CountingStore):
+    def __init__(self, delegate: LocalStore) -> None:
+        super().__init__(delegate)
+        self.finalize_calls = 0
+
+    def claim_session(self) -> ClaimSession:
+        delegate = self.delegate.claim_session()
+        owner = self
+
+        class AuthorityLosingSession:
+            def __init__(self) -> None:
+                self.cancellation_signal = threading.Event()
+                self.lost: BaseException | None = None
+                self.timer: threading.Timer | None = None
+
+            def __enter__(self):
+                delegate.__enter__()
+                return self
+
+            def __exit__(self, *_error):
+                if self.timer is not None:
+                    self.timer.cancel()
+                return delegate.__exit__(*_error)
+
+            def acquire_many(self, queries):
+                acquired = delegate.acquire_many(queries)
+
+                def lose_authority() -> None:
+                    self.lost = RuntimeError("injected renewal exhaustion")
+                    self.cancellation_signal.set()
+
+                self.timer = threading.Timer(0.1, lose_authority)
+                self.timer.start()
+                return acquired
+
+            def raise_if_lost(self) -> None:
+                if self.lost is not None:
+                    raise EvidenceClaimLostError(
+                        "ClaimSession authority was lost"
+                    ) from self.lost
+                delegate.raise_if_lost()
+
+            def finalize_many(self, commits):
+                owner.finalize_calls += 1
+                return delegate.finalize_many(commits)
+
+            def __getattr__(self, name):
+                return getattr(delegate, name)
+
+        return AuthorityLosingSession()  # type: ignore[return-value]
 
 
 class _ConcurrentRecordingAdapter:
@@ -551,6 +629,32 @@ def test_cancellation_stops_renewal_and_releases_active_claims(
 
     assert reacquired is not None
     assert reacquired.generation == 2
+
+
+def test_claim_authority_loss_cancels_tool_before_finalize(tmp_path: Path) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    delegate = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+
+    with LocalStore.open(tmp_path / "store") as local:
+        store = _AuthorityLosingStore(local)
+        started = __import__("time").monotonic()
+        with pytest.raises(AnnotationError) as raised:
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=tmp_path / "output",
+                adapter=_SlowToolAdapter(delegate),
+                store=store,
+                runner=annotate_module.ToolRunner(termination_grace_seconds=0.1),
+            )
+        cancellation_elapsed = __import__("time").monotonic() - started
+
+    assert isinstance(raised.value.__cause__, EvidenceClaimLostError)
+    assert cancellation_elapsed < 1.0
+    assert store.finalize_calls == 0
 
 
 def test_annotation_preserves_primary_failure_when_session_close_also_fails(

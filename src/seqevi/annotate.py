@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from .evidence import (
     EvidenceStatus,
 )
 from .result import RESULT_FORMAT_VERSION, materialize_result_database
-from .runner import ToolCommand, ToolRunResult, ToolRunner
+from .runner import ToolCancelledError, ToolCommand, ToolRunResult, ToolRunner
 from .sequence import (
     SequenceIdentity,
     iter_staged_identities,
@@ -88,8 +89,14 @@ class _BatchMetrics:
 
 
 class _MeasuringToolRunner(ToolRunner):
-    def __init__(self, delegate: ToolRunner) -> None:
+    def __init__(
+        self,
+        delegate: ToolRunner,
+        *,
+        cancellation_signal: threading.Event | None = None,
+    ) -> None:
         self.delegate = delegate
+        self.cancellation_signal = cancellation_signal
         self.duration_seconds = 0.0
 
     def run(
@@ -97,8 +104,13 @@ class _MeasuringToolRunner(ToolRunner):
         command: ToolCommand,
         *,
         timeout_seconds: float | None = None,
+        cancellation_signal: threading.Event | None = None,
     ) -> ToolRunResult:
-        result = self.delegate.run(command, timeout_seconds=timeout_seconds)
+        result = self.delegate.run(
+            command,
+            timeout_seconds=timeout_seconds,
+            cancellation_signal=cancellation_signal or self.cancellation_signal,
+        )
         self.duration_seconds += result.duration_seconds
         return result
 
@@ -156,7 +168,12 @@ def run_annotation(
         busy_retry_after: float | None = None
         if is_claim_session_capable_store(store):
             claim_session = store.claim_session().__enter__()
-        tool_runner = _MeasuringToolRunner(runner or ToolRunner())
+        tool_runner = _MeasuringToolRunner(
+            runner or ToolRunner(),
+            cancellation_signal=(
+                claim_session.cancellation_signal if claim_session is not None else None
+            ),
+        )
 
         for identity_batch in batched(iter_staged_identities(stage), _STORE_BATCH_SIZE):
             queries = tuple(
@@ -460,14 +477,19 @@ def _run_annotation_batch(
     with misses_fasta.open("w", encoding="ascii", newline="\n") as handle:
         handle.writelines(iter_fasta_lines(identities))
     adapter_started = time.perf_counter()
-    batch = adapter.run_batch(
-        identities=identities,
-        input_fasta=misses_fasta,
-        work_dir=batch_dir,
-        runner=runner,
-        timeout_seconds=timeout_seconds,
-        threads=threads,
-    )
+    try:
+        batch = adapter.run_batch(
+            identities=identities,
+            input_fasta=misses_fasta,
+            work_dir=batch_dir,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+            threads=threads,
+        )
+    except ToolCancelledError:
+        if claim_session is not None:
+            claim_session.raise_if_lost()
+        raise
     adapter_seconds = time.perf_counter() - adapter_started
     commits = _build_commits(batch=batch, identities=identities, adapter=adapter)
     batches = 0

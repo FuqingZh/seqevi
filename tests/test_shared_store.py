@@ -2728,6 +2728,86 @@ def test_http_heartbeat_renews_before_request_deadline() -> None:
         session.close()
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_calls", "loses_authority"),
+    [
+        ("transient-503", 3, False),
+        ("fenced-412", 1, True),
+        ("exhausted-503", 2, True),
+    ],
+)
+def test_http_heartbeat_renew_failure_policy(
+    failure: str,
+    expected_calls: int,
+    loses_authority: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    renew_calls = 0
+    renewed = threading.Event()
+    monkeypatch.setattr("seqevi.store.client.random.uniform", lambda _a, _b: 0.01)
+
+    def authority_payload() -> dict[str, object]:
+        return {
+            "session_id": "renew-fault",
+            "owner_token": "owner",
+            "generation": 1,
+            "expires_at": (now + timedelta(seconds=120)).isoformat(),
+            "remaining_lease_seconds": 120,
+            "heartbeat_after_seconds": 0.01,
+            "renew_deadline_seconds": 0.08,
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal renew_calls
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "protocol": "claim-session-v1",
+                    "maximum_batch_size": 1000,
+                    "retention_seconds": 60,
+                    "maximum_session_receipt_headers": 1000,
+                    "maximum_session_receipt_items": 32000,
+                    "server_time": now.isoformat(),
+                },
+            )
+        if request.url.path.endswith("/open"):
+            return httpx.Response(200, json=authority_payload())
+        if request.url.path.endswith("/renew"):
+            renew_calls += 1
+            if failure == "fenced-412":
+                renewed.set()
+                return httpx.Response(412, text="fenced")
+            if failure == "exhausted-503" or renew_calls < 3:
+                if renew_calls >= expected_calls:
+                    renewed.set()
+                return httpx.Response(503, headers={"Retry-After": "0.01"})
+            renewed.set()
+            return httpx.Response(200, json=authority_payload())
+        return httpx.Response(200, json={"closed": True})
+
+    with HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1000,
+        _client=_claim_mock_client(httpx.MockTransport(handler)),
+        _async_transport=httpx.MockTransport(handler),
+    ) as store:
+        session = store.claim_session()
+        assert renewed.wait(1.0)
+        if loses_authority:
+            assert session.cancellation_signal.wait(0.5)
+            with pytest.raises(EvidenceClaimLostError):
+                session.raise_if_lost()
+        else:
+            assert not session.cancellation_signal.is_set()
+            session.raise_if_lost()
+        session.close()
+
+    assert renew_calls >= expected_calls
+
+
 @pytest.mark.parametrize("renewal_failure", ["malformed", "authority-switch"])
 def test_http_heartbeat_invalid_success_is_terminal_session_loss(
     renewal_failure: str,
