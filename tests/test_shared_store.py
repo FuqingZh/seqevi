@@ -4693,34 +4693,45 @@ def test_postgres_maintenance_rejects_embedded_conninfo_before_connect(
     engine.dispose()
 
 
-def test_postgres_maintenance_preempts_returning_do_connect_listener(
+@pytest.mark.parametrize("event_name", ["checkout", "do_connect"])
+def test_postgres_maintenance_rejects_preexisting_instance_listener(
     monkeypatch: pytest.MonkeyPatch,
+    event_name: str,
 ) -> None:
     engine = create_engine(
         "postgresql+psycopg://unused@127.0.0.1/unused",
-        connect_args={"connect_timeout": 30},
+        pool_timeout=0.25,
     )
-    earlier_called = False
-    observed: dict[str, Any] = {}
 
-    @event.listens_for(engine, "do_connect")
-    def earlier_returning_listener(*_args: Any, **_kwargs: Any) -> Any:
-        nonlocal earlier_called
-        earlier_called = True
-        return object()
+    def existing_listener(*_args: Any, **_kwargs: Any) -> None:
+        pass
 
-    def bounded_connect(*_args: Any, **cparams: Any) -> None:
-        observed.update(cparams)
-        raise RuntimeError("bounded physical creation owned")
+    event.listen(engine, event_name, existing_listener)
+    original_checkout = tuple(engine.pool.dispatch.checkout.listeners)
+    original_do_connect = tuple(engine.dialect.dispatch.do_connect.listeners)
+    connected = False
+    temporary_listener_added = False
 
-    monkeypatch.setattr(engine.dialect, "connect", bounded_connect)
-    with pytest.raises(RuntimeError, match="bounded physical creation owned"):
+    def unexpected_connect() -> None:
+        nonlocal connected
+        connected = True
+
+    def unexpected_listener_setup(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal temporary_listener_added
+        temporary_listener_added = True
+
+    monkeypatch.setattr(engine, "connect", unexpected_connect)
+    monkeypatch.setattr(store_migration.event, "listen", unexpected_listener_setup)
+    with pytest.raises(RuntimeError, match="requires a fresh Engine"):
         with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
             engine, time.monotonic() + 5
         ):
-            pytest.fail("earlier do_connect listener bypassed bounded creation")
-    assert not earlier_called
-    assert 0 < int(observed["connect_timeout"]) < 30
+            pytest.fail("pre-existing instance listener reached acquisition")
+    assert not connected
+    assert not temporary_listener_added
+    assert cast(Any, engine.pool)._timeout == 0.25
+    assert tuple(engine.pool.dispatch.checkout.listeners) == original_checkout
+    assert tuple(engine.dialect.dispatch.do_connect.listeners) == original_do_connect
     engine.dispose()
 
 
@@ -5168,78 +5179,6 @@ def test_postgres_maintenance_pre_ping_reconnects_stale_pooled_connection() -> N
         assert cast(Any, engine.pool).checkedout() == 0
         assert ("_do_ping_w_event" in vars(engine.dialect)) is pre_ping_was_own
         assert vars(engine.dialect).get("_do_ping_w_event") is original_own_pre_ping
-        engine.dispose()
-
-
-@pytest.mark.requires_postgres
-def test_postgres_maintenance_captures_before_existing_checkout_listener() -> None:
-    with _isolated_postgres_url() as database_url:
-        engine = create_engine(database_url, pool_size=1, max_overflow=0)
-        with engine.connect():
-            pass
-
-        def stall_checkout(
-            dbapi_connection: Any, _connection_record: Any, _connection_proxy: Any
-        ) -> None:
-            time.sleep(0.55)
-            with dbapi_connection.cursor() as cursor:
-                cursor.execute("SELECT pg_sleep(10)")
-
-        event.listen(engine, "checkout", stall_checkout)
-        started = time.monotonic()
-        with pytest.raises(TimeoutError, match="initialization exceeded deadline"):
-            with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
-                engine, started + 0.5
-            ):
-                pytest.fail("stalled pre-existing checkout listener succeeded")
-        assert 0.4 <= time.monotonic() - started < 1.5
-        assert cast(Any, engine.pool).checkedout() == 0
-        event.remove(engine, "checkout", stall_checkout)
-        with engine.connect() as connection:
-            assert connection.exec_driver_sql("SELECT 1").scalar_one() == 1
-        engine.dispose()
-
-
-@pytest.mark.requires_postgres
-def test_postgres_maintenance_preserves_checkout_hook_transaction_state() -> None:
-    with _isolated_postgres_url() as database_url:
-        engine = create_engine(database_url, pool_size=1, max_overflow=0)
-        with engine.begin() as connection:
-            connection.exec_driver_sql(
-                "CREATE TABLE acquisition_hook_state (value integer NOT NULL)"
-            )
-        with engine.connect():
-            pass
-
-        def mutate_checkout(
-            dbapi_connection: Any, _connection_record: Any, _connection_proxy: Any
-        ) -> None:
-            with dbapi_connection.cursor() as cursor:
-                cursor.execute("SET statement_timeout = '1700ms'")
-                cursor.execute("INSERT INTO acquisition_hook_state VALUES (1)")
-
-        event.listen(engine, "checkout", mutate_checkout)
-        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
-            engine, time.monotonic() + 5
-        ) as connection:
-            assert (
-                connection.exec_driver_sql("SHOW statement_timeout").scalar_one()
-                == "1700ms"
-            )
-            assert (
-                connection.exec_driver_sql(
-                    "SELECT count(*) FROM acquisition_hook_state"
-                ).scalar_one()
-                == 1
-            )
-        event.remove(engine, "checkout", mutate_checkout)
-        with engine.connect() as connection:
-            assert (
-                connection.exec_driver_sql(
-                    "SELECT count(*) FROM acquisition_hook_state"
-                ).scalar_one()
-                == 0
-            )
         engine.dispose()
 
 

@@ -718,6 +718,14 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
 
     from psycopg import capabilities
 
+    if (
+        engine.pool.dispatch.checkout.listeners
+        or engine.dialect.dispatch.do_connect.listeners
+    ):
+        raise RuntimeError(
+            "PostgreSQL maintenance requires a fresh Engine without instance "
+            "checkout or do_connect listeners"
+        )
     if not capabilities.has_cancel_safe():
         raise RuntimeError(
             "PostgreSQL maintenance requires libpq 17 bounded cancellation"
@@ -870,9 +878,6 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
                     "do_connect",
                     bounded_physical_connect,
                 )
-                connect_listeners = engine.dialect.dispatch.do_connect.listeners
-                connect_listeners.remove(bounded_physical_connect)
-                connect_listeners.appendleft(bounded_physical_connect)
                 connect_listener_registered = True
                 connection = engine.connect()
             finally:
