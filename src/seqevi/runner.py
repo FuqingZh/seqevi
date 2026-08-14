@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import signal
 import subprocess
 import time
 from collections.abc import Callable, Mapping
-from ctypes import CDLL, byref, c_int
+from ctypes import CDLL, byref, c_int, get_errno
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -286,6 +287,15 @@ class ToolRunner:
                 break
             except (KeyboardInterrupt, SystemExit) as error:
                 defer(error)
+            except OSError:
+                if time.monotonic() - cleanup_started >= _CLEANUP_STUCK_AFTER_SECONDS:
+                    if not stuck_reported:
+                        self._report_cleanup_stuck(command, leader_pid, ())
+                        stuck_reported = True
+                try:
+                    time.sleep(_WAIT_INTERVAL_SECONDS)
+                except (KeyboardInterrupt, SystemExit) as error:
+                    defer(error)
         if owns_adopted_children:
             while True:
                 try:
@@ -466,12 +476,18 @@ class ToolRunner:
             return True
         enabled = c_int()
         try:
-            result = CDLL(None, use_errno=True).prctl(
-                _PR_GET_CHILD_SUBREAPER, byref(enabled), 0, 0, 0
-            )
-        except (AttributeError, OSError):
-            return False
-        return result == 0 and enabled.value == 1
+            prctl = CDLL(None, use_errno=True).prctl
+            result = prctl(_PR_GET_CHILD_SUBREAPER, byref(enabled), 0, 0, 0)
+        except AttributeError as error:
+            raise OSError(errno.ENOSYS, "prctl is unavailable") from error
+        except OSError as error:
+            raise OSError(
+                error.errno, "failed to query child subreaper state"
+            ) from error
+        if result != 0:
+            error_number = get_errno() or errno.EIO
+            raise OSError(error_number, "failed to query child subreaper state")
+        return enabled.value == 1
 
     @staticmethod
     def _signal_group(

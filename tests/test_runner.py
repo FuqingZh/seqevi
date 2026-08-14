@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import signal
 import sys
 import threading
@@ -316,6 +317,66 @@ def test_adopted_zombie_waitpid_ambiguity_is_not_clean(
     monkeypatch.setattr(runner_module.os, "waitpid", waitpid)
     assert ToolRunner._reap_adopted_group_zombies(7) is False
     assert ToolRunner._reap_adopted_group_zombies(7) is True
+
+
+def test_subreaper_query_error_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Library:
+        @staticmethod
+        def prctl(*_arguments: object) -> int:
+            return -1
+
+    monkeypatch.setattr(runner_module.os, "getpid", lambda: 2)
+    monkeypatch.setattr(runner_module, "CDLL", lambda *_args, **_kwargs: Library())
+    monkeypatch.setattr(runner_module, "get_errno", lambda: errno.EIO)
+
+    with pytest.raises(OSError, match="failed to query child subreaper state"):
+        ToolRunner._owns_adopted_children()
+
+
+def test_subreaper_query_error_retains_cleanup_until_retry_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    query_attempts = 0
+
+    class Process:
+        pid = 12345
+
+        @staticmethod
+        def wait() -> None:
+            events.append("wait")
+
+    def owns_adopted_children() -> bool:
+        nonlocal query_attempts
+        query_attempts += 1
+        events.append("query")
+        if query_attempts == 1:
+            raise OSError(errno.EIO, "query failed")
+        return True
+
+    monkeypatch.setattr(ToolRunner, "_wait_for_clean_group", lambda *_args: False)
+    monkeypatch.setattr(ToolRunner, "_signal_group", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        ToolRunner,
+        "_owns_adopted_children",
+        staticmethod(owns_adopted_children),
+    )
+    monkeypatch.setattr(
+        ToolRunner,
+        "_reap_adopted_group_zombies",
+        staticmethod(lambda _process_group_id: events.append("reap") or True),
+    )
+
+    cleanup_error = ToolRunner()._terminate_and_reap(  # pyright: ignore[reportPrivateUsage]
+        Process(),  # type: ignore[arg-type]
+        command(tmp_path, "pass"),
+        send_term=False,
+    )
+
+    assert cleanup_error is None
+    assert events == ["query", "query", "reap", "wait"]
 
 
 def test_cleanup_stuck_remains_synchronously_owned_until_clean(
