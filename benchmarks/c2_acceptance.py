@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import signal
 import subprocess
 import sys
 import time
@@ -33,6 +34,24 @@ def _identity_set(path: Path) -> set[str]:
 
 def _identity_digest(identities: set[str]) -> str:
     return hashlib.sha256("\n".join(sorted(identities)).encode()).hexdigest()
+
+
+def _candidate_head() -> str:
+    dirty = subprocess.check_output(
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "src",
+            "benchmarks",
+        ],
+        text=True,
+    ).strip()
+    if dirty:
+        raise RuntimeError("C2 requires committed source and benchmark harnesses")
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 
 
 def _external_tool_processes(output_root: Path) -> list[int]:
@@ -104,6 +123,27 @@ def _result(path: Path, return_code: int) -> dict[str, object]:
     return result
 
 
+def _wait_initial(processes: dict[str, subprocess.Popen[bytes]]) -> dict[str, int]:
+    return_codes: dict[str, int] = {}
+    pending = dict(processes)
+    while pending:
+        for name, process in tuple(pending.items()):
+            return_code = process.poll()
+            if return_code is None:
+                continue
+            return_codes[name] = return_code
+            del pending[name]
+            if return_code != 0:
+                for peer in pending.values():
+                    try:
+                        peer.send_signal(signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
+        if pending:
+            time.sleep(0.1)
+    return return_codes
+
+
 def _reuse_counts(result: dict[str, object]) -> tuple[int, int]:
     counts = result.get("counts")
     if not isinstance(counts, dict):
@@ -164,14 +204,10 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=64)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--cleanup-wait-seconds", type=float, default=61.0)
-    parser.add_argument(
-        "--finalize-existing",
-        action="store_true",
-        help="Validate completed initial/replay outputs after a reporting-only failure.",
-    )
     args = parser.parse_args()
-    if args.output_root.exists() and not args.finalize_existing:
+    if args.output_root.exists():
         parser.error("--output-root must not already exist")
+    source_head = _candidate_head()
 
     blf_ids = _identity_set(args.blf)
     uniprot_ids = _identity_set(args.uniprot)
@@ -180,67 +216,59 @@ def main() -> None:
     if not uniprot_ids < blf_ids or len(blf_ids | uniprot_ids) != 9116:
         raise RuntimeError("frozen C2 overlap/subset contract is not satisfied")
 
-    if args.finalize_existing:
-        initial_results = {
-            name: _result(args.output_root / f"initial-{name}" / "stdout.json", 0)
-            for name in ("blf", "uniprot")
-        }
-        replay_results = {
-            name: _result(args.output_root / f"replay-{name}" / "stdout.json", 0)
-            for name in ("blf", "uniprot")
-        }
-        initial_elapsed = None
-        replay_elapsed = None
-        after_initial = {
-            "evidence": 9116,
-            "evidence_identity_sha256": _identity_digest(blf_ids),
-        }
-    else:
-        args.output_root.mkdir(parents=True)
-        initial_started = time.perf_counter()
-        processes = {}
-        for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
-            root = args.output_root / f"initial-{name}"
-            root.mkdir()
-            processes[name] = _run_command(
-                fasta=fasta,
-                output=root / "result.duckdb",
-                profile=args.profile,
-                store=args.store,
-                threads=args.threads,
-                stdout_path=root / "stdout.json",
-                stderr_path=root / "stderr.log",
-            )
-        initial_results = {}
-        for name, process in processes.items():
-            return_code = process.wait()
-            initial_results[name] = _result(
-                args.output_root / f"initial-{name}" / "stdout.json", return_code
-            )
-        initial_elapsed = time.perf_counter() - initial_started
-        after_initial = _database_readback(args.database_url)
+    args.output_root.mkdir(parents=True)
+    initial_started = time.perf_counter()
+    processes = {}
+    for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
+        root = args.output_root / f"initial-{name}"
+        root.mkdir()
+        processes[name] = _run_command(
+            fasta=fasta,
+            output=root / "result.duckdb",
+            profile=args.profile,
+            store=args.store,
+            threads=args.threads,
+            stdout_path=root / "stdout.json",
+            stderr_path=root / "stderr.log",
+        )
+    return_codes = _wait_initial(processes)
+    initial_results = {
+        name: _result(
+            args.output_root / f"initial-{name}" / "stdout.json",
+            return_codes[name],
+        )
+        for name in processes
+    }
+    initial_elapsed = time.perf_counter() - initial_started
+    after_initial = _database_readback(args.database_url)
 
-        replay_results = {}
-        replay_started = time.perf_counter()
-        for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
-            root = args.output_root / f"replay-{name}"
-            root.mkdir()
-            process = _run_command(
-                fasta=fasta,
-                output=root / "result.duckdb",
-                profile=args.profile,
-                store=args.store,
-                threads=args.threads,
-                stdout_path=root / "stdout.json",
-                stderr_path=root / "stderr.log",
-            )
-            replay_results[name] = _result(root / "stdout.json", process.wait())
-        replay_elapsed = time.perf_counter() - replay_started
+    replay_results = {}
+    replay_started = time.perf_counter()
+    for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
+        root = args.output_root / f"replay-{name}"
+        root.mkdir()
+        process = _run_command(
+            fasta=fasta,
+            output=root / "result.duckdb",
+            profile=args.profile,
+            store=args.store,
+            threads=args.threads,
+            stdout_path=root / "stdout.json",
+            stderr_path=root / "stderr.log",
+        )
+        replay_results[name] = _result(root / "stdout.json", process.wait())
+    replay_elapsed = time.perf_counter() - replay_started
 
-        if args.cleanup_wait_seconds > 0:
-            time.sleep(args.cleanup_wait_seconds)
+    if args.cleanup_wait_seconds > 0:
+        time.sleep(args.cleanup_wait_seconds)
     final_readback = _database_readback(args.database_url)
     expected_replay = {"blf": 9116, "uniprot": 9115}
+    initial_reuse = [_reuse_counts(result) for result in initial_results.values()]
+    if (
+        sum(item[1] for item in initial_reuse) != 9116
+        or sum(item[0] for item in initial_reuse) != 9115
+    ):
+        raise RuntimeError("initial C2 results did not prove duplicate suppression")
     for name, expected in expected_replay.items():
         cache_hits, computed = _reuse_counts(replay_results[name])
         if cache_hits != expected or computed != 0:
@@ -269,9 +297,7 @@ def main() -> None:
         "schema_version": 1,
         "status": "accepted",
         "recorded_at": datetime.now(UTC).isoformat(),
-        "source_head": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "source_head": source_head,
         "python": platform.python_version(),
         "profile": args.profile,
         "threads_per_process": args.threads,
@@ -295,7 +321,7 @@ def main() -> None:
         "replay": replay_results,
         "replay_elapsed_seconds": replay_elapsed,
         "cleanup_wait_seconds": args.cleanup_wait_seconds,
-        "finalized_existing_outputs": args.finalize_existing,
+        "finalized_existing_outputs": False,
         "remaining_external_tool_processes": external_tool_processes,
         "final_database": final_readback,
     }

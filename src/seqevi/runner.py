@@ -166,13 +166,14 @@ class ToolRunner:
             live_members = ()
             if reason is None:
                 live_members, _ = self._group_snapshot(process.pid, process.pid)
-            if reason is not None or live_members:
-                self._terminate_and_reap(process, command, send_term=True)
-            else:
-                self._terminate_and_reap(process, command, send_term=False)
+            cleanup_error = self._terminate_and_reap(
+                process, command, send_term=reason is not None or bool(live_members)
+            )
 
             if original_error is not None:
                 raise original_error
+            if cleanup_error is not None:
+                raise cleanup_error
 
         result = self._result(
             command,
@@ -195,51 +196,120 @@ class ToolRunner:
         command: ToolCommand,
         *,
         send_term: bool,
-    ) -> None:
+    ) -> BaseException | None:
         leader_pid = process.pid
-        cleanup_started = time.monotonic()
+        cleanup_started: float | None = None
         stuck_reported = False
+        deferred_error: BaseException | None = None
+
+        def defer(error: BaseException) -> None:
+            nonlocal deferred_error
+            if deferred_error is None:
+                deferred_error = error
+
         if send_term:
-            self._signal_group(leader_pid, signal.SIGTERM, allow_missing=False)
+            while True:
+                try:
+                    self._signal_group(leader_pid, signal.SIGTERM, allow_missing=False)
+                    break
+                except (KeyboardInterrupt, SystemExit) as error:
+                    defer(error)
             grace_deadline = time.monotonic() + self.termination_grace_seconds
             while time.monotonic() < grace_deadline:
-                time.sleep(
-                    max(
-                        0.0,
-                        min(
-                            _WAIT_INTERVAL_SECONDS,
-                            grace_deadline - time.monotonic(),
-                        ),
+                try:
+                    time.sleep(
+                        max(
+                            0.0,
+                            min(
+                                _WAIT_INTERVAL_SECONDS,
+                                grace_deadline - time.monotonic(),
+                            ),
+                        )
                     )
-                )
+                except (KeyboardInterrupt, SystemExit) as error:
+                    defer(error)
 
             # Kill the complete group at the fixed grace boundary. A missing
             # group is a benign exit race; membership is still proven below.
-            self._signal_group(leader_pid, signal.SIGKILL, allow_missing=True)
+            while True:
+                try:
+                    self._signal_group(leader_pid, signal.SIGKILL, allow_missing=True)
+                    cleanup_started = time.monotonic()
+                    break
+                except (KeyboardInterrupt, SystemExit) as error:
+                    defer(error)
 
-        stuck_reported = self._wait_for_clean_group(
-            command,
-            leader_pid,
-            cleanup_started,
-            stuck_reported,
-        )
+        cleanup_started = cleanup_started or time.monotonic()
+
+        while True:
+            try:
+                stuck_reported = self._wait_for_clean_group(
+                    command,
+                    leader_pid,
+                    cleanup_started,
+                    stuck_reported,
+                )
+                break
+            except (KeyboardInterrupt, SystemExit) as error:
+                defer(error)
 
         # Fence a fork handoff while the unreaped leader still reserves its PGID.
-        while not self._signal_group(leader_pid, signal.SIGKILL, allow_missing=True):
-            live, _ = self._group_snapshot(leader_pid, leader_pid)
+        while True:
+            try:
+                if self._signal_group(leader_pid, signal.SIGKILL, allow_missing=True):
+                    break
+                live, _ = self._group_snapshot(leader_pid, leader_pid)
+            except (KeyboardInterrupt, SystemExit) as error:
+                defer(error)
+                continue
             if not stuck_reported:
                 self._report_cleanup_stuck(command, leader_pid, live)
                 stuck_reported = True
-            time.sleep(_WAIT_INTERVAL_SECONDS)
-        self._wait_for_clean_group(
-            command,
-            leader_pid,
-            cleanup_started,
-            stuck_reported,
-        )
-        if self._owns_adopted_children():
-            self._reap_adopted_group_zombies(leader_pid)
-        process.wait()
+            try:
+                time.sleep(_WAIT_INTERVAL_SECONDS)
+            except (KeyboardInterrupt, SystemExit) as error:
+                defer(error)
+        while True:
+            try:
+                self._wait_for_clean_group(
+                    command,
+                    leader_pid,
+                    cleanup_started,
+                    stuck_reported,
+                )
+                break
+            except (KeyboardInterrupt, SystemExit) as error:
+                defer(error)
+        while True:
+            try:
+                owns_adopted_children = self._owns_adopted_children()
+                break
+            except (KeyboardInterrupt, SystemExit) as error:
+                defer(error)
+        if owns_adopted_children:
+            while True:
+                try:
+                    adopted_clean = self._reap_adopted_group_zombies(leader_pid)
+                except (KeyboardInterrupt, SystemExit) as error:
+                    defer(error)
+                    continue
+                if adopted_clean:
+                    break
+                if time.monotonic() - cleanup_started >= _CLEANUP_STUCK_AFTER_SECONDS:
+                    if not stuck_reported:
+                        self._report_cleanup_stuck(command, leader_pid, ())
+                        stuck_reported = True
+                try:
+                    time.sleep(_WAIT_INTERVAL_SECONDS)
+                except (KeyboardInterrupt, SystemExit) as error:
+                    defer(error)
+        while True:
+            try:
+                process.wait()
+                break
+            except (KeyboardInterrupt, SystemExit) as error:
+                defer(error)
+        return deferred_error
 
     def _wait_for_clean_group(
         self,
@@ -355,13 +425,13 @@ class ToolRunner:
         )
 
     @classmethod
-    def _reap_adopted_group_zombies(cls, process_group_id: int) -> None:
+    def _reap_adopted_group_zombies(cls, process_group_id: int) -> bool:
         while True:
             reaped = False
             try:
                 entries = tuple(os.scandir("/proc"))
             except OSError:
-                return
+                return False
             for entry in entries:
                 if not entry.name.isdecimal():
                     continue
@@ -373,7 +443,7 @@ class ToolRunner:
                 except (FileNotFoundError, ProcessLookupError):
                     continue
                 except (OSError, ValueError):
-                    continue
+                    return False
                 if (
                     member.process_group_id != process_group_id
                     or member.state not in {"Z", "X"}
@@ -386,7 +456,7 @@ class ToolRunner:
                     continue
                 reaped = reaped or waited == pid
             if not reaped:
-                return
+                return True
 
     @staticmethod
     def _owns_adopted_children() -> bool:

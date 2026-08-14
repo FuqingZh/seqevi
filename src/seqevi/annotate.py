@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
@@ -309,9 +310,13 @@ def run_annotation(
             busy_queries = next_busy
             busy_retry_after = next_retry_after
 
+        if claim_session is not None:
+            claim_session.raise_if_lost()
         fetch_started = time.perf_counter()
         fetched_by_key = store.fetch_many(keys_by_sequence_id.values())
         store_fetch_seconds = time.perf_counter() - fetch_started
+        if claim_session is not None:
+            claim_session.raise_if_lost()
         missing_keys = set(keys_by_sequence_id.values()) - fetched_by_key.keys()
         if missing_keys:
             raise AnnotationError(
@@ -338,8 +343,17 @@ def run_annotation(
         metadata = dict(result_metadata or _default_result_metadata(adapter))
         metadata["InputDigest"] = stage.input_digest
         metadata.setdefault("CreatedAt", datetime.now(UTC).isoformat())
+        package_output = (
+            work_dir / "candidate-result.duckdb"
+            if claim_session is not None
+            else output_dir
+        )
+        if claim_session is not None:
+            claim_session.raise_if_lost()
+            if output_dir.exists():
+                raise AnnotationError(f"output path already exists: {output_dir}")
         materialize_result_database(
-            output_path=output_dir,
+            output_path=package_output,
             records=iter_staged_records(stage),
             input_record_count=stage.input_records,
             fetched_by_sequence_id=fetched_by_sequence_id,
@@ -357,6 +371,14 @@ def run_annotation(
                 "no_hits": statuses.count(EvidenceStatus.NO_HIT),
             },
         )
+        if claim_session is not None:
+            try:
+                claim_session.raise_if_lost()
+                os.replace(package_output, output_dir)
+                claim_session.raise_if_lost()
+            except BaseException:
+                output_dir.unlink(missing_ok=True)
+                raise
         package_seconds = time.perf_counter() - package_started
     except BaseException as error:
         primary_failure = error
@@ -491,6 +513,8 @@ def _run_annotation_batch(
             claim_session.raise_if_lost()
         raise
     adapter_seconds = time.perf_counter() - adapter_started
+    if claim_session is not None:
+        claim_session.raise_if_lost()
     commits = _build_commits(batch=batch, identities=identities, adapter=adapter)
     batches = 0
     peer_completed_sequence_ids: set[str] = set()
@@ -502,6 +526,7 @@ def _run_annotation_batch(
         else:
             claim_session.raise_if_lost()
             outcomes = claim_session.finalize_many(commit_batch)
+            claim_session.raise_if_lost()
             peer_completed_sequence_ids.update(
                 commit.identity.sequence_id
                 for commit, outcome in zip(commit_batch, outcomes, strict=True)

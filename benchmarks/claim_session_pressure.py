@@ -42,6 +42,32 @@ _RESIDUES = "ACDEFGHIKLMNPQRSTVWY"
 _phase = contextvars.ContextVar("pressure_phase", default="other")
 
 
+def _candidate_head() -> str:
+    dirty = (
+        __import__("subprocess")
+        .check_output(
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                "src",
+                "benchmarks",
+            ],
+            text=True,
+        )
+        .strip()
+    )
+    if dirty:
+        raise RuntimeError("pressure requires committed source and benchmark harnesses")
+    return (
+        __import__("subprocess")
+        .check_output(["git", "rev-parse", "HEAD"], text=True)
+        .strip()
+    )
+
+
 def _sequence(index: int) -> str:
     encoded = []
     value = index
@@ -120,6 +146,7 @@ def main() -> None:
         parser.error("--counts values must be positive")
     if args.report.exists():
         parser.error("--report must not already exist")
+    source_head = _candidate_head()
 
     persistence = PostgresEvidencePersistence.open(
         args.database_url, pool_size=32, max_overflow=32
@@ -279,41 +306,47 @@ def main() -> None:
 
             heartbeat_thread = threading.Thread(target=heartbeat)
             heartbeat_thread.start()
-            for offset in range(0, count, 1000):
-                batch = queries[offset : offset + 1000]
-                models = [EvidenceQueryModel.from_domain(query) for query in batch]
-                started = time.perf_counter()
-                with _measured("acquire"):
-                    outcomes = persistence.acquire_claim_session(
-                        authority,
-                        acquire_request_id=uuid4().hex,
-                        query_digest=canonical_query_digest(models),
-                        queries=batch,
+            try:
+                for offset in range(0, count, 1000):
+                    batch = queries[offset : offset + 1000]
+                    models = [EvidenceQueryModel.from_domain(query) for query in batch]
+                    started = time.perf_counter()
+                    with _measured("acquire"):
+                        outcomes = persistence.acquire_claim_session(
+                            authority,
+                            acquire_request_id=uuid4().hex,
+                            query_digest=canonical_query_digest(models),
+                            queries=batch,
+                        )
+                    operation_latencies["acquire"].append(time.perf_counter() - started)
+                    if any(
+                        outcome.disposition is not ClaimDisposition.ACQUIRED
+                        for outcome in outcomes
+                    ):
+                        raise RuntimeError(
+                            "pressure acquire did not own every cold key"
+                        )
+                    acquired.extend(
+                        (query, outcome.claim.generation)
+                        for query, outcome in zip(batch, outcomes, strict=True)
+                        if outcome.claim is not None
                     )
-                operation_latencies["acquire"].append(time.perf_counter() - started)
-                if any(
-                    outcome.disposition is not ClaimDisposition.ACQUIRED
-                    for outcome in outcomes
-                ):
-                    raise RuntimeError("pressure acquire did not own every cold key")
-                acquired.extend(
-                    (query, outcome.claim.generation)
-                    for query, outcome in zip(batch, outcomes, strict=True)
-                    if outcome.claim is not None
-                )
-            for offset in range(0, count, 1000):
-                items = tuple(
-                    _finalize_item(query, generation)
-                    for query, generation in acquired[offset : offset + 1000]
-                )
-                started = time.perf_counter()
-                with _measured("finalize"):
-                    persistence.finalize_claim_session(
-                        authority, items, {raw_artifact.digest: raw_artifact}
+                for offset in range(0, count, 1000):
+                    items = tuple(
+                        _finalize_item(query, generation)
+                        for query, generation in acquired[offset : offset + 1000]
                     )
-                operation_latencies["finalize"].append(time.perf_counter() - started)
-            heartbeat_stop.set()
-            heartbeat_thread.join()
+                    started = time.perf_counter()
+                    with _measured("finalize"):
+                        persistence.finalize_claim_session(
+                            authority, items, {raw_artifact.digest: raw_artifact}
+                        )
+                    operation_latencies["finalize"].append(
+                        time.perf_counter() - started
+                    )
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join()
             started = time.perf_counter()
             with _measured("close"):
                 persistence.close_claim_session(authority)
@@ -393,6 +426,12 @@ def main() -> None:
                     "terminal_evidence_total": terminal,
                 }
             )
+            expected_terminal = sum(args.counts[:lane])
+            if terminal != expected_terminal:
+                raise RuntimeError(
+                    f"pressure terminal evidence was {terminal}, "
+                    f"expected {expected_terminal}"
+                )
         if args.cleanup_wait_seconds > 0:
             time.sleep(args.cleanup_wait_seconds)
         final_cleanup_started = time.perf_counter()
@@ -444,12 +483,18 @@ def main() -> None:
         persistence.close()
     if activity_errors:
         raise RuntimeError(f"pg_stat_activity sampling failed: {activity_errors}")
+    expected_zero = {
+        "claim_sessions": 0,
+        "session_claims": 0,
+        "claim_session_acquire_receipts": 0,
+        "claim_session_acquire_receipt_items": 0,
+    }
+    if final_residual != expected_zero:
+        raise RuntimeError(f"pressure left residual coordination: {final_residual}")
 
     report = {
         "schema_version": 1,
-        "source_head": __import__("subprocess")
-        .check_output(["git", "rev-parse", "HEAD"], text=True)
-        .strip(),
+        "source_head": source_head,
         "python": platform.python_version(),
         "postgres": postgres_version,
         "settings": settings,

@@ -238,6 +238,39 @@ class _AuthorityLosingStore(_CountingStore):
         return AuthorityLosingSession()  # type: ignore[return-value]
 
 
+class _ManualAuthorityLosingStore(_CountingStore):
+    def __init__(self, delegate: LocalStore) -> None:
+        super().__init__(delegate)
+        self.lost = threading.Event()
+
+    def lose_authority(self) -> None:
+        self.lost.set()
+
+    def claim_session(self) -> ClaimSession:
+        delegate = self.delegate.claim_session()
+        owner = self
+
+        class ManualSession:
+            cancellation_signal = owner.lost
+
+            def __enter__(self):
+                delegate.__enter__()
+                return self
+
+            def __exit__(self, *_error):
+                return delegate.__exit__(*_error)
+
+            def raise_if_lost(self) -> None:
+                if owner.lost.is_set():
+                    raise EvidenceClaimLostError("injected packaging authority loss")
+                delegate.raise_if_lost()
+
+            def __getattr__(self, name):
+                return getattr(delegate, name)
+
+        return ManualSession()  # type: ignore[return-value]
+
+
 class _ConcurrentRecordingAdapter:
     def __init__(self, delegate: FixtureAdapter, *, block_first: bool = False) -> None:
         self.delegate = delegate
@@ -655,6 +688,38 @@ def test_claim_authority_loss_cancels_tool_before_finalize(tmp_path: Path) -> No
     assert isinstance(raised.value.__cause__, EvidenceClaimLostError)
     assert cancellation_elapsed < 1.0
     assert store.finalize_calls == 0
+
+
+def test_claim_authority_loss_during_packaging_never_publishes_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    original_materialize = annotate_module.materialize_result_database
+
+    with LocalStore.open(tmp_path / "store") as local:
+        store = _ManualAuthorityLosingStore(local)
+
+        def materialize(**kwargs: object) -> None:
+            original_materialize(**kwargs)  # type: ignore[arg-type]
+            store.lose_authority()
+
+        monkeypatch.setattr(annotate_module, "materialize_result_database", materialize)
+        output = tmp_path / "output.duckdb"
+        with pytest.raises(AnnotationError) as raised:
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=output,
+                adapter=adapter,
+                store=store,
+            )
+
+    assert isinstance(raised.value.__cause__, EvidenceClaimLostError)
+    assert not output.exists()
 
 
 def test_annotation_preserves_primary_failure_when_session_close_also_fails(

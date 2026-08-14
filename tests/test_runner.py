@@ -234,6 +234,54 @@ def test_keyboard_interrupt_still_cleans_and_reaps_group(tmp_path: Path) -> None
     assert time.monotonic() - started < 1.0
 
 
+def test_keyboard_interrupt_during_grace_is_deferred_until_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_path = tmp_path / "leader.pid"
+    cancellation = threading.Event()
+    cancellation.set()
+    original_sleep = runner_module.time.sleep
+    interrupted = False
+
+    def interrupt_once(seconds: float) -> None:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+        original_sleep(seconds)
+
+    monkeypatch.setattr(runner_module.time, "sleep", interrupt_once)
+    with pytest.raises(KeyboardInterrupt):
+        ToolRunner(termination_grace_seconds=0.05).run(
+            command(
+                tmp_path,
+                f"import os,pathlib,time;pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()));time.sleep(10)",
+            ),
+            cancellation_signal=cancellation,
+        )
+    assert interrupted
+    if pid_path.exists():
+        assert not Path(f"/proc/{pid_path.read_text()}").exists()
+
+
+def test_adopted_zombie_read_ambiguity_is_not_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = ToolRunner._read_process_member
+    ambiguous = True
+
+    def read(pid: int):
+        nonlocal ambiguous
+        if ambiguous:
+            ambiguous = False
+            raise PermissionError
+        return original(pid)
+
+    monkeypatch.setattr(ToolRunner, "_read_process_member", staticmethod(read))
+    assert ToolRunner._reap_adopted_group_zombies(999_999) is False
+    assert ToolRunner._reap_adopted_group_zombies(999_999) is True
+
+
 def test_cleanup_stuck_remains_synchronously_owned_until_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -241,8 +289,23 @@ def test_cleanup_stuck_remains_synchronously_owned_until_clean(
     cancellation.set()
     release = threading.Event()
     observed = []
+    observed_at: list[float] = []
+    forced_at: list[float] = []
     monkeypatch.setattr(runner_module, "_CLEANUP_STUCK_AFTER_SECONDS", 0.05)
     original_snapshot = runner_module.ToolRunner._group_snapshot
+    original_signal_group = runner_module.ToolRunner._signal_group
+
+    def signal_group(
+        process_group_id: int,
+        sent_signal: signal.Signals,
+        *,
+        allow_missing: bool,
+    ) -> bool:
+        if sent_signal == signal.SIGKILL and not forced_at:
+            forced_at.append(time.monotonic())
+        return original_signal_group(
+            process_group_id, sent_signal, allow_missing=allow_missing
+        )
 
     def blocked_snapshot(process_group_id: int, leader_pid: int):
         if not release.is_set():
@@ -264,9 +327,15 @@ def test_cleanup_stuck_remains_synchronously_owned_until_clean(
         "_group_snapshot",
         staticmethod(blocked_snapshot),
     )
+    monkeypatch.setattr(
+        runner_module.ToolRunner,
+        "_signal_group",
+        staticmethod(signal_group),
+    )
 
     def observe(stuck) -> None:
         observed.append(stuck)
+        observed_at.append(time.monotonic())
         threading.Timer(0.05, release.set).start()
 
     with pytest.raises(ToolCancelledError):
@@ -278,5 +347,6 @@ def test_cleanup_stuck_remains_synchronously_owned_until_clean(
         )
 
     assert len(observed) == 1
+    assert observed_at[0] - forced_at[0] >= 0.05
     assert observed[0].members == ((observed[0].leader_pid + 1, "D"),)
     assert release.is_set()
