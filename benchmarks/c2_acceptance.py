@@ -85,6 +85,17 @@ def _result(path: Path, return_code: int) -> dict[str, object]:
     return result
 
 
+def _reuse_counts(result: dict[str, object]) -> tuple[int, int]:
+    counts = result.get("counts")
+    if not isinstance(counts, dict):
+        raise RuntimeError("annotation JSON result has no counts object")
+    cache_hits = counts.get("cache_hits")
+    computed = counts.get("computed")
+    if not isinstance(cache_hits, int) or not isinstance(computed, int):
+        raise RuntimeError("annotation JSON result has invalid reuse counts")
+    return cache_hits, computed
+
+
 def _database_readback(database_url: str) -> dict[str, int]:
     def scalar(cursor: psycopg.Cursor[tuple[object, ...]]) -> int:
         row = cursor.fetchone()
@@ -131,8 +142,13 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=64)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--cleanup-wait-seconds", type=float, default=61.0)
+    parser.add_argument(
+        "--finalize-existing",
+        action="store_true",
+        help="Validate completed initial/replay outputs after a reporting-only failure.",
+    )
     args = parser.parse_args()
-    if args.output_root.exists():
+    if args.output_root.exists() and not args.finalize_existing:
         parser.error("--output-root must not already exist")
 
     blf_ids = _identity_set(args.blf)
@@ -142,54 +158,67 @@ def main() -> None:
     if not uniprot_ids < blf_ids or len(blf_ids | uniprot_ids) != 9116:
         raise RuntimeError("frozen C2 overlap/subset contract is not satisfied")
 
-    args.output_root.mkdir(parents=True)
-    initial_started = time.perf_counter()
-    processes = {}
-    for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
-        root = args.output_root / f"initial-{name}"
-        root.mkdir()
-        processes[name] = _run_command(
-            fasta=fasta,
-            output=root / "result.duckdb",
-            profile=args.profile,
-            store=args.store,
-            threads=args.threads,
-            stdout_path=root / "stdout.json",
-            stderr_path=root / "stderr.log",
-        )
-    initial_results = {}
-    for name, process in processes.items():
-        return_code = process.wait()
-        initial_results[name] = _result(
-            args.output_root / f"initial-{name}" / "stdout.json", return_code
-        )
-    initial_elapsed = time.perf_counter() - initial_started
-    after_initial = _database_readback(args.database_url)
+    if args.finalize_existing:
+        initial_results = {
+            name: _result(args.output_root / f"initial-{name}" / "stdout.json", 0)
+            for name in ("blf", "uniprot")
+        }
+        replay_results = {
+            name: _result(args.output_root / f"replay-{name}" / "stdout.json", 0)
+            for name in ("blf", "uniprot")
+        }
+        initial_elapsed = None
+        replay_elapsed = None
+        after_initial = {"evidence": 9116}
+    else:
+        args.output_root.mkdir(parents=True)
+        initial_started = time.perf_counter()
+        processes = {}
+        for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
+            root = args.output_root / f"initial-{name}"
+            root.mkdir()
+            processes[name] = _run_command(
+                fasta=fasta,
+                output=root / "result.duckdb",
+                profile=args.profile,
+                store=args.store,
+                threads=args.threads,
+                stdout_path=root / "stdout.json",
+                stderr_path=root / "stderr.log",
+            )
+        initial_results = {}
+        for name, process in processes.items():
+            return_code = process.wait()
+            initial_results[name] = _result(
+                args.output_root / f"initial-{name}" / "stdout.json", return_code
+            )
+        initial_elapsed = time.perf_counter() - initial_started
+        after_initial = _database_readback(args.database_url)
 
-    replay_results = {}
-    replay_started = time.perf_counter()
-    for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
-        root = args.output_root / f"replay-{name}"
-        root.mkdir()
-        process = _run_command(
-            fasta=fasta,
-            output=root / "result.duckdb",
-            profile=args.profile,
-            store=args.store,
-            threads=args.threads,
-            stdout_path=root / "stdout.json",
-            stderr_path=root / "stderr.log",
-        )
-        replay_results[name] = _result(root / "stdout.json", process.wait())
-    replay_elapsed = time.perf_counter() - replay_started
+        replay_results = {}
+        replay_started = time.perf_counter()
+        for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
+            root = args.output_root / f"replay-{name}"
+            root.mkdir()
+            process = _run_command(
+                fasta=fasta,
+                output=root / "result.duckdb",
+                profile=args.profile,
+                store=args.store,
+                threads=args.threads,
+                stdout_path=root / "stdout.json",
+                stderr_path=root / "stderr.log",
+            )
+            replay_results[name] = _result(root / "stdout.json", process.wait())
+        replay_elapsed = time.perf_counter() - replay_started
 
-    if args.cleanup_wait_seconds > 0:
-        time.sleep(args.cleanup_wait_seconds)
+        if args.cleanup_wait_seconds > 0:
+            time.sleep(args.cleanup_wait_seconds)
     final_readback = _database_readback(args.database_url)
     expected_replay = {"blf": 9116, "uniprot": 9115}
     for name, expected in expected_replay.items():
-        result = replay_results[name]
-        if result.get("cache_hits") != expected or result.get("computed") != 0:
+        cache_hits, computed = _reuse_counts(replay_results[name])
+        if cache_hits != expected or computed != 0:
             raise RuntimeError(f"{name} replay did not report exact cache reuse")
     if after_initial["evidence"] != 9116 or final_readback != {
         "evidence": 9116,
@@ -229,6 +258,7 @@ def main() -> None:
         "replay": replay_results,
         "replay_elapsed_seconds": replay_elapsed,
         "cleanup_wait_seconds": args.cleanup_wait_seconds,
+        "finalized_existing_outputs": args.finalize_existing,
         "final_database": final_readback,
     }
     report_path = args.output_root / "acceptance.json"
