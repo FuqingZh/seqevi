@@ -97,6 +97,24 @@ def test_c2_frozen_input_digests_and_threads_are_hard_gates(tmp_path: Path) -> N
         module["_validate_profile"]("diagnostic-profile")
 
 
+def test_c2_child_environment_overrides_stale_pythonpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _c2()
+    monkeypatch.chdir(tmp_path)
+    source_root = module["_candidate_source_root"]()
+    monkeypatch.setenv("PYTHONPATH", "/stale/installed/package")
+
+    environment = module["_candidate_child_environment"](source_root)
+
+    assert environment["PYTHONPATH"] == str(source_root.resolve())
+    assert "/stale/installed/package" not in environment["PYTHONPATH"]
+    assert (source_root / "seqevi" / "__init__.py").is_file()
+    assert module["_child_environment_record"](environment) == {
+        "PYTHONPATH": str(source_root.resolve())
+    }
+
+
 def test_pressure_listener_includes_final_cleanup_deletes() -> None:
     module = cast(
         dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
@@ -105,6 +123,17 @@ def test_pressure_listener_includes_final_cleanup_deletes() -> None:
     assert records("sweep") is True
     assert records("final_cleanup") is True
     assert records("renew") is False
+
+
+def test_pressure_counts_are_frozen_for_acceptance() -> None:
+    module = cast(
+        dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
+    )
+    validate = module["_validate_counts"]
+    validate([100, 1000, 3000, 9116])
+    for counts in ([100], [100, 1000, 3000], [100, 1000, 3000, 9117]):
+        with pytest.raises(ValueError, match="requires counts"):
+            validate(counts)
 
 
 def test_c2_result_identity_is_frozen_fail_closed(tmp_path: Path) -> None:

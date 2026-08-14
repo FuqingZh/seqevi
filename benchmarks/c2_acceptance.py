@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -24,6 +25,7 @@ from psycopg import sql
 
 from seqevi.sequence import read_fasta
 
+_HARNESS_PATH = Path(__file__).resolve()
 _REQUIRED_THREADS = 64
 _REQUIRED_PROFILE = "eggnog-5.0.2"
 _FROZEN_INPUT_SHA256 = {
@@ -80,9 +82,12 @@ def _identity_digest(identities: set[str]) -> str:
 
 
 def _candidate_head() -> str:
+    repository_root = _HARNESS_PATH.parents[1]
     dirty = subprocess.check_output(
         [
             "git",
+            "-C",
+            str(repository_root),
             "status",
             "--porcelain",
             "--untracked-files=all",
@@ -94,7 +99,39 @@ def _candidate_head() -> str:
     ).strip()
     if dirty:
         raise RuntimeError("C2 requires committed source and benchmark harnesses")
-    return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    return subprocess.check_output(
+        ["git", "-C", str(repository_root), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+
+def _candidate_source_root() -> Path:
+    harness_root = _HARNESS_PATH.parents[1]
+    repository_root = Path(
+        subprocess.check_output(
+            ["git", "-C", str(harness_root), "rev-parse", "--show-toplevel"],
+            text=True,
+        ).strip()
+    ).resolve()
+    source_root = repository_root / "src"
+    package_marker = source_root / "seqevi" / "__init__.py"
+    if harness_root != repository_root or not package_marker.is_file():
+        raise RuntimeError("C2 harness is not bound to the candidate source tree")
+    subprocess.check_output(
+        ["git", "ls-files", "--error-unmatch", "src/seqevi/__init__.py"],
+        cwd=repository_root,
+        stderr=subprocess.STDOUT,
+    )
+    return source_root
+
+
+def _candidate_child_environment(source_root: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(source_root.resolve())
+    return environment
+
+
+def _child_environment_record(environment: Mapping[str, str]) -> dict[str, str]:
+    return {"PYTHONPATH": environment["PYTHONPATH"]}
 
 
 def _external_tool_processes(output_root: Path) -> list[int]:
@@ -136,6 +173,7 @@ def _run_command(
     threads: int,
     stdout_path: Path,
     stderr_path: Path,
+    environment: Mapping[str, str],
 ) -> subprocess.Popen[bytes]:
     command = (
         sys.executable,
@@ -163,7 +201,7 @@ def _run_command(
             stdout=stdout,
             stderr=stderr,
             start_new_session=True,
-            env=os.environ.copy(),
+            env=dict(environment),
         )
     finally:
         stdout.close()
@@ -484,6 +522,8 @@ def main() -> None:
     if args.output_root.exists():
         parser.error("--output-root must not already exist")
     source_head = _candidate_head()
+    candidate_source_root = _candidate_source_root()
+    child_environment = _candidate_child_environment(candidate_source_root)
 
     input_paths = {"blf": args.blf, "uniprot": args.uniprot}
     input_sha256 = _validate_frozen_inputs(input_paths)
@@ -513,6 +553,7 @@ def main() -> None:
                 threads=args.threads,
                 stdout_path=root / "stdout.json",
                 stderr_path=root / "stderr.log",
+                environment=child_environment,
             )
     except BaseException:
         _stop_and_reap(processes)
@@ -550,6 +591,7 @@ def main() -> None:
             threads=args.threads,
             stdout_path=root / "stdout.json",
             stderr_path=root / "stderr.log",
+            environment=child_environment,
         )
         try:
             return_code = process.wait()
@@ -597,6 +639,7 @@ def main() -> None:
         "python": platform.python_version(),
         "profile": args.profile,
         "threads_per_process": args.threads,
+        "annotation_child_environment": _child_environment_record(child_environment),
         "store_binding_probe_open_request_id": store_binding_probe,
         "inputs": {
             "blf": {

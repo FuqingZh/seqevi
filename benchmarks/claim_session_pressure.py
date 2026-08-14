@@ -49,10 +49,16 @@ _PHASE_SQL_PER_OPERATION = {
     "sweep": 10,
 }
 _OPERATION_DEADLINE_SECONDS = 5.0
+_REQUIRED_COUNTS = (100, 1000, 3000, 9116)
 
 
 def _records_sweep_delete_rows(phase: str) -> bool:
     return phase in {"sweep", "final_cleanup"}
+
+
+def _validate_counts(counts: list[int]) -> None:
+    if tuple(counts) != _REQUIRED_COUNTS:
+        raise ValueError("accepted pressure requires counts 100 1000 3000 9116 exactly")
 
 
 def _candidate_head() -> str:
@@ -252,8 +258,10 @@ def main() -> None:
     )
     parser.add_argument("--cleanup-wait-seconds", type=float, default=61.0)
     args = parser.parse_args()
-    if any(count < 1 for count in args.counts):
-        parser.error("--counts values must be positive")
+    try:
+        _validate_counts(args.counts)
+    except ValueError as error:
+        parser.error(str(error))
     if args.report.exists():
         parser.error("--report must not already exist")
     source_head = _candidate_head()
