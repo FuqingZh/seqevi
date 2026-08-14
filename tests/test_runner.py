@@ -154,6 +154,16 @@ def test_cancellation_wakes_runner_without_polling_delay(tmp_path: Path) -> None
     assert time.monotonic() - started < 1.0
 
 
+def test_cancellation_wins_the_leader_exit_boundary(tmp_path: Path) -> None:
+    cancellation = threading.Event()
+    cancellation.set()
+    with pytest.raises(ToolCancelledError) as raised:
+        ToolRunner(termination_grace_seconds=0.01).run(
+            command(tmp_path, "pass"), cancellation_signal=cancellation
+        )
+    assert raised.value.result.cancelled is True
+
+
 def test_keyboard_interrupt_still_cleans_and_reaps_group(tmp_path: Path) -> None:
     class InterruptingSignal:
         def is_set(self) -> bool:

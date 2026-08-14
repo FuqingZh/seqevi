@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 import signal
 import subprocess
 import time
 from collections.abc import Callable, Mapping
+from ctypes import CDLL, byref, c_int
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from threading import Event
 _WAIT_INTERVAL_SECONDS = 0.05
 _CLEANUP_STUCK_AFTER_SECONDS = 2.0
 _LOGGER = logging.getLogger("seqevi.runner")
+_PR_GET_CHILD_SUBREAPER = 37
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,7 +235,8 @@ class ToolRunner:
             cleanup_started,
             stuck_reported,
         )
-        self._reap_adopted_group_zombies(leader_pid)
+        if self._owns_adopted_children():
+            self._reap_adopted_group_zombies(leader_pid)
         process.wait()
 
     def _wait_for_clean_group(
@@ -382,6 +385,19 @@ class ToolRunner:
                 reaped = reaped or waited == pid
             if not reaped:
                 return
+
+    @staticmethod
+    def _owns_adopted_children() -> bool:
+        if os.getpid() == 1:
+            return True
+        enabled = c_int()
+        try:
+            result = CDLL(None, use_errno=True).prctl(
+                _PR_GET_CHILD_SUBREAPER, byref(enabled), 0, 0, 0
+            )
+        except (AttributeError, OSError):
+            return False
+        return result == 0 and enabled.value == 1
 
     @staticmethod
     def _signal_group(
