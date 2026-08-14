@@ -142,9 +142,13 @@ class ToolRunner:
                 shell=False,
                 start_new_session=True,
             )
+            execution_started = time.monotonic()
             reason: str | None = None
             original_error: BaseException | None = None
-            deadline = None if timeout_seconds is None else started + timeout_seconds
+            deadline = (
+                None if timeout_seconds is None else execution_started + timeout_seconds
+            )
+            live_members = ()
             try:
                 while not self._leader_exited(process.pid):
                     if cancellation_signal.is_set():
@@ -158,15 +162,13 @@ class ToolRunner:
                             break
                         wait_for = min(wait_for, remaining)
                     cancellation_signal.wait(wait_for)
+                if reason is None and cancellation_signal.is_set():
+                    reason = "cancelled"
+                if reason is None:
+                    live_members, _ = self._group_snapshot(process.pid, process.pid)
             except BaseException as error:
                 original_error = error
                 reason = "exception"
-
-            if reason is None and cancellation_signal.is_set():
-                reason = "cancelled"
-            live_members = ()
-            if reason is None:
-                live_members, _ = self._group_snapshot(process.pid, process.pid)
             cleanup_error = self._terminate_and_reap(
                 process, command, send_term=reason is not None or bool(live_members)
             )
@@ -175,6 +177,8 @@ class ToolRunner:
                 raise original_error
             if cleanup_error is not None:
                 raise cleanup_error
+            if reason is None and cancellation_signal.is_set():
+                reason = "cancelled"
 
         result = self._result(
             command,
@@ -406,11 +410,10 @@ class ToolRunner:
             except (OSError, ValueError):
                 ambiguous = True
                 continue
-            if (
-                member.process_group_id == process_group_id
-                and member.pid != leader_pid
-                and member.state not in {"Z", "X"}
-            ):
+            if member.process_group_id == process_group_id and member.state not in {
+                "Z",
+                "X",
+            }:
                 live.append(member)
         return tuple(sorted(live, key=lambda item: item.pid)), ambiguous
 

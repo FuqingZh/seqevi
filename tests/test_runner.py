@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -218,6 +219,80 @@ def test_cancellation_wins_the_leader_exit_boundary(tmp_path: Path) -> None:
     assert raised.value.result.cancelled is True
 
 
+def test_cancellation_after_containment_wins_normal_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cancellation = threading.Event()
+    original_snapshot = ToolRunner._group_snapshot
+    snapshots = 0
+
+    def snapshot(process_group_id: int, leader_pid: int):
+        nonlocal snapshots
+        observed = original_snapshot(process_group_id, leader_pid)
+        snapshots += 1
+        if snapshots == 1:
+            cancellation.set()
+        return observed
+
+    monkeypatch.setattr(ToolRunner, "_group_snapshot", staticmethod(snapshot))
+
+    with pytest.raises(ToolCancelledError) as raised:
+        ToolRunner().run(command(tmp_path, "pass"), cancellation_signal=cancellation)
+
+    assert raised.value.result.cancelled is True
+
+
+def test_interrupt_during_pre_cleanup_scan_is_deferred_until_group_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    original_snapshot = ToolRunner._group_snapshot
+    interrupted = False
+
+    def interrupt_once(process_group_id: int, leader_pid: int):
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+        return original_snapshot(process_group_id, leader_pid)
+
+    monkeypatch.setattr(ToolRunner, "_group_snapshot", staticmethod(interrupt_once))
+    with pytest.raises(KeyboardInterrupt):
+        ToolRunner(termination_grace_seconds=0.05).run(
+            command(
+                tmp_path,
+                "import pathlib,subprocess,sys;"
+                "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(10)']);"
+                f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))",
+            )
+        )
+
+    assert interrupted
+    child_pid = int(child_pid_path.read_text())
+    child_stat = Path(f"/proc/{child_pid}/stat")
+    if child_stat.exists():
+        assert child_stat.read_text().split(") ", 1)[1].startswith(("Z ", "X "))
+
+
+def test_timeout_budget_starts_after_successful_process_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_popen = runner_module.subprocess.Popen
+
+    def delayed_popen(*args: Any, **kwargs: Any):
+        time.sleep(0.15)
+        return original_popen(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", delayed_popen)
+
+    result = ToolRunner().run(
+        command(tmp_path, "import time;time.sleep(0.1)"), timeout_seconds=0.2
+    )
+
+    assert result.return_code == 0
+    assert result.duration_seconds >= 0.25
+
+
 def test_keyboard_interrupt_still_cleans_and_reaps_group(tmp_path: Path) -> None:
     class InterruptingSignal:
         def is_set(self) -> bool:
@@ -409,7 +484,7 @@ def test_cleanup_stuck_remains_synchronously_owned_until_clean(
             return (
                 (
                     runner_module._ProcessMember(  # pyright: ignore[reportPrivateUsage]
-                        pid=leader_pid + 1,
+                        pid=leader_pid,
                         state="D",
                         parent_pid=leader_pid,
                         process_group_id=process_group_id,
@@ -445,5 +520,5 @@ def test_cleanup_stuck_remains_synchronously_owned_until_clean(
 
     assert len(observed) == 1
     assert observed_at[0] - forced_at[0] >= 0.05
-    assert observed[0].members == ((observed[0].leader_pid + 1, "D"),)
+    assert observed[0].members == ((observed[0].leader_pid, "D"),)
     assert release.is_set()

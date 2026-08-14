@@ -6,6 +6,7 @@ import argparse
 import contextvars
 import hashlib
 import json
+import math
 import platform
 import threading
 import time
@@ -40,6 +41,14 @@ from seqevi.store.transport import (
 
 _RESIDUES = "ACDEFGHIKLMNPQRSTVWY"
 _phase = contextvars.ContextVar("pressure_phase", default="other")
+_PHASE_SQL_PER_OPERATION = {
+    "acquire": 19,
+    "renew": 5,
+    "finalize": 15,
+    "close": 5,
+    "sweep": 10,
+}
+_OPERATION_DEADLINE_SECONDS = 5.0
 
 
 def _records_sweep_delete_rows(phase: str) -> bool:
@@ -96,6 +105,103 @@ def _percentile(values: list[float], percentile: float) -> float:
     ordered = sorted(values)
     index = min(round((len(ordered) - 1) * percentile), len(ordered) - 1)
     return ordered[index]
+
+
+def _validate_lane_report(
+    report: dict[str, Any],
+    *,
+    expected_terminal: int,
+    expected_sessions: int,
+    expected_receipt_headers: int,
+) -> None:
+    claims = cast(int, report["claims"])
+    expected_operations = {
+        "acquire": math.ceil(claims / 1000),
+        "renew": cast(int, report["heartbeat_calls"]),
+        "finalize": math.ceil(claims / 1000),
+        "close": 1,
+        "sweep": 1,
+    }
+    if expected_operations["renew"] < 1:
+        raise RuntimeError("pressure lane did not overlap heartbeat traffic")
+    phases = cast(dict[str, dict[str, int | float]], report["phases"])
+    for phase, operations in expected_operations.items():
+        metrics = phases[phase]
+        if metrics["operations"] != operations:
+            raise RuntimeError(f"pressure {phase} operation count is not canonical")
+        if metrics["sql_executions"] != operations * _PHASE_SQL_PER_OPERATION[phase]:
+            raise RuntimeError(f"pressure {phase} SQL count is not bounded")
+        if metrics["transactions"] != operations:
+            raise RuntimeError(f"pressure {phase} transaction count is not bounded")
+        if metrics["pool_checkouts"] != operations:
+            raise RuntimeError(f"pressure {phase} pool checkout count is not bounded")
+        latency = [
+            cast(float, metrics[name])
+            for name in (
+                "p50_seconds",
+                "p95_seconds",
+                "p99_seconds",
+                "maximum_seconds",
+            )
+        ]
+        if (
+            not all(math.isfinite(value) and value >= 0 for value in latency)
+            or latency != sorted(latency)
+            or latency[-1] >= _OPERATION_DEADLINE_SECONDS
+        ):
+            raise RuntimeError(f"pressure {phase} latency exceeded its invariant")
+        pool_latency = [
+            cast(float, metrics["pool_wait_p95_seconds"]),
+            cast(float, metrics["pool_wait_maximum_seconds"]),
+        ]
+        if (
+            not all(math.isfinite(value) and value >= 0 for value in pool_latency)
+            or pool_latency != sorted(pool_latency)
+            or pool_latency[-1] >= _OPERATION_DEADLINE_SECONDS
+        ):
+            raise RuntimeError(f"pressure {phase} pool wait exceeded its invariant")
+    if report["http_status_counts"] != {"412": 0, "503": 0}:
+        raise RuntimeError("pressure observed unexpected authority/backpressure status")
+    residual = cast(dict[str, int], report["residual"])
+    expected_residual = {
+        "claim_sessions": expected_sessions,
+        "session_claims": 0,
+        "claim_session_acquire_receipts": expected_receipt_headers,
+        "claim_session_acquire_receipt_items": expected_terminal,
+    }
+    if residual != expected_residual:
+        raise RuntimeError(f"pressure lane residual is not canonical: {residual}")
+    if report["terminal_evidence_total"] != expected_terminal:
+        raise RuntimeError(
+            f"pressure terminal evidence was {report['terminal_evidence_total']}, "
+            f"expected {expected_terminal}"
+        )
+    delete_rows = cast(dict[str, dict[str, int]], report["sweep_delete_rows"])
+    if any(values["maximum_rows"] > 1000 for values in delete_rows.values()):
+        raise RuntimeError("pressure sweep exceeded its 1,000-row delete bound")
+
+
+def _validate_final_cleanup(metrics: dict[str, Any]) -> None:
+    operations = cast(int, metrics["calls_returning_work"]) + 1
+    if (
+        metrics["sql_executions"] != operations * _PHASE_SQL_PER_OPERATION["sweep"]
+        or metrics["transactions"] != operations
+        or metrics["pool_checkouts"] != operations
+    ):
+        raise RuntimeError("pressure final cleanup work is not bounded")
+    pool_p95 = cast(float, metrics["pool_wait_p95_seconds"])
+    pool_maximum = cast(float, metrics["pool_wait_maximum_seconds"])
+    if (
+        not all(
+            math.isfinite(value) and value >= 0 for value in (pool_p95, pool_maximum)
+        )
+        or pool_p95 > pool_maximum
+        or pool_maximum >= _OPERATION_DEADLINE_SECONDS
+    ):
+        raise RuntimeError("pressure final cleanup pool wait exceeded its invariant")
+    delete_rows = cast(dict[str, dict[str, int]], metrics["delete_rows"])
+    if any(values["maximum_rows"] > 1000 for values in delete_rows.values()):
+        raise RuntimeError("pressure final cleanup exceeded its 1,000-row delete bound")
 
 
 def _queries(count: int, lane: int) -> tuple[EvidenceQuery, ...]:
@@ -419,25 +525,27 @@ def main() -> None:
                 for table, values in sweep_delete_rows.items()
                 if values[start_sweep_deletes.get(table, 0) :]
             }
-            reports.append(
-                {
-                    "claims": count,
-                    "workload_client_concurrency": 2,
-                    "heartbeat_calls": heartbeat_calls,
-                    "http_status_counts": {"412": 0, "503": 0},
-                    "phases": phase_metrics,
-                    "sweep_calls_returning_work": sweep_calls,
-                    "sweep_delete_rows": delete_rows,
-                    "residual": residual,
-                    "terminal_evidence_total": terminal,
-                }
-            )
             expected_terminal = sum(args.counts[:lane])
-            if terminal != expected_terminal:
-                raise RuntimeError(
-                    f"pressure terminal evidence was {terminal}, "
-                    f"expected {expected_terminal}"
-                )
+            lane_report = {
+                "claims": count,
+                "workload_client_concurrency": 2,
+                "heartbeat_calls": heartbeat_calls,
+                "http_status_counts": {"412": 0, "503": 0},
+                "phases": phase_metrics,
+                "sweep_calls_returning_work": sweep_calls,
+                "sweep_delete_rows": delete_rows,
+                "residual": residual,
+                "terminal_evidence_total": terminal,
+            }
+            _validate_lane_report(
+                lane_report,
+                expected_terminal=expected_terminal,
+                expected_sessions=lane,
+                expected_receipt_headers=sum(
+                    math.ceil(value / 1000) for value in args.counts[:lane]
+                ),
+            )
+            reports.append(lane_report)
         if args.cleanup_wait_seconds > 0:
             time.sleep(args.cleanup_wait_seconds)
         final_cleanup_started = time.perf_counter()
@@ -498,6 +606,20 @@ def main() -> None:
     if final_residual != expected_zero:
         raise RuntimeError(f"pressure left residual coordination: {final_residual}")
 
+    final_cleanup = {
+        "elapsed_seconds": final_cleanup_elapsed,
+        "calls_returning_work": final_cleanup_calls,
+        "sql_executions": statement_counts["final_cleanup"]
+        - final_cleanup_start_statements,
+        "transactions": transaction_counts["final_cleanup"]
+        - final_cleanup_start_transactions,
+        "pool_checkouts": len(final_cleanup_pool_waits),
+        "pool_wait_p95_seconds": _percentile(final_cleanup_pool_waits, 0.95),
+        "pool_wait_maximum_seconds": max(final_cleanup_pool_waits, default=0.0),
+        "delete_rows": final_cleanup_delete_rows,
+    }
+    _validate_final_cleanup(final_cleanup)
+
     report = {
         "schema_version": 1,
         "source_head": source_head,
@@ -510,18 +632,7 @@ def main() -> None:
         },
         "counts": reports,
         "cleanup_wait_seconds": args.cleanup_wait_seconds,
-        "final_cleanup": {
-            "elapsed_seconds": final_cleanup_elapsed,
-            "calls_returning_work": final_cleanup_calls,
-            "sql_executions": statement_counts["final_cleanup"]
-            - final_cleanup_start_statements,
-            "transactions": transaction_counts["final_cleanup"]
-            - final_cleanup_start_transactions,
-            "pool_checkouts": len(final_cleanup_pool_waits),
-            "pool_wait_p95_seconds": _percentile(final_cleanup_pool_waits, 0.95),
-            "pool_wait_maximum_seconds": max(final_cleanup_pool_waits, default=0.0),
-            "delete_rows": final_cleanup_delete_rows,
-        },
+        "final_cleanup": final_cleanup,
         "final_residual": final_residual,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
