@@ -282,6 +282,42 @@ def test_adopted_zombie_read_ambiguity_is_not_clean(
     assert ToolRunner._reap_adopted_group_zombies(999_999) is True
 
 
+def test_adopted_zombie_waitpid_ambiguity_is_not_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Entry:
+        name = "12345"
+
+    attempts = 0
+    scans = 0
+
+    def scandir(_path: str) -> tuple[Entry, ...]:
+        nonlocal scans
+        scans += 1
+        return (Entry(),) if scans <= 2 else ()
+
+    def waitpid(_pid: int, _options: int) -> tuple[int, int]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise InterruptedError
+        return (12345, 0)
+
+    monkeypatch.setattr(runner_module.os, "scandir", scandir)
+    monkeypatch.setattr(
+        ToolRunner,
+        "_read_process_member",
+        staticmethod(
+            lambda pid: runner_module._ProcessMember(
+                pid, "Z", runner_module.os.getpid(), 7
+            )
+        ),
+    )
+    monkeypatch.setattr(runner_module.os, "waitpid", waitpid)
+    assert ToolRunner._reap_adopted_group_zombies(7) is False
+    assert ToolRunner._reap_adopted_group_zombies(7) is True
+
+
 def test_cleanup_stuck_remains_synchronously_owned_until_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

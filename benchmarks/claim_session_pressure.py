@@ -42,6 +42,10 @@ _RESIDUES = "ACDEFGHIKLMNPQRSTVWY"
 _phase = contextvars.ContextVar("pressure_phase", default="other")
 
 
+def _records_sweep_delete_rows(phase: str) -> bool:
+    return phase in {"sweep", "final_cleanup"}
+
+
 def _candidate_head() -> str:
     dirty = (
         __import__("subprocess")
@@ -188,7 +192,9 @@ def main() -> None:
             phase, started = statement_started.pop(id(context))
             statement_latencies[phase].append(time.perf_counter() - started)
             normalized = " ".join(statement.lower().split())
-            if phase == "sweep" and normalized.startswith("delete from "):
+            if _records_sweep_delete_rows(phase) and normalized.startswith(
+                "delete from "
+            ):
                 table = normalized.removeprefix("delete from ").split()[0]
                 sweep_delete_rows[table].append(max(cursor.rowcount, 0))
 

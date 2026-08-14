@@ -454,6 +454,8 @@ class ToolRunner:
                     waited, _ = os.waitpid(pid, os.WNOHANG)
                 except ChildProcessError:
                     continue
+                except OSError:
+                    return False
                 reaped = reaped or waited == pid
             if not reaped:
                 return True

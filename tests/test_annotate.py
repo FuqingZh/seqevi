@@ -271,6 +271,36 @@ class _ManualAuthorityLosingStore(_CountingStore):
         return ManualSession()  # type: ignore[return-value]
 
 
+class _CloseAuthorityLosingStore(_CountingStore):
+    def claim_session(self) -> ClaimSession:
+        delegate = self.delegate.claim_session()
+
+        class CloseLosingSession:
+            cancellation_signal = delegate.cancellation_signal
+
+            def __init__(self) -> None:
+                self.lost = False
+
+            def __enter__(self):
+                delegate.__enter__()
+                return self
+
+            def __exit__(self, *_error):
+                result = delegate.__exit__(*_error)
+                self.lost = True
+                return result
+
+            def raise_if_lost(self) -> None:
+                if self.lost:
+                    raise EvidenceClaimLostError("injected close authority loss")
+                delegate.raise_if_lost()
+
+            def __getattr__(self, name):
+                return getattr(delegate, name)
+
+        return CloseLosingSession()  # type: ignore[return-value]
+
+
 class _ConcurrentRecordingAdapter:
     def __init__(self, delegate: FixtureAdapter, *, block_first: bool = False) -> None:
         self.delegate = delegate
@@ -716,6 +746,30 @@ def test_claim_authority_loss_during_packaging_never_publishes_success(
                 output_dir=output,
                 adapter=adapter,
                 store=store,
+            )
+
+    assert isinstance(raised.value.__cause__, EvidenceClaimLostError)
+    assert not output.exists()
+
+
+def test_claim_authority_loss_during_close_never_returns_success(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+
+    with LocalStore.open(tmp_path / "store") as local:
+        output = tmp_path / "output.duckdb"
+        with pytest.raises(AnnotationError) as raised:
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=output,
+                adapter=adapter,
+                store=_CloseAuthorityLosingStore(local),
             )
 
     assert isinstance(raised.value.__cause__, EvidenceClaimLostError)

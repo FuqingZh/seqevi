@@ -19,6 +19,16 @@ import psycopg
 
 from seqevi.sequence import read_fasta
 
+_REQUIRED_THREADS = 64
+_FROZEN_INPUT_SHA256 = {
+    "blf": "9dc23bc3d230e097243110ac8e3a77df3e7f69c181d29290ed1d8d20e3e268d5",
+    "uniprot": "a21f7da241177ebc75ab182e6ad77ff974ed4d21c41807953e0535266f0a7509",
+}
+_FROZEN_STATUS_COUNTS = {
+    "blf": {"hits": 8777, "no_hits": 339},
+    "uniprot": {"hits": 8776, "no_hits": 339},
+}
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -26,6 +36,18 @@ def _sha256(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_frozen_inputs(paths: dict[str, Path]) -> dict[str, str]:
+    observed = {name: _sha256(path) for name, path in paths.items()}
+    if observed != _FROZEN_INPUT_SHA256:
+        raise RuntimeError("C2 input SHA-256 values do not match the frozen inputs")
+    return observed
+
+
+def _validate_threads(threads: int) -> None:
+    if threads != _REQUIRED_THREADS:
+        raise ValueError(f"accepted C2 requires exactly {_REQUIRED_THREADS} threads")
 
 
 def _identity_set(path: Path) -> set[str]:
@@ -123,24 +145,52 @@ def _result(path: Path, return_code: int) -> dict[str, object]:
     return result
 
 
+def _stop_and_reap(
+    processes: dict[str, subprocess.Popen[bytes]],
+) -> BaseException | None:
+    deferred: BaseException | None = None
+    for process in processes.values():
+        signalled = False
+        while not signalled:
+            try:
+                if process.poll() is not None:
+                    break
+                process.send_signal(signal.SIGINT)
+                signalled = True
+            except ProcessLookupError:
+                signalled = True
+            except BaseException as error:
+                deferred = deferred or error
+    for process in processes.values():
+        while True:
+            try:
+                process.wait()
+                break
+            except BaseException as error:
+                deferred = deferred or error
+    return deferred
+
+
 def _wait_initial(processes: dict[str, subprocess.Popen[bytes]]) -> dict[str, int]:
     return_codes: dict[str, int] = {}
     pending = dict(processes)
-    while pending:
-        for name, process in tuple(pending.items()):
-            return_code = process.poll()
-            if return_code is None:
-                continue
-            return_codes[name] = return_code
-            del pending[name]
-            if return_code != 0:
-                for peer in pending.values():
-                    try:
-                        peer.send_signal(signal.SIGINT)
-                    except ProcessLookupError:
-                        pass
-        if pending:
-            time.sleep(0.1)
+    try:
+        while pending:
+            for name, process in tuple(pending.items()):
+                return_code = process.poll()
+                if return_code is None:
+                    continue
+                return_codes[name] = return_code
+                del pending[name]
+                if return_code != 0:
+                    cleanup_error = _stop_and_reap(pending)
+                    if cleanup_error is not None:
+                        raise cleanup_error
+            if pending:
+                time.sleep(0.1)
+    except BaseException:
+        _stop_and_reap(processes)
+        raise
     return return_codes
 
 
@@ -153,6 +203,23 @@ def _reuse_counts(result: dict[str, object]) -> tuple[int, int]:
     if not isinstance(cache_hits, int) or not isinstance(computed, int):
         raise RuntimeError("annotation JSON result has invalid reuse counts")
     return cache_hits, computed
+
+
+def _status_counts(result: dict[str, object]) -> tuple[int, int]:
+    counts = result.get("counts")
+    if not isinstance(counts, dict):
+        raise RuntimeError("annotation JSON result has no counts object")
+    hits = counts.get("hits")
+    no_hits = counts.get("no_hits")
+    if not isinstance(hits, int) or not isinstance(no_hits, int):
+        raise RuntimeError("annotation JSON result has invalid status counts")
+    return hits, no_hits
+
+
+def _validate_frozen_result(name: str, result: dict[str, object]) -> None:
+    expected = _FROZEN_STATUS_COUNTS[name]
+    if _status_counts(result) != (expected["hits"], expected["no_hits"]):
+        raise RuntimeError(f"{name} result did not match frozen hit/no-hit totals")
 
 
 def _database_readback(database_url: str) -> dict[str, int | str]:
@@ -205,9 +272,16 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--cleanup-wait-seconds", type=float, default=61.0)
     args = parser.parse_args()
+    try:
+        _validate_threads(args.threads)
+    except ValueError as error:
+        parser.error(str(error))
     if args.output_root.exists():
         parser.error("--output-root must not already exist")
     source_head = _candidate_head()
+
+    input_paths = {"blf": args.blf, "uniprot": args.uniprot}
+    input_sha256 = _validate_frozen_inputs(input_paths)
 
     blf_ids = _identity_set(args.blf)
     uniprot_ids = _identity_set(args.uniprot)
@@ -219,18 +293,22 @@ def main() -> None:
     args.output_root.mkdir(parents=True)
     initial_started = time.perf_counter()
     processes = {}
-    for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
-        root = args.output_root / f"initial-{name}"
-        root.mkdir()
-        processes[name] = _run_command(
-            fasta=fasta,
-            output=root / "result.duckdb",
-            profile=args.profile,
-            store=args.store,
-            threads=args.threads,
-            stdout_path=root / "stdout.json",
-            stderr_path=root / "stderr.log",
-        )
+    try:
+        for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
+            root = args.output_root / f"initial-{name}"
+            root.mkdir()
+            processes[name] = _run_command(
+                fasta=fasta,
+                output=root / "result.duckdb",
+                profile=args.profile,
+                store=args.store,
+                threads=args.threads,
+                stdout_path=root / "stdout.json",
+                stderr_path=root / "stderr.log",
+            )
+    except BaseException:
+        _stop_and_reap(processes)
+        raise
     return_codes = _wait_initial(processes)
     initial_results = {
         name: _result(
@@ -239,6 +317,8 @@ def main() -> None:
         )
         for name in processes
     }
+    for name, result in initial_results.items():
+        _validate_frozen_result(name, result)
     initial_elapsed = time.perf_counter() - initial_started
     after_initial = _database_readback(args.database_url)
 
@@ -256,7 +336,13 @@ def main() -> None:
             stdout_path=root / "stdout.json",
             stderr_path=root / "stderr.log",
         )
-        replay_results[name] = _result(root / "stdout.json", process.wait())
+        try:
+            return_code = process.wait()
+        except BaseException:
+            _stop_and_reap({name: process})
+            raise
+        replay_results[name] = _result(root / "stdout.json", return_code)
+        _validate_frozen_result(name, replay_results[name])
     replay_elapsed = time.perf_counter() - replay_started
 
     if args.cleanup_wait_seconds > 0:
@@ -304,12 +390,12 @@ def main() -> None:
         "inputs": {
             "blf": {
                 "path": str(args.blf.resolve()),
-                "sha256": _sha256(args.blf),
+                "sha256": input_sha256["blf"],
                 "unique_evidence_identities": len(blf_ids),
             },
             "uniprot": {
                 "path": str(args.uniprot.resolve()),
-                "sha256": _sha256(args.uniprot),
+                "sha256": input_sha256["uniprot"],
                 "unique_evidence_identities": len(uniprot_ids),
             },
             "overlap": len(blf_ids & uniprot_ids),

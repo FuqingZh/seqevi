@@ -161,6 +161,7 @@ def run_annotation(
     store_commit_seconds = 0.0
     claim_session: ClaimSession | None = None
     primary_failure: BaseException | None = None
+    close_failure: BaseException | None = None
     try:
         keys_by_sequence_id = {}
         computed_ids: set[str] = set()
@@ -387,19 +388,33 @@ def run_annotation(
         raise AnnotationError(
             f"annotation failed; diagnostics retained at {work_dir}: {error}"
         ) from error
-    else:
-        shutil.rmtree(work_dir, ignore_errors=True)
     finally:
         if claim_session is not None:
             try:
                 claim_session.__exit__(None, None, None)
             except BaseException as close_error:
                 if primary_failure is None:
-                    raise
-                primary_failure.add_note(
-                    f"ClaimSession cleanup also failed: {close_error!r}"
-                )
+                    close_failure = close_error
+                else:
+                    primary_failure.add_note(
+                        f"ClaimSession cleanup also failed: {close_error!r}"
+                    )
         shutil.rmtree(stage.root, ignore_errors=True)
+
+    if close_failure is not None:
+        output_dir.unlink(missing_ok=True)
+        raise close_failure
+    if claim_session is not None:
+        try:
+            claim_session.raise_if_lost()
+        except BaseException as error:
+            output_dir.unlink(missing_ok=True)
+            if not isinstance(error, Exception):
+                raise
+            raise AnnotationError(
+                f"annotation failed; diagnostics retained at {work_dir}: {error}"
+            ) from error
+    shutil.rmtree(work_dir, ignore_errors=True)
 
     statuses = [fetched.record.status for fetched in fetched_by_sequence_id.values()]
     artifact_digests = {
