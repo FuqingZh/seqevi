@@ -264,9 +264,9 @@ class ClaimSessionAuthorityModel(TransportModel):
 
 class ClaimSessionOpenResponse(ClaimSessionAuthorityModel):
     expires_at: datetime
-    remaining_lease_seconds: Annotated[float, Field(gt=0)]
+    remaining_lease_seconds: Annotated[float, Field(gt=0, le=120)]
     heartbeat_after_seconds: Annotated[float, Field(gt=0)]
-    renew_deadline_seconds: Annotated[float, Field(gt=0)]
+    renew_deadline_seconds: Annotated[float, Field(gt=0, le=90)]
 
     def to_domain(self) -> ClaimSessionAuthority:
         return ClaimSessionAuthority(**self.model_dump())
@@ -350,7 +350,7 @@ class ClaimSessionAcquireResponse(TransportModel):
 
 
 class ClaimSessionAuthorityCheckRequest(ClaimSessionAuthorityModel):
-    claims: list[SessionEvidenceClaimModel]
+    claims: Annotated[list[SessionEvidenceClaimModel], Field(max_length=1000)]
 
 
 class ClaimSessionAuthorityCheckResponse(TransportModel):

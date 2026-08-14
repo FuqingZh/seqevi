@@ -767,6 +767,10 @@ class _HttpClaimSession:
                 self._renew_deadline,
             )
 
+    def _renew_deadline_snapshot(self) -> float:
+        with self._lock:
+            return self._renew_deadline
+
     def _heartbeat(self) -> None:
         while True:
             with self._lock:
@@ -894,7 +898,8 @@ class _HttpClaimSession:
                             staged.append(result)
                         break
                     except ClaimReceiptCapacityError:
-                        delay = min(1.0, self._renew_deadline - time.monotonic())
+                        renew_deadline = self._renew_deadline_snapshot()
+                        delay = min(1.0, renew_deadline - time.monotonic())
                         if delay <= 0 or self._stop.wait(delay):
                             raise EvidenceClaimLostError(
                                 "ClaimSession authority runway expired during receipt admission"
