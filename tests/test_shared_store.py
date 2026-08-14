@@ -4599,6 +4599,34 @@ def test_postgres_maintenance_acquisition_only_narrows_pool_timeout() -> None:
         engine.dispose()
 
 
+def test_postgres_maintenance_refreshes_pool_remainder_before_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(
+        "postgresql+psycopg://unused@127.0.0.1/unused", pool_timeout=30
+    )
+    remainders = iter((5.0, 4.0, 0.75))
+    observed: list[float] = []
+
+    monkeypatch.setattr(
+        store_migration, "_remaining", lambda _deadline: next(remainders)
+    )
+
+    def stop_at_checkout() -> None:
+        observed.append(cast(Any, engine.pool)._timeout)
+        raise RuntimeError("stop at checkout")
+
+    monkeypatch.setattr(engine, "connect", stop_at_checkout)
+    with pytest.raises(RuntimeError, match="stop at checkout"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 10
+        ):
+            pytest.fail("test checkout unexpectedly succeeded")
+    assert observed == [0.75]
+    assert cast(Any, engine.pool)._timeout == 30
+    engine.dispose()
+
+
 def test_postgres_maintenance_rejects_unrepresentable_physical_connect_budget() -> None:
     engine = create_engine("postgresql+psycopg://unused@127.0.0.1/unused")
     connected = False
@@ -4838,6 +4866,31 @@ def test_postgres_maintenance_resolver_matches_psycopg_getaddrinfo_flags() -> No
     )
 
 
+def test_postgres_maintenance_resolver_preserves_ipv6_scope_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ResolvedProcess:
+        returncode = 0
+
+        def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+            assert timeout is not None
+            payload = [
+                [socket.AF_INET6, socket.SOCK_STREAM, 6, "", ["fe80::1", 5432, 0, 3]],
+                [socket.AF_INET6, socket.SOCK_STREAM, 6, "", ["fe80::1", 5432, 0, 4]],
+                [socket.AF_INET, socket.SOCK_STREAM, 6, "", ["192.0.2.1", 5432]],
+            ]
+            return json.dumps(payload).encode(), b""
+
+    monkeypatch.setattr(
+        store_migration.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: ResolvedProcess(),
+    )
+    assert store_migration._resolve_postgres_host(  # pyright: ignore[reportPrivateUsage]
+        "scoped.example", 5432, time.monotonic() + 5
+    ) == ("fe80::1%3", "fe80::1%4", "192.0.2.1")
+
+
 @pytest.mark.parametrize("source", ["parameter", "environment"])
 def test_postgres_maintenance_preserves_abstract_socket_targets(
     monkeypatch: pytest.MonkeyPatch, source: str
@@ -4884,6 +4937,22 @@ def test_postgres_maintenance_uses_environment_attempts_and_prefer_standby(
     assert bounded["hostaddr"] == "192.0.2.1,192.0.2.2,192.0.2.3"
     assert bounded["port"] == "5432,5432,5433"
     assert bounded["target_session_attrs"] == "prefer-standby"
+
+
+@pytest.mark.parametrize(
+    "cparams",
+    [
+        {"host": "one,two", "hostaddr": "192.0.2.1"},
+        {"host": "one", "hostaddr": "192.0.2.1,192.0.2.2"},
+    ],
+)
+def test_postgres_maintenance_rejects_mismatched_explicit_target_lists(
+    cparams: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError, match="host and hostaddr lists must have equal"):
+        store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
+            cparams, time.monotonic() + 10
+        )
 
 
 @pytest.mark.parametrize(

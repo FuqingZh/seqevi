@@ -735,7 +735,6 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
             "ClaimSession maintenance connection serialization exceeded deadline"
         )
     try:
-        remaining = _remaining(deadline)
         pool = cast(Any, engine.pool)
         if not hasattr(pool, "_timeout"):
             raise RuntimeError(
@@ -863,7 +862,6 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
         acquisition_timer.daemon = True
         acquisition_timer.start()
         try:
-            pool._timeout = min(float(original_pool_timeout), remaining)
             try:
                 engine.dialect._do_ping_w_event = bounded_pre_ping
                 event.listen(
@@ -879,6 +877,7 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
                     bounded_physical_connect,
                 )
                 connect_listener_registered = True
+                pool._timeout = min(float(original_pool_timeout), _remaining(deadline))
                 connection = engine.connect()
             finally:
                 try:
@@ -968,6 +967,10 @@ def _resolve_postgres_connect_targets(
     hosts = str(raw_host or "").split(",")
     hostaddrs = str(raw_hostaddr or "").split(",")
     ports = str(bounded.get("port", 5432)).split(",")
+    if any(hosts) and any(hostaddrs) and len(hosts) != len(hostaddrs):
+        raise ValueError(
+            "PostgreSQL explicit host and hostaddr lists must have equal lengths"
+        )
     target_count = max(len(hosts), len(hostaddrs))
     hosts = _align_postgres_connect_values(hosts, target_count, "host")
     hostaddrs = _align_postgres_connect_values(hostaddrs, target_count, "hostaddr")
@@ -1062,7 +1065,18 @@ def _resolve_postgres_host(host: str, port: int, deadline: float) -> tuple[str, 
     if process.returncode != 0:
         raise OSError(stderr[:4096].decode("utf-8", errors="replace"))
     payload = json.loads(stdout)
-    addresses = tuple(dict.fromkeys(str(item[4][0]) for item in payload))
+    resolved_addresses: list[str] = []
+    for item in payload:
+        address = str(item[4][0])
+        if (
+            int(item[0]) == socket.AF_INET6
+            and len(item[4]) >= 4
+            and int(item[4][3]) != 0
+            and "%" not in address
+        ):
+            address = f"{address}%{int(item[4][3])}"
+        resolved_addresses.append(address)
+    addresses = tuple(dict.fromkeys(resolved_addresses))
     if not addresses:
         raise OSError(f"PostgreSQL resolver returned no addresses for {host!r}")
     _remaining(deadline)
