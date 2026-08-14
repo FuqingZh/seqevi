@@ -348,9 +348,7 @@ def main() -> None:
             phase_metrics = {}
             for phase in ("acquire", "renew", "finalize", "close", "sweep"):
                 values = operation_latencies[phase]
-                phase_pool_waits = pool_waits[phase][
-                    start_pool_waits.get(phase, 0) :
-                ]
+                phase_pool_waits = pool_waits[phase][start_pool_waits.get(phase, 0) :]
                 phase_metrics[phase] = {
                     "operations": len(values),
                     "sql_executions": statement_counts[phase]
@@ -430,9 +428,7 @@ def main() -> None:
                 "maximum_rows": max(
                     values[final_cleanup_start_deletes.get(table, 0) :], default=0
                 ),
-                "total_rows": sum(
-                    values[final_cleanup_start_deletes.get(table, 0) :]
-                ),
+                "total_rows": sum(values[final_cleanup_start_deletes.get(table, 0) :]),
             }
             for table, values in sweep_delete_rows.items()
             if values[final_cleanup_start_deletes.get(table, 0) :]

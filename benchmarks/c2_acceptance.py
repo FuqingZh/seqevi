@@ -251,11 +251,11 @@ def main() -> None:
         or after_initial["evidence_identity_sha256"] != expected_identity_digest
         or final_readback
         != {
-        "evidence": 9116,
-        "evidence_identity_sha256": expected_identity_digest,
-        "claim_sessions": 0,
-        "session_claims": 0,
-        "missing_artifact_references": 0,
+            "evidence": 9116,
+            "evidence_identity_sha256": expected_identity_digest,
+            "claim_sessions": 0,
+            "session_claims": 0,
+            "missing_artifact_references": 0,
         }
     ):
         raise RuntimeError("C2 database readback did not satisfy acceptance")
