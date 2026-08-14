@@ -4875,6 +4875,59 @@ def test_postgres_maintenance_uses_environment_attempts_and_prefer_standby(
     assert bounded["target_session_attrs"] == "prefer-standby"
 
 
+@pytest.mark.parametrize(
+    ("key", "envvar", "envvalue", "expected", "attempts"),
+    [
+        ("host", "PGHOST", "one,two", "one,two", 2),
+        (
+            "hostaddr",
+            "PGHOSTADDR",
+            "192.0.2.1,192.0.2.2",
+            "192.0.2.1,192.0.2.2",
+            2,
+        ),
+        ("port", "PGPORT", "5432,5433", "5432,5433", 2),
+        (
+            "target_session_attrs",
+            "PGTARGETSESSIONATTRS",
+            "prefer-standby",
+            "prefer-standby",
+            2,
+        ),
+    ],
+)
+def test_postgres_maintenance_null_parameter_uses_environment_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+    envvar: str,
+    envvalue: str,
+    expected: str,
+    attempts: int,
+) -> None:
+    monkeypatch.setenv(envvar, envvalue)
+    if key == "port":
+        monkeypatch.setenv("PGHOSTADDR", "192.0.2.1,192.0.2.2")
+    elif key == "target_session_attrs":
+        monkeypatch.delenv("PGHOST", raising=False)
+        monkeypatch.delenv("PGHOSTADDR", raising=False)
+    elif key == "host":
+        monkeypatch.setattr(
+            store_migration,
+            "_resolve_postgres_host",
+            lambda host, _port, _deadline: {
+                "one": ("192.0.2.1",),
+                "two": ("192.0.2.2",),
+            }[host],
+        )
+    bounded, observed_attempts = (  # pyright: ignore[reportPrivateUsage]
+        store_migration._resolve_postgres_connect_targets(
+            {key: None}, time.monotonic() + 10
+        )
+    )
+    assert bounded[key] == expected
+    assert observed_attempts == attempts
+
+
 def test_postgres_maintenance_skips_failed_dns_target_when_another_resolves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

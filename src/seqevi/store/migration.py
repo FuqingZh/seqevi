@@ -1020,7 +1020,7 @@ def _effective_postgres_connect_params(cparams: dict[str, Any]) -> dict[str, Any
         ("port", "PGPORT"),
         ("target_session_attrs", "PGTARGETSESSIONATTRS"),
     ):
-        if key not in bounded and (value := os.environ.get(envvar)) is not None:
+        if bounded.get(key) is None and (value := os.environ.get(envvar)) is not None:
             bounded[key] = value
     return bounded
 
