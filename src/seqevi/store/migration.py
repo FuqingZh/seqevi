@@ -989,7 +989,11 @@ def _resolve_postgres_connect_targets(
         return bounded, attempts
     hosts = str(raw_host or "").split(",")
     hostaddrs = str(raw_hostaddr or "").split(",")
-    ports = str(bounded.get("port", 5432)).split(",")
+    ports = str(bounded.get("port", "")).split(",")
+    if any(host.startswith("@") for host in hosts):
+        raise RuntimeError(
+            "PostgreSQL maintenance does not support abstract Unix socket targets"
+        )
     if any(hosts) and any(hostaddrs) and len(hosts) != len(hostaddrs):
         raise ValueError(
             "PostgreSQL explicit host and hostaddr lists must have equal lengths"
@@ -1002,7 +1006,7 @@ def _resolve_postgres_connect_targets(
     resolved_hostaddrs: list[str] = []
     resolved_ports: list[str] = []
     for host, hostaddr, raw_port in zip(hosts, hostaddrs, ports, strict=True):
-        if hostaddr or not host or host.startswith(("/", "@")):
+        if hostaddr or not host or host.startswith("/"):
             resolved_hosts.append(host)
             resolved_hostaddrs.append(hostaddr)
             resolved_ports.append(raw_port)
@@ -1012,7 +1016,9 @@ def _resolve_postgres_connect_targets(
         except ValueError:
             try:
                 addresses = _resolve_postgres_host(
-                    host, int(raw_port) if raw_port else 5432, deadline
+                    host,
+                    int(raw_port) if raw_port else _postgres_default_port(),
+                    deadline,
                 )
             except TimeoutError:
                 raise
@@ -1050,12 +1056,24 @@ def _effective_postgres_connect_params(cparams: dict[str, Any]) -> dict[str, Any
         ("hostaddr", "PGHOSTADDR"),
         ("port", "PGPORT"),
         ("target_session_attrs", "PGTARGETSESSIONATTRS"),
+        ("connect_timeout", "PGCONNECT_TIMEOUT"),
     ):
         if bounded.get(key) in (None, ""):
             bounded.pop(key, None)
             if (value := os.environ.get(envvar)) not in (None, ""):
                 bounded[key] = value
     return bounded
+
+
+def _postgres_default_port() -> int:
+    """Return the default port compiled into the active client libpq."""
+
+    from psycopg import pq
+
+    for option in pq.Conninfo.get_defaults():
+        if option.keyword == b"port" and option.compiled is not None:
+            return int(option.compiled)
+    raise RuntimeError("PostgreSQL client libpq did not report a default port")
 
 
 def _align_postgres_connect_values(

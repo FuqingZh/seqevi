@@ -4933,27 +4933,118 @@ def test_postgres_maintenance_resolver_preserves_ipv6_scope_ids(
 
 
 @pytest.mark.parametrize("source", ["parameter", "environment"])
-def test_postgres_maintenance_preserves_abstract_socket_targets(
+def test_postgres_maintenance_rejects_abstract_socket_before_driver_connect(
     monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
-    cparams: dict[str, Any] = {}
+    connect_args: dict[str, Any] = {}
     if source == "parameter":
-        cparams["host"] = "@seqevi"
+        connect_args["host"] = "@seqevi"
     else:
         monkeypatch.setenv("PGHOST", "@seqevi")
+    engine = create_engine(
+        "postgresql+psycopg://unused@/unused", connect_args=connect_args
+    )
+    connected = False
 
+    def unexpected_connect(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal connected
+        connected = True
+
+    monkeypatch.setattr(engine.dialect, "connect", unexpected_connect)
+    with pytest.raises(RuntimeError, match="does not support abstract Unix socket"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pytest.fail("abstract Unix socket reached the driver")
+    assert not connected
+    engine.dispose()
+
+
+def test_postgres_maintenance_preserves_filesystem_socket_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     def unexpected_resolution(*_args: Any) -> tuple[str, ...]:
-        pytest.fail("abstract Unix socket was sent to DNS resolution")
+        pytest.fail("filesystem Unix socket was sent to DNS resolution")
 
     monkeypatch.setattr(
         store_migration, "_resolve_postgres_host", unexpected_resolution
     )
     bounded, attempts = store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
-        cparams, time.monotonic() + 10
+        {"host": "/var/run/postgresql"}, time.monotonic() + 10
     )
-    assert bounded["host"] == "@seqevi"
+    assert bounded["host"] == "/var/run/postgresql"
     assert bounded["hostaddr"] == ""
     assert attempts == 1
+
+
+@pytest.mark.parametrize(
+    "connect_args", [{}, {"connect_timeout": None}, {"connect_timeout": ""}]
+)
+def test_postgres_maintenance_preserves_environment_connect_timeout(
+    monkeypatch: pytest.MonkeyPatch, connect_args: dict[str, Any]
+) -> None:
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", "2")
+    engine = create_engine(
+        "postgresql+psycopg://unused@127.0.0.1/unused",
+        connect_args=connect_args,
+    )
+    observed: list[int] = []
+
+    def observe_connect_timeout(*_args: Any, **cparams: Any) -> None:
+        observed.append(int(cparams["connect_timeout"]))
+        raise TimeoutError("stop after observing effective connect timeout")
+
+    monkeypatch.setattr(engine.dialect, "connect", observe_connect_timeout)
+    with pytest.raises(TimeoutError, match="stop after observing effective"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pytest.fail("test physical connection unexpectedly succeeded")
+    assert observed == [2]
+    engine.dispose()
+
+
+def test_postgres_maintenance_preserves_explicit_connect_timeout_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", "4")
+    engine = create_engine(
+        "postgresql+psycopg://unused@127.0.0.1/unused",
+        connect_args={"connect_timeout": 2},
+    )
+    observed: list[int] = []
+
+    def observe_connect_timeout(*_args: Any, **cparams: Any) -> None:
+        observed.append(int(cparams["connect_timeout"]))
+        raise TimeoutError("stop after observing explicit connect timeout")
+
+    monkeypatch.setattr(engine.dialect, "connect", observe_connect_timeout)
+    with pytest.raises(TimeoutError, match="stop after observing explicit"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pytest.fail("test physical connection unexpectedly succeeded")
+    assert observed == [2]
+    engine.dispose()
+
+
+def test_postgres_maintenance_uses_client_compiled_default_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, int]] = []
+    monkeypatch.setattr(store_migration, "_postgres_default_port", lambda: 6543)
+
+    def resolve(host: str, port: int, _deadline: float) -> tuple[str, ...]:
+        observed.append((host, port))
+        return ("192.0.2.1",)
+
+    monkeypatch.setattr(store_migration, "_resolve_postgres_host", resolve)
+    bounded, attempts = store_migration._resolve_postgres_connect_targets(  # pyright: ignore[reportPrivateUsage]
+        {"host": "one,two", "port": "5433,"}, time.monotonic() + 10
+    )
+    assert attempts == 2
+    assert observed == [("one", 5433), ("two", 6543)]
+    assert bounded["port"] == "5433,"
 
 
 def test_postgres_maintenance_uses_environment_attempts_and_prefer_standby(
