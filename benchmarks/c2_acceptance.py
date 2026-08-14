@@ -31,6 +31,25 @@ def _identity_set(path: Path) -> set[str]:
     return {record.identity.sequence_id for record in read_fasta(path)}
 
 
+def _identity_digest(identities: set[str]) -> str:
+    return hashlib.sha256("\n".join(sorted(identities)).encode()).hexdigest()
+
+
+def _external_tool_processes(output_root: Path) -> list[int]:
+    marker = os.fsencode(str(output_root.resolve()))
+    matches = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdecimal() or int(entry.name) == os.getpid():
+            continue
+        try:
+            command = Path(entry.path, "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if marker in command and (b"emapper.py" in command or b"diamond" in command):
+            matches.append(int(entry.name))
+    return sorted(matches)
+
+
 def _run_command(
     *,
     fasta: Path,
@@ -96,7 +115,7 @@ def _reuse_counts(result: dict[str, object]) -> tuple[int, int]:
     return cache_hits, computed
 
 
-def _database_readback(database_url: str) -> dict[str, int]:
+def _database_readback(database_url: str) -> dict[str, int | str]:
     def scalar(cursor: psycopg.Cursor[tuple[object, ...]]) -> int:
         row = cursor.fetchone()
         if row is None:
@@ -107,6 +126,8 @@ def _database_readback(database_url: str) -> dict[str, int]:
     with psycopg.connect(direct_url) as connection, connection.cursor() as cursor:
         cursor.execute("SELECT count(*) FROM evidence")
         evidence_count = scalar(cursor)
+        cursor.execute("SELECT sequence_id FROM evidence ORDER BY sequence_id")
+        evidence_identities = {cast(str, row[0]) for row in cursor.fetchall()}
         cursor.execute("SELECT count(*) FROM claim_sessions")
         session_count = scalar(cursor)
         cursor.execute("SELECT count(*) FROM session_claims")
@@ -126,6 +147,7 @@ def _database_readback(database_url: str) -> dict[str, int]:
         missing_artifacts = scalar(cursor)
     return {
         "evidence": evidence_count,
+        "evidence_identity_sha256": _identity_digest(evidence_identities),
         "claim_sessions": session_count,
         "session_claims": claim_count,
         "missing_artifact_references": missing_artifacts,
@@ -169,7 +191,10 @@ def main() -> None:
         }
         initial_elapsed = None
         replay_elapsed = None
-        after_initial = {"evidence": 9116}
+        after_initial = {
+            "evidence": 9116,
+            "evidence_identity_sha256": _identity_digest(blf_ids),
+        }
     else:
         args.output_root.mkdir(parents=True)
         initial_started = time.perf_counter()
@@ -220,13 +245,25 @@ def main() -> None:
         cache_hits, computed = _reuse_counts(replay_results[name])
         if cache_hits != expected or computed != 0:
             raise RuntimeError(f"{name} replay did not report exact cache reuse")
-    if after_initial["evidence"] != 9116 or final_readback != {
+    expected_identity_digest = _identity_digest(blf_ids)
+    if (
+        after_initial["evidence"] != 9116
+        or after_initial["evidence_identity_sha256"] != expected_identity_digest
+        or final_readback
+        != {
         "evidence": 9116,
+        "evidence_identity_sha256": expected_identity_digest,
         "claim_sessions": 0,
         "session_claims": 0,
         "missing_artifact_references": 0,
-    }:
+        }
+    ):
         raise RuntimeError("C2 database readback did not satisfy acceptance")
+    external_tool_processes = _external_tool_processes(args.output_root)
+    if external_tool_processes:
+        raise RuntimeError(
+            f"external tool processes remain after C2: {external_tool_processes}"
+        )
 
     report = {
         "schema_version": 1,
@@ -259,6 +296,7 @@ def main() -> None:
         "replay_elapsed_seconds": replay_elapsed,
         "cleanup_wait_seconds": args.cleanup_wait_seconds,
         "finalized_existing_outputs": args.finalize_existing,
+        "remaining_external_tool_processes": external_tool_processes,
         "final_database": final_readback,
     }
     report_path = args.output_root / "acceptance.json"
