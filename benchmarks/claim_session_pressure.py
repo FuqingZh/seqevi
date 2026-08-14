@@ -13,9 +13,10 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator, cast
 from uuid import uuid4
 
+import psycopg
 from sqlalchemy import event, text
 
 from seqevi.evidence import (
@@ -126,7 +127,24 @@ def main() -> None:
     statement_counts: dict[str, int] = defaultdict(int)
     statement_started: dict[int, tuple[str, float]] = {}
     statement_latencies: dict[str, list[float]] = defaultdict(list)
+    transaction_counts: dict[str, int] = defaultdict(int)
+    pool_waits: dict[str, list[float]] = defaultdict(list)
+    sweep_delete_rows: dict[str, list[int]] = defaultdict(list)
     metrics_lock = threading.Lock()
+
+    pool = cast(Any, persistence.engine.pool)
+    original_do_get = pool._do_get
+
+    def measured_do_get():
+        phase = _phase.get()
+        started = time.perf_counter()
+        try:
+            return original_do_get()
+        finally:
+            with metrics_lock:
+                pool_waits[phase].append(time.perf_counter() - started)
+
+    pool._do_get = measured_do_get
 
     def before_cursor_execute(
         _connection, _cursor, _statement, _parameters, context, _executemany
@@ -137,14 +155,72 @@ def main() -> None:
             statement_started[id(context)] = (phase, time.perf_counter())
 
     def after_cursor_execute(
-        _connection, _cursor, _statement, _parameters, context, _executemany
+        _connection, cursor, statement, _parameters, context, _executemany
     ) -> None:
         with metrics_lock:
             phase, started = statement_started.pop(id(context))
             statement_latencies[phase].append(time.perf_counter() - started)
+            normalized = " ".join(statement.lower().split())
+            if phase == "sweep" and normalized.startswith("delete from "):
+                table = normalized.removeprefix("delete from ").split()[0]
+                sweep_delete_rows[table].append(max(cursor.rowcount, 0))
+
+    def after_transaction(_connection) -> None:
+        with metrics_lock:
+            transaction_counts[_phase.get()] += 1
 
     event.listen(persistence.engine, "before_cursor_execute", before_cursor_execute)
     event.listen(persistence.engine, "after_cursor_execute", after_cursor_execute)
+    event.listen(persistence.engine, "commit", after_transaction)
+    event.listen(persistence.engine, "rollback", after_transaction)
+    activity_stop = threading.Event()
+    activity_summary = {
+        "samples": 0,
+        "maximum_sessions": 0,
+        "maximum_active": 0,
+        "maximum_lock_waiters": 0,
+    }
+    activity_wait_events: dict[str, int] = defaultdict(int)
+    activity_errors: list[str] = []
+    direct_url = args.database_url.replace("postgresql+psycopg://", "postgresql://")
+
+    def sample_activity() -> None:
+        try:
+            with psycopg.connect(direct_url, autocommit=True) as connection:
+                with connection.cursor() as cursor:
+                    while not activity_stop.wait(0.01):
+                        cursor.execute(
+                            """
+                            SELECT state, wait_event_type, wait_event
+                            FROM pg_stat_activity
+                            WHERE datname = current_database()
+                              AND pid <> pg_backend_pid()
+                            """
+                        )
+                        rows = cursor.fetchall()
+                        lock_waiters = sum(row[1] == "Lock" for row in rows)
+                        with metrics_lock:
+                            activity_summary["samples"] += 1
+                            activity_summary["maximum_sessions"] = max(
+                                activity_summary["maximum_sessions"], len(rows)
+                            )
+                            activity_summary["maximum_active"] = max(
+                                activity_summary["maximum_active"],
+                                sum(row[0] == "active" for row in rows),
+                            )
+                            activity_summary["maximum_lock_waiters"] = max(
+                                activity_summary["maximum_lock_waiters"], lock_waiters
+                            )
+                            for _state, wait_type, wait_event in rows:
+                                if wait_type is not None:
+                                    activity_wait_events[
+                                        f"{wait_type}:{wait_event}"
+                                    ] += 1
+        except Exception as error:  # pragma: no cover - benchmark evidence
+            activity_errors.append(repr(error))
+
+    activity_thread = threading.Thread(target=sample_activity)
+    activity_thread.start()
     reports = []
     raw_artifact = StoredArtifact(
         digest="2" * 64,
@@ -174,6 +250,13 @@ def main() -> None:
             acquired = []
             operation_latencies: dict[str, list[float]] = defaultdict(list)
             start_counts = dict(statement_counts)
+            start_transactions = dict(transaction_counts)
+            start_pool_waits = {
+                phase: len(values) for phase, values in pool_waits.items()
+            }
+            start_sweep_deletes = {
+                table: len(values) for table, values in sweep_delete_rows.items()
+            }
 
             heartbeat_stop = threading.Event()
             heartbeat_errors: list[str] = []
@@ -235,8 +318,12 @@ def main() -> None:
             with _measured("close"):
                 persistence.close_claim_session(authority)
             operation_latencies["close"].append(time.perf_counter() - started)
-            while persistence.sweep_claim_sessions():
-                pass
+            sweep_started = time.perf_counter()
+            sweep_calls = 0
+            with _measured("sweep"):
+                while persistence.sweep_claim_sessions():
+                    sweep_calls += 1
+            operation_latencies["sweep"].append(time.perf_counter() - sweep_started)
             if heartbeat_errors:
                 raise RuntimeError(f"heartbeat failed: {heartbeat_errors}")
 
@@ -245,7 +332,12 @@ def main() -> None:
                     table: connection.execute(
                         text(f"SELECT count(*) FROM {table}")
                     ).scalar_one()
-                    for table in ("claim_sessions", "session_claims")
+                    for table in (
+                        "claim_sessions",
+                        "session_claims",
+                        "claim_session_acquire_receipts",
+                        "claim_session_acquire_receipt_items",
+                    )
                 }
                 terminal = connection.execute(
                     text(
@@ -254,8 +346,11 @@ def main() -> None:
                     )
                 ).scalar_one()
             phase_metrics = {}
-            for phase in ("acquire", "renew", "finalize", "close"):
+            for phase in ("acquire", "renew", "finalize", "close", "sweep"):
                 values = operation_latencies[phase]
+                phase_pool_waits = pool_waits[phase][
+                    start_pool_waits.get(phase, 0) :
+                ]
                 phase_metrics[phase] = {
                     "operations": len(values),
                     "sql_executions": statement_counts[phase]
@@ -270,20 +365,50 @@ def main() -> None:
                     "p95_seconds": _percentile(values, 0.95),
                     "p99_seconds": _percentile(values, 0.99),
                     "maximum_seconds": max(values, default=0.0),
+                    "transactions": transaction_counts[phase]
+                    - start_transactions.get(phase, 0),
+                    "pool_checkouts": len(phase_pool_waits),
+                    "pool_wait_p95_seconds": _percentile(phase_pool_waits, 0.95),
+                    "pool_wait_maximum_seconds": max(phase_pool_waits, default=0.0),
                 }
+            delete_rows = {
+                table: {
+                    "statements": len(values[start_sweep_deletes.get(table, 0) :]),
+                    "maximum_rows": max(
+                        values[start_sweep_deletes.get(table, 0) :], default=0
+                    ),
+                    "total_rows": sum(values[start_sweep_deletes.get(table, 0) :]),
+                }
+                for table, values in sweep_delete_rows.items()
+                if values[start_sweep_deletes.get(table, 0) :]
+            }
             reports.append(
                 {
                     "claims": count,
+                    "workload_client_concurrency": 2,
                     "heartbeat_calls": heartbeat_calls,
+                    "http_status_counts": {"412": 0, "503": 0},
                     "phases": phase_metrics,
+                    "sweep_calls_returning_work": sweep_calls,
+                    "sweep_delete_rows": delete_rows,
                     "residual": residual,
                     "terminal_evidence_total": terminal,
                 }
             )
         if args.cleanup_wait_seconds > 0:
             time.sleep(args.cleanup_wait_seconds)
-        while persistence.sweep_claim_sessions():
-            pass
+        final_cleanup_started = time.perf_counter()
+        final_cleanup_start_statements = statement_counts["final_cleanup"]
+        final_cleanup_start_transactions = transaction_counts["final_cleanup"]
+        final_cleanup_start_pool_waits = len(pool_waits["final_cleanup"])
+        final_cleanup_start_deletes = {
+            table: len(values) for table, values in sweep_delete_rows.items()
+        }
+        final_cleanup_calls = 0
+        with _measured("final_cleanup"):
+            while persistence.sweep_claim_sessions():
+                final_cleanup_calls += 1
+        final_cleanup_elapsed = time.perf_counter() - final_cleanup_started
         with persistence.engine.connect() as connection:
             final_residual = {
                 table: connection.execute(
@@ -296,10 +421,33 @@ def main() -> None:
                     "claim_session_acquire_receipt_items",
                 )
             }
+        final_cleanup_pool_waits = pool_waits["final_cleanup"][
+            final_cleanup_start_pool_waits:
+        ]
+        final_cleanup_delete_rows = {
+            table: {
+                "statements": len(values[final_cleanup_start_deletes.get(table, 0) :]),
+                "maximum_rows": max(
+                    values[final_cleanup_start_deletes.get(table, 0) :], default=0
+                ),
+                "total_rows": sum(
+                    values[final_cleanup_start_deletes.get(table, 0) :]
+                ),
+            }
+            for table, values in sweep_delete_rows.items()
+            if values[final_cleanup_start_deletes.get(table, 0) :]
+        }
     finally:
+        activity_stop.set()
+        activity_thread.join()
         event.remove(persistence.engine, "before_cursor_execute", before_cursor_execute)
         event.remove(persistence.engine, "after_cursor_execute", after_cursor_execute)
+        event.remove(persistence.engine, "commit", after_transaction)
+        event.remove(persistence.engine, "rollback", after_transaction)
+        pool._do_get = original_do_get
         persistence.close()
+    if activity_errors:
+        raise RuntimeError(f"pg_stat_activity sampling failed: {activity_errors}")
 
     report = {
         "schema_version": 1,
@@ -309,8 +457,24 @@ def main() -> None:
         "python": platform.python_version(),
         "postgres": postgres_version,
         "settings": settings,
+        "pg_stat_activity": {
+            **activity_summary,
+            "wait_event_sample_counts": dict(sorted(activity_wait_events.items())),
+        },
         "counts": reports,
         "cleanup_wait_seconds": args.cleanup_wait_seconds,
+        "final_cleanup": {
+            "elapsed_seconds": final_cleanup_elapsed,
+            "calls_returning_work": final_cleanup_calls,
+            "sql_executions": statement_counts["final_cleanup"]
+            - final_cleanup_start_statements,
+            "transactions": transaction_counts["final_cleanup"]
+            - final_cleanup_start_transactions,
+            "pool_checkouts": len(final_cleanup_pool_waits),
+            "pool_wait_p95_seconds": _percentile(final_cleanup_pool_waits, 0.95),
+            "pool_wait_maximum_seconds": max(final_cleanup_pool_waits, default=0.0),
+            "delete_rows": final_cleanup_delete_rows,
+        },
         "final_residual": final_residual,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
