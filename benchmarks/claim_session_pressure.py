@@ -113,6 +113,30 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[index]
 
 
+def _has_interval_overlap(
+    renew: list[tuple[float, float]], workload: list[tuple[float, float]]
+) -> bool:
+    return any(
+        renew_start < work_end and work_start < renew_end
+        for renew_start, renew_end in renew
+        for work_start, work_end in workload
+    )
+
+
+def _cleanup_failed_lane(persistence: Any, authority: Any) -> list[BaseException]:
+    errors: list[BaseException] = []
+    try:
+        persistence.close_claim_session(authority)
+    except BaseException as error:
+        errors.append(error)
+    try:
+        while persistence.sweep_claim_sessions():
+            pass
+    except BaseException as error:
+        errors.append(error)
+    return errors
+
+
 def _validate_lane_report(
     report: dict[str, Any],
     *,
@@ -130,6 +154,11 @@ def _validate_lane_report(
     }
     if expected_operations["renew"] < 1:
         raise RuntimeError("pressure lane did not overlap heartbeat traffic")
+    intervals = cast(dict[str, list[tuple[float, float]]], report["intervals"])
+    if not _has_interval_overlap(
+        intervals["renew"], intervals["acquire"] + intervals["finalize"]
+    ):
+        raise RuntimeError("pressure heartbeat did not overlap acquire/finalize")
     phases = cast(dict[str, dict[str, int | float]], report["phases"])
     for phase, operations in expected_operations.items():
         metrics = phases[phase]
@@ -396,6 +425,9 @@ def main() -> None:
             )
             acquired = []
             operation_latencies: dict[str, list[float]] = defaultdict(list)
+            operation_intervals: dict[str, list[tuple[float, float]]] = defaultdict(
+                list
+            )
             start_counts = dict(statement_counts)
             start_transactions = dict(transaction_counts)
             start_pool_waits = {
@@ -419,6 +451,9 @@ def main() -> None:
                         operation_latencies["renew"].append(
                             time.perf_counter() - started
                         )
+                        operation_intervals["renew"].append(
+                            (started, time.perf_counter())
+                        )
                         heartbeat_calls += 1
                     except Exception as error:  # pragma: no cover - benchmark evidence
                         heartbeat_errors.append(repr(error))
@@ -426,6 +461,7 @@ def main() -> None:
 
             heartbeat_thread = threading.Thread(target=heartbeat)
             heartbeat_thread.start()
+            operation_error: BaseException | None = None
             try:
                 for offset in range(0, count, 1000):
                     batch = queries[offset : offset + 1000]
@@ -439,6 +475,9 @@ def main() -> None:
                             queries=batch,
                         )
                     operation_latencies["acquire"].append(time.perf_counter() - started)
+                    operation_intervals["acquire"].append(
+                        (started, time.perf_counter())
+                    )
                     if any(
                         outcome.disposition is not ClaimDisposition.ACQUIRED
                         for outcome in outcomes
@@ -464,18 +503,47 @@ def main() -> None:
                     operation_latencies["finalize"].append(
                         time.perf_counter() - started
                     )
+                    operation_intervals["finalize"].append(
+                        (started, time.perf_counter())
+                    )
+            except BaseException as error:
+                operation_error = error
             finally:
                 heartbeat_stop.set()
                 heartbeat_thread.join()
+            if operation_error is not None:
+                cleanup_errors = _cleanup_failed_lane(persistence, authority)
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "pressure lane and cleanup failed",
+                        [operation_error, *cleanup_errors],
+                    ) from None
+                raise operation_error
             started = time.perf_counter()
-            with _measured("close"):
-                persistence.close_claim_session(authority)
+            try:
+                with _measured("close"):
+                    persistence.close_claim_session(authority)
+            except BaseException as error:
+                cleanup_errors = _cleanup_failed_lane(persistence, authority)
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "pressure close and cleanup failed", [error, *cleanup_errors]
+                    ) from None
+                raise
             operation_latencies["close"].append(time.perf_counter() - started)
             sweep_started = time.perf_counter()
             sweep_calls = 0
-            with _measured("sweep"):
-                while persistence.sweep_claim_sessions():
-                    sweep_calls += 1
+            try:
+                with _measured("sweep"):
+                    while persistence.sweep_claim_sessions():
+                        sweep_calls += 1
+            except BaseException as error:
+                cleanup_errors = _cleanup_failed_lane(persistence, authority)
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "pressure sweep and cleanup failed", [error, *cleanup_errors]
+                    ) from None
+                raise
             operation_latencies["sweep"].append(time.perf_counter() - sweep_started)
             if heartbeat_errors:
                 raise RuntimeError(f"heartbeat failed: {heartbeat_errors}")
@@ -540,6 +608,7 @@ def main() -> None:
                 "heartbeat_calls": heartbeat_calls,
                 "http_status_counts": {"412": 0, "503": 0},
                 "phases": phase_metrics,
+                "intervals": dict(operation_intervals),
                 "sweep_calls_returning_work": sweep_calls,
                 "sweep_delete_rows": delete_rows,
                 "residual": residual,

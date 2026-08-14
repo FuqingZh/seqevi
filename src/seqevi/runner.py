@@ -19,6 +19,7 @@ _WAIT_INTERVAL_SECONDS = 0.05
 _CLEANUP_STUCK_AFTER_SECONDS = 2.0
 _LOGGER = logging.getLogger("seqevi.runner")
 _PR_GET_CHILD_SUBREAPER = 37
+_DEFERRED_CLEANUP_ERRORS = (KeyboardInterrupt, SystemExit, OSError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,12 +213,22 @@ class ToolRunner:
             if deferred_error is None:
                 deferred_error = error
 
+        if not send_term:
+            while True:
+                try:
+                    late_members, ambiguous = self._group_snapshot(
+                        leader_pid, leader_pid
+                    )
+                    send_term = bool(late_members) or ambiguous
+                    break
+                except _DEFERRED_CLEANUP_ERRORS as error:
+                    defer(error)
         if send_term:
             while True:
                 try:
                     self._signal_group(leader_pid, signal.SIGTERM, allow_missing=False)
                     break
-                except (KeyboardInterrupt, SystemExit) as error:
+                except _DEFERRED_CLEANUP_ERRORS as error:
                     defer(error)
             grace_deadline = time.monotonic() + self.termination_grace_seconds
             while time.monotonic() < grace_deadline:
@@ -231,7 +242,7 @@ class ToolRunner:
                             ),
                         )
                     )
-                except (KeyboardInterrupt, SystemExit) as error:
+                except _DEFERRED_CLEANUP_ERRORS as error:
                     defer(error)
 
             # Kill the complete group at the fixed grace boundary. A missing
@@ -241,7 +252,7 @@ class ToolRunner:
                     self._signal_group(leader_pid, signal.SIGKILL, allow_missing=True)
                     cleanup_started = time.monotonic()
                     break
-                except (KeyboardInterrupt, SystemExit) as error:
+                except _DEFERRED_CLEANUP_ERRORS as error:
                     defer(error)
 
         cleanup_started = cleanup_started or time.monotonic()
@@ -255,7 +266,7 @@ class ToolRunner:
                     stuck_reported,
                 )
                 break
-            except (KeyboardInterrupt, SystemExit) as error:
+            except _DEFERRED_CLEANUP_ERRORS as error:
                 defer(error)
 
         # Fence a fork handoff while the unreaped leader still reserves its PGID.
@@ -264,7 +275,7 @@ class ToolRunner:
                 if self._signal_group(leader_pid, signal.SIGKILL, allow_missing=True):
                     break
                 live, _ = self._group_snapshot(leader_pid, leader_pid)
-            except (KeyboardInterrupt, SystemExit) as error:
+            except _DEFERRED_CLEANUP_ERRORS as error:
                 defer(error)
                 continue
             if not stuck_reported:
@@ -272,7 +283,7 @@ class ToolRunner:
                 stuck_reported = True
             try:
                 time.sleep(_WAIT_INTERVAL_SECONDS)
-            except (KeyboardInterrupt, SystemExit) as error:
+            except _DEFERRED_CLEANUP_ERRORS as error:
                 defer(error)
         while True:
             try:
@@ -283,7 +294,7 @@ class ToolRunner:
                     stuck_reported,
                 )
                 break
-            except (KeyboardInterrupt, SystemExit) as error:
+            except _DEFERRED_CLEANUP_ERRORS as error:
                 defer(error)
         while True:
             try:
@@ -291,20 +302,21 @@ class ToolRunner:
                 break
             except (KeyboardInterrupt, SystemExit) as error:
                 defer(error)
-            except OSError:
+            except OSError as error:
+                defer(error)
                 if time.monotonic() - cleanup_started >= _CLEANUP_STUCK_AFTER_SECONDS:
                     if not stuck_reported:
                         self._report_cleanup_stuck(command, leader_pid, ())
                         stuck_reported = True
                 try:
                     time.sleep(_WAIT_INTERVAL_SECONDS)
-                except (KeyboardInterrupt, SystemExit) as error:
+                except _DEFERRED_CLEANUP_ERRORS as error:
                     defer(error)
         if owns_adopted_children:
             while True:
                 try:
                     adopted_clean = self._reap_adopted_group_zombies(leader_pid)
-                except (KeyboardInterrupt, SystemExit) as error:
+                except _DEFERRED_CLEANUP_ERRORS as error:
                     defer(error)
                     continue
                 if adopted_clean:
@@ -315,13 +327,13 @@ class ToolRunner:
                         stuck_reported = True
                 try:
                     time.sleep(_WAIT_INTERVAL_SECONDS)
-                except (KeyboardInterrupt, SystemExit) as error:
+                except _DEFERRED_CLEANUP_ERRORS as error:
                     defer(error)
         while True:
             try:
                 process.wait()
                 break
-            except (KeyboardInterrupt, SystemExit) as error:
+            except _DEFERRED_CLEANUP_ERRORS as error:
                 defer(error)
         return deferred_error
 

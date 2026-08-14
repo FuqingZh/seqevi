@@ -347,7 +347,7 @@ def _remove_binding_probe(
         cursor.execute(
             """
             DELETE FROM claim_session_open_receipts
-            WHERE open_request_id = %s AND session_id = %s AND closed = 1
+            WHERE open_request_id = %s AND session_id = %s AND closed = 0
             """,
             (open_request_id, session_id),
         )

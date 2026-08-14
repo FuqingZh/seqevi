@@ -306,6 +306,54 @@ def test_c2_store_binding_requires_fresh_matching_shared_database(
         )
 
 
+def test_c2_binding_probe_removes_exact_closed_zero_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _c2()
+    queries: list[tuple[str, tuple[str, str]]] = []
+
+    class Cursor:
+        rowcount = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_error: object) -> None:
+            pass
+
+        def execute(self, query: str, parameters: tuple[str, str]) -> None:
+            normalized = " ".join(query.split())
+            queries.append((normalized, parameters))
+            self.rowcount = (
+                1
+                if "closed = 0" in normalized or "state = 'closing'" in normalized
+                else 0
+            )
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_error: object) -> None:
+            pass
+
+        def cursor(self) -> Cursor:
+            return Cursor()
+
+    globals_ = module["_remove_binding_probe"].__globals__
+    monkeypatch.setitem(
+        globals_,
+        "psycopg",
+        type("Psycopg", (), {"connect": lambda *_args: Connection()}),
+    )
+
+    module["_remove_binding_probe"]("postgresql://db", "session", "request")
+
+    assert queries[0][1] == ("request", "session")
+    assert "closed = 0" in queries[0][0]
+    assert queries[1][1] == ("session",)
+
+
 @pytest.mark.parametrize(
     "violation",
     ["sql", "transactions", "latency", "pool_wait", "terminal"],
@@ -336,6 +384,11 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
         "heartbeat_calls": 2,
         "http_status_counts": {"412": 0, "503": 0},
         "phases": phases,
+        "intervals": {
+            "renew": [(1.5, 2.5)],
+            "acquire": [(1.0, 2.0)],
+            "finalize": [(3.0, 4.0)],
+        },
         "sweep_delete_rows": {},
         "residual": {
             "claim_sessions": 1,
@@ -370,3 +423,32 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
             expected_sessions=1,
             expected_receipt_headers=1,
         )
+
+
+def test_pressure_requires_real_heartbeat_overlap() -> None:
+    module = cast(
+        dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
+    )
+    assert module["_has_interval_overlap"]([(1.5, 2.5)], [(1.0, 2.0), (3.0, 4.0)])
+    assert not module["_has_interval_overlap"]([(4.0, 5.0)], [(1.0, 2.0), (2.0, 3.0)])
+
+
+def test_pressure_failed_lane_closes_and_sweeps_with_aggregated_errors() -> None:
+    module = cast(
+        dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
+    )
+    events: list[str] = []
+
+    class Persistence:
+        def close_claim_session(self, _authority: object) -> None:
+            events.append("close")
+            raise RuntimeError("close failed")
+
+        def sweep_claim_sessions(self) -> bool:
+            events.append("sweep")
+            return False
+
+    errors = module["_cleanup_failed_lane"](Persistence(), object())
+    assert events == ["close", "sweep"]
+    assert len(errors) == 1
+    assert str(errors[0]) == "close failed"

@@ -450,8 +450,92 @@ def test_subreaper_query_error_retains_cleanup_until_retry_succeeds(
         send_term=False,
     )
 
-    assert cleanup_error is None
+    assert isinstance(cleanup_error, OSError)
     assert events == ["query", "query", "reap", "wait"]
+
+
+def test_cleanup_syscall_errors_are_deferred_until_final_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    clean_attempts = 0
+    wait_attempts = 0
+
+    class Process:
+        pid = 12345
+
+        @staticmethod
+        def wait() -> None:
+            nonlocal wait_attempts
+            wait_attempts += 1
+            events.append("wait")
+            if wait_attempts == 1:
+                raise OSError(errno.EINTR, "interrupted")
+
+    def clean(*_args: object) -> bool:
+        nonlocal clean_attempts
+        clean_attempts += 1
+        events.append("clean")
+        if clean_attempts == 1:
+            raise InterruptedError
+        return False
+
+    def signal_group(_pid: int, sent: signal.Signals, **_kwargs: object) -> bool:
+        events.append(sent.name)
+        return True
+
+    monkeypatch.setattr(ToolRunner, "_group_snapshot", lambda *_args: ((), False))
+    monkeypatch.setattr(ToolRunner, "_wait_for_clean_group", clean)
+    monkeypatch.setattr(ToolRunner, "_signal_group", staticmethod(signal_group))
+    monkeypatch.setattr(
+        ToolRunner, "_owns_adopted_children", staticmethod(lambda: False)
+    )
+
+    error = ToolRunner()._terminate_and_reap(  # pyright: ignore[reportPrivateUsage]
+        Process(),  # type: ignore[arg-type]
+        command(tmp_path, "pass"),
+        send_term=False,
+    )
+
+    assert isinstance(error, InterruptedError)
+    assert events == ["clean", "clean", "SIGKILL", "clean", "wait", "wait"]
+
+
+def test_late_descendant_gets_term_grace_before_kill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    member = runner_module._ProcessMember(12346, "S", 12345, 12345)
+
+    class Process:
+        pid = 12345
+
+        @staticmethod
+        def wait() -> None:
+            events.append("wait")
+
+    monkeypatch.setattr(
+        ToolRunner, "_group_snapshot", lambda *_args: ((member,), False)
+    )
+    monkeypatch.setattr(ToolRunner, "_wait_for_clean_group", lambda *_args: False)
+    monkeypatch.setattr(
+        ToolRunner, "_owns_adopted_children", staticmethod(lambda: False)
+    )
+    monkeypatch.setattr(
+        ToolRunner,
+        "_signal_group",
+        staticmethod(lambda _pid, sent, **_kwargs: events.append(sent.name) or True),
+    )
+
+    error = ToolRunner(termination_grace_seconds=0.01)._terminate_and_reap(  # pyright: ignore[reportPrivateUsage]
+        Process(),  # type: ignore[arg-type]
+        command(tmp_path, "pass"),
+        send_term=False,
+    )
+
+    assert error is None
+    assert events[:3] == ["SIGTERM", "SIGKILL", "SIGKILL"]
+    assert events[-1] == "wait"
 
 
 def test_cleanup_stuck_remains_synchronously_owned_until_clean(
