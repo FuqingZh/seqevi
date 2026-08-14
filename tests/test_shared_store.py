@@ -5418,6 +5418,45 @@ def test_postgres_maintenance_resolver_exit_race_preserves_deadline_and_reaps(
     assert process.reaped
 
 
+def test_postgres_maintenance_resolver_interruption_is_exactly_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InterruptedResolverProcess:
+        returncode = None
+
+        def __init__(self) -> None:
+            self.communications = 0
+            self.terminated = False
+            self.reaped = False
+
+        def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+            self.communications += 1
+            if self.communications == 1:
+                assert timeout is not None
+                raise KeyboardInterrupt("resolver interrupted")
+            assert timeout is not None
+            self.reaped = True
+            self.returncode = -15
+            return b"", b""
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    process = InterruptedResolverProcess()
+    monkeypatch.setattr(
+        store_migration.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: process,
+    )
+    with pytest.raises(KeyboardInterrupt, match="resolver interrupted"):
+        store_migration._resolve_postgres_host(  # pyright: ignore[reportPrivateUsage]
+            "interrupted.invalid", 5432, time.monotonic() + 10
+        )
+    assert process.terminated
+    assert process.communications == 2
+    assert process.reaped
+
+
 def test_postgres_maintenance_rejects_resolved_attempts_that_cannot_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

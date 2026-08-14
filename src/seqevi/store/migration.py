@@ -1061,6 +1061,12 @@ def _resolve_postgres_host(host: str, port: int, deadline: float) -> tuple[str, 
         except BaseException as cleanup:
             timeout.add_note(f"PostgreSQL resolver cleanup failed: {cleanup!r}")
         raise timeout from error
+    except BaseException as error:
+        try:
+            _stop_postgres_resolver(process)
+        except BaseException as cleanup:
+            error.add_note(f"PostgreSQL resolver cleanup failed: {cleanup!r}")
+        raise
     _remaining(deadline)
     if process.returncode != 0:
         raise OSError(stderr[:4096].decode("utf-8", errors="replace"))
