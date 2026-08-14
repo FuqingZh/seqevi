@@ -4996,6 +4996,7 @@ def test_postgres_maintenance_rejects_mismatched_explicit_target_lists(
         )
 
 
+@pytest.mark.parametrize("parameter_value", [None, ""])
 @pytest.mark.parametrize(
     ("key", "envvar", "envvalue", "expected", "attempts"),
     [
@@ -5017,8 +5018,9 @@ def test_postgres_maintenance_rejects_mismatched_explicit_target_lists(
         ),
     ],
 )
-def test_postgres_maintenance_null_parameter_uses_environment_fallback(
+def test_postgres_maintenance_empty_parameter_uses_environment_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    parameter_value: str | None,
     key: str,
     envvar: str,
     envvalue: str,
@@ -5042,7 +5044,7 @@ def test_postgres_maintenance_null_parameter_uses_environment_fallback(
         )
     bounded, observed_attempts = (  # pyright: ignore[reportPrivateUsage]
         store_migration._resolve_postgres_connect_targets(
-            {key: None}, time.monotonic() + 10
+            {key: parameter_value}, time.monotonic() + 10
         )
     )
     assert bounded[key] == expected
@@ -5687,7 +5689,7 @@ def test_maintenance_timeout_show_mismatch_discards_connection(
         driver_connection = Raw()
 
     class FakeConnection:
-        connection = Holder()
+        _dbapi_connection = Holder()
 
         def __init__(self):
             self.invalidated = False
@@ -5734,7 +5736,7 @@ def test_maintenance_watchdog_classifies_expiry_during_commit_as_ambiguous(
         driver_connection = Raw()
 
     class FakeConnection:
-        connection = Holder()
+        _dbapi_connection = Holder()
 
         def __init__(self):
             self.invalidated = False
@@ -5770,7 +5772,7 @@ def test_postgres_maintenance_cleanup_watchdog_invalidates_stalled_connection() 
         driver_connection = Raw()
 
     class FakeConnection:
-        connection = Holder()
+        _dbapi_connection = Holder()
 
         def __init__(self) -> None:
             self.invalidated = False
@@ -5790,6 +5792,40 @@ def test_postgres_maintenance_cleanup_watchdog_invalidates_stalled_connection() 
     assert time.monotonic() - started < 0.5
     assert cancelled.is_set()
     assert connection.invalidated
+
+
+@pytest.mark.requires_postgres
+def test_postgres_maintenance_cleanup_does_not_reconnect_invalidated_connection() -> (
+    None
+):
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url, pool_size=1, max_overflow=0)
+        reconnected = False
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ) as connection:
+            connection.commit()
+            connection.invalidate()
+            original_connect = engine.dialect.connect
+
+            def unexpected_reconnect(*_args: Any, **_kwargs: Any) -> Any:
+                nonlocal reconnected
+                reconnected = True
+                pytest.fail(
+                    "invalidated maintenance cleanup re-entered dialect.connect"
+                )
+
+            engine.dialect.connect = unexpected_reconnect
+            try:
+                store_migration._cleanup_postgres_maintenance(  # pyright: ignore[reportPrivateUsage]
+                    connection, True, time.monotonic() + 5
+                )
+            finally:
+                engine.dialect.connect = original_connect
+            assert connection.invalidated
+        assert not reconnected
+        assert cast(Any, engine.pool).checkedout() == 0
+        engine.dispose()
 
 
 @pytest.mark.requires_postgres

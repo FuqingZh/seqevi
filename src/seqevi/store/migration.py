@@ -51,7 +51,18 @@ class _MaintenanceWatchdog:
     def __init__(self, connection: Connection, deadline: float) -> None:
         self.connection = connection
         self.expired = threading.Event()
-        raw = cast(Any, connection.connection.driver_connection)
+        if connection.invalidated:
+            raise RuntimeError(
+                "PostgreSQL maintenance cannot arm a watchdog for an "
+                "invalidated connection"
+            )
+        dbapi_connection = cast(Any, connection)._dbapi_connection
+        if dbapi_connection is None:
+            raise RuntimeError(
+                "PostgreSQL maintenance cannot arm a watchdog without an "
+                "existing DBAPI connection"
+            )
+        raw = dbapi_connection.driver_connection
 
         def cancel_stalled_operation() -> None:
             self.expired.set()
@@ -1040,8 +1051,10 @@ def _effective_postgres_connect_params(cparams: dict[str, Any]) -> dict[str, Any
         ("port", "PGPORT"),
         ("target_session_attrs", "PGTARGETSESSIONATTRS"),
     ):
-        if bounded.get(key) is None and (value := os.environ.get(envvar)) is not None:
-            bounded[key] = value
+        if bounded.get(key) in (None, ""):
+            bounded.pop(key, None)
+            if (value := os.environ.get(envvar)) not in (None, ""):
+                bounded[key] = value
     return bounded
 
 
@@ -1134,6 +1147,8 @@ def _discard_postgres_connection(
 def _cleanup_postgres_maintenance(
     connection: Connection, acquired: bool, deadline: float
 ) -> None:
+    if connection.invalidated:
+        return
     watchdog: _MaintenanceWatchdog | None = None
     try:
         watchdog = _MaintenanceWatchdog(connection, deadline)
