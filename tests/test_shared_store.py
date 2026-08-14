@@ -4980,10 +4980,13 @@ def test_postgres_maintenance_preserves_filesystem_socket_target(
 @pytest.mark.parametrize(
     "connect_args", [{}, {"connect_timeout": None}, {"connect_timeout": ""}]
 )
+@pytest.mark.parametrize("environment_timeout", ["2", "2.5"])
 def test_postgres_maintenance_preserves_environment_connect_timeout(
-    monkeypatch: pytest.MonkeyPatch, connect_args: dict[str, Any]
+    monkeypatch: pytest.MonkeyPatch,
+    connect_args: dict[str, Any],
+    environment_timeout: str,
 ) -> None:
-    monkeypatch.setenv("PGCONNECT_TIMEOUT", "2")
+    monkeypatch.setenv("PGCONNECT_TIMEOUT", environment_timeout)
     engine = create_engine(
         "postgresql+psycopg://unused@127.0.0.1/unused",
         connect_args=connect_args,
@@ -5004,13 +5007,14 @@ def test_postgres_maintenance_preserves_environment_connect_timeout(
     engine.dispose()
 
 
+@pytest.mark.parametrize("configured_timeout", [2, "2.5"])
 def test_postgres_maintenance_preserves_explicit_connect_timeout_cap(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, configured_timeout: int | str
 ) -> None:
     monkeypatch.setenv("PGCONNECT_TIMEOUT", "4")
     engine = create_engine(
         "postgresql+psycopg://unused@127.0.0.1/unused",
-        connect_args={"connect_timeout": 2},
+        connect_args={"connect_timeout": configured_timeout},
     )
     observed: list[int] = []
 
@@ -5025,6 +5029,29 @@ def test_postgres_maintenance_preserves_explicit_connect_timeout_cap(
         ):
             pytest.fail("test physical connection unexpectedly succeeded")
     assert observed == [2]
+    engine.dispose()
+
+
+def test_postgres_maintenance_rejects_invalid_connect_timeout_without_coercion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(
+        "postgresql+psycopg://unused@127.0.0.1/unused",
+        connect_args={"connect_timeout": "invalid"},
+    )
+    connected = False
+
+    def unexpected_connect(*_args: Any, **_cparams: Any) -> None:
+        nonlocal connected
+        connected = True
+
+    monkeypatch.setattr(engine.dialect, "connect", unexpected_connect)
+    with pytest.raises(ValueError, match="could not convert string to float"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 5
+        ):
+            pytest.fail("invalid timeout unexpectedly reached the driver")
+    assert not connected
     engine.dispose()
 
 

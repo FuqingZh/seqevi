@@ -844,9 +844,14 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
                         "physical-connect budget"
                     )
                 configured = bounded_cparams.get("connect_timeout")
+                configured_timeout = (
+                    _parse_postgres_connect_timeout(configured)
+                    if configured is not None
+                    else 0
+                )
                 bounded_cparams["connect_timeout"] = (
-                    min(int(configured), connect_timeout)
-                    if configured is not None and int(configured) > 0
+                    min(configured_timeout, connect_timeout)
+                    if configured_timeout > 0
                     else connect_timeout
                 )
             if acquisition_expired.is_set():
@@ -1074,6 +1079,12 @@ def _postgres_default_port() -> int:
         if option.keyword == b"port" and option.compiled is not None:
             return int(option.compiled)
     raise RuntimeError("PostgreSQL client libpq did not report a default port")
+
+
+def _parse_postgres_connect_timeout(value: Any) -> int:
+    """Parse a timeout with the locked Psycopg driver's conversion semantics."""
+
+    return int(float(value))
 
 
 def _align_postgres_connect_values(
