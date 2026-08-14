@@ -55,8 +55,10 @@ PYTHONPATH=src pdm run python benchmarks/annotate_real.py \
 
 `claim_session_pressure.py` runs the approved PostgreSQL ClaimSession matrix
 through the production persistence implementation. It records per-operation
-SQL execution counts and latency while renew traffic overlaps acquire/finalize,
-then waits for retained receipts and proves zero residual coordination:
+SQL and transaction counts, pool-acquisition timing, PostgreSQL activity and
+lock-wait samples, receipt and bounded-sweeper rows, and latency while renew
+traffic overlaps acquire/finalize. It then waits for retained receipts and
+proves zero residual coordination:
 
 ```bash
 PYTHONPATH=src:. pdm run python benchmarks/claim_session_pressure.py \
@@ -65,7 +67,9 @@ PYTHONPATH=src:. pdm run python benchmarks/claim_session_pressure.py \
 ```
 
 `c2_acceptance.py` owns the frozen real two-process C2 launch and independent
-replays. The Store endpoint and database must be fresh, isolated, and served by
+replays. It verifies the exact input identity set, artifact references,
+coordination cleanup, cache-only replays, and that no matching external tool
+remains. The Store endpoint and database must be fresh, isolated, and served by
 the exact candidate head; the two caller-owned FASTAs and named execution
 profile remain external:
 
