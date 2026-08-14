@@ -820,17 +820,29 @@ def _bounded_postgres_connect(engine: Engine, deadline: float) -> Iterator[Conne
             bounded_cparams, attempts = _resolve_postgres_connect_targets(
                 cparams, deadline
             )
-            connect_timeout = int(_remaining(deadline)) // attempts
-            if connect_timeout < 2:
-                raise TimeoutError(
-                    "ClaimSession maintenance has insufficient physical-connect budget"
+            with acquisition_state_lock:
+                if acquisition_expired.is_set():
+                    raise TimeoutError(
+                        "ClaimSession maintenance connection initialization "
+                        "exceeded deadline"
+                    )
+                connect_timeout = int(_remaining(deadline)) // attempts
+                if connect_timeout < 2:
+                    raise TimeoutError(
+                        "ClaimSession maintenance has insufficient "
+                        "physical-connect budget"
+                    )
+                configured = bounded_cparams.get("connect_timeout")
+                bounded_cparams["connect_timeout"] = (
+                    min(int(configured), connect_timeout)
+                    if configured is not None and int(configured) > 0
+                    else connect_timeout
                 )
-            configured = bounded_cparams.get("connect_timeout")
-            bounded_cparams["connect_timeout"] = (
-                min(int(configured), connect_timeout)
-                if configured is not None and int(configured) > 0
-                else connect_timeout
-            )
+            if acquisition_expired.is_set():
+                raise TimeoutError(
+                    "ClaimSession maintenance connection initialization "
+                    "exceeded deadline"
+                )
             raw = dialect.connect(*cargs, **bounded_cparams)
             if not callable(getattr(raw, "cancel_safe", None)):
                 raw.close()

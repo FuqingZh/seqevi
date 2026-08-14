@@ -4827,6 +4827,47 @@ def test_postgres_maintenance_divides_timeout_across_all_host_attempts(
     engine.dispose()
 
 
+def test_postgres_maintenance_expiry_before_physical_connect_is_irreversible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine("postgresql+psycopg://unused@127.0.0.1/unused")
+    remainders = iter((5.0, 0.05, 5.0))
+    connected = False
+
+    monkeypatch.setattr(
+        store_migration, "_remaining", lambda _deadline: next(remainders)
+    )
+
+    def delayed_target_preparation(
+        cparams: dict[str, Any], _deadline: float
+    ) -> tuple[dict[str, Any], int]:
+        time.sleep(0.1)
+        return dict(cparams), 1
+
+    def unexpected_connect(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal connected
+        connected = True
+
+    monkeypatch.setattr(
+        store_migration,
+        "_resolve_postgres_connect_targets",
+        delayed_target_preparation,
+    )
+    monkeypatch.setattr(engine.dialect, "connect", unexpected_connect)
+    with pytest.raises(TimeoutError, match="initialization exceeded deadline"):
+        with store_migration._bounded_postgres_connect(  # pyright: ignore[reportPrivateUsage]
+            engine, time.monotonic() + 10
+        ):
+            pytest.fail("expired acquisition started physical connect")
+    assert not connected
+    assert cast(Any, engine.pool).checkedout() == 0
+    assert not any(
+        thread.name == "seqevi-postgres-acquisition-watchdog" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+    engine.dispose()
+
+
 def test_postgres_maintenance_stalled_dns_is_killed_and_reaped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
