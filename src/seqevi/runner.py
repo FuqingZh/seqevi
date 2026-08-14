@@ -163,7 +163,9 @@ class ToolRunner:
 
             if reason is None and cancellation_signal.is_set():
                 reason = "cancelled"
-            live_members, _ = self._group_snapshot(process.pid, process.pid)
+            live_members = ()
+            if reason is None:
+                live_members, _ = self._group_snapshot(process.pid, process.pid)
             if reason is not None or live_members:
                 self._terminate_and_reap(process, command, send_term=True)
             else:

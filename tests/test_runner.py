@@ -154,6 +154,59 @@ def test_cancellation_wakes_runner_without_polling_delay(tmp_path: Path) -> None
     assert time.monotonic() - started < 1.0
 
 
+def test_cancellation_signals_before_group_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cancellation = threading.Event()
+    signal_sent = threading.Event()
+    original_signal_group = ToolRunner._signal_group
+    original_group_snapshot = ToolRunner._group_snapshot
+    first_snapshot = True
+    errors: list[BaseException] = []
+
+    def signal_group(
+        process_group_id: int,
+        sent_signal: signal.Signals,
+        *,
+        allow_missing: bool,
+    ) -> bool:
+        if sent_signal == signal.SIGTERM:
+            signal_sent.set()
+        return original_signal_group(
+            process_group_id, sent_signal, allow_missing=allow_missing
+        )
+
+    def slow_group_snapshot(
+        cls: type[ToolRunner], process_group_id: int, leader_pid: int
+    ) -> tuple[tuple[object, ...], bool]:
+        nonlocal first_snapshot
+        if first_snapshot:
+            first_snapshot = False
+            time.sleep(1.1)
+        return original_group_snapshot(process_group_id, leader_pid)
+
+    def run() -> None:
+        try:
+            ToolRunner(termination_grace_seconds=0.01).run(
+                command(tmp_path, "import time; time.sleep(30)"),
+                cancellation_signal=cancellation,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(ToolRunner, "_signal_group", staticmethod(signal_group))
+    monkeypatch.setattr(ToolRunner, "_group_snapshot", classmethod(slow_group_snapshot))
+    thread = threading.Thread(target=run)
+    thread.start()
+    time.sleep(0.1)
+    cancellation.set()
+    assert signal_sent.wait(0.9)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ToolCancelledError)
+
+
 def test_cancellation_wins_the_leader_exit_boundary(tmp_path: Path) -> None:
     cancellation = threading.Event()
     cancellation.set()
