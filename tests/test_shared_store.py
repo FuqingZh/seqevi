@@ -80,6 +80,7 @@ from seqevi.store.schema import (
 )
 from seqevi.store.transport import (
     ClaimSessionFinalizeItem,
+    ClaimSessionOpenResponse,
     CommitModel,
     EvidenceRecordModel,
     EvidenceQueryModel,
@@ -506,6 +507,39 @@ def test_service_openapi_preserves_legacy_and_adds_claim_operations(
         "/v1/internal/claim-sessions/finalize",
         "/v1/internal/claim-sessions/close",
     }
+
+
+def test_claim_session_transport_enforces_authority_timing_limits() -> None:
+    authority = {
+        "session_id": "session",
+        "owner_token": "owner",
+        "generation": 1,
+    }
+    timing = {
+        **authority,
+        "expires_at": datetime.now(UTC),
+        "heartbeat_after_seconds": 30,
+    }
+    ClaimSessionOpenResponse.model_validate(
+        {
+            **timing,
+            "remaining_lease_seconds": 120,
+            "renew_deadline_seconds": 90,
+        }
+    )
+    for field, value in (
+        ("remaining_lease_seconds", 120.000001),
+        ("renew_deadline_seconds", 90.000001),
+    ):
+        with pytest.raises(ValidationError):
+            ClaimSessionOpenResponse.model_validate(
+                {
+                    **timing,
+                    "remaining_lease_seconds": 120,
+                    "renew_deadline_seconds": 90,
+                    field: value,
+                }
+            )
 
 
 def test_configure_claim_logging_attaches_an_info_handler() -> None:
@@ -2064,6 +2098,26 @@ def test_http_receipt_capacity_restarts_acquire_with_new_request_id() -> None:
     assert acquire_ids[0] != acquire_ids[1]
 
 
+def test_receipt_capacity_retry_snapshots_renew_deadline_under_lock() -> None:
+    store_client_module = importlib.import_module("seqevi.store.client")
+    session = object.__new__(store_client_module._HttpClaimSession)
+    session._lock = threading.Lock()
+    session._renew_deadline = 10.0
+    observed: list[float] = []
+
+    session._lock.acquire()
+    thread = threading.Thread(
+        target=lambda: observed.append(session._renew_deadline_snapshot())
+    )
+    thread.start()
+    session._renew_deadline = 20.0
+    assert thread.is_alive()
+    session._lock.release()
+    thread.join(0.5)
+
+    assert observed == [20.0]
+
+
 @pytest.mark.parametrize(
     "malformation", ["missing", "wrong-count", "wrong-key", "wrong-disposition"]
 )
@@ -3110,12 +3164,12 @@ def test_claim_session_sweeper_retries_after_connection_failure(tmp_path: Path) 
     assert persistence.sweeps >= 2
 
 
-def test_claim_session_authority_preserves_inputs_larger_than_future_ceiling(
+def test_claim_session_authority_enforces_protocol_batch_ceiling(
     tmp_path: Path,
 ) -> None:
     class AuthorityPersistence(MemoryPersistence):
         def claim_session_authority_is_live(self, _authority, claims):
-            assert len(tuple(claims)) == 1001
+            assert len(tuple(claims)) == 1000
             return True
 
     _, key = _key("MAUTHORITYBOUNDARY")
@@ -3124,15 +3178,23 @@ def test_claim_session_authority_preserves_inputs_larger_than_future_ceiling(
         "session_id": "session",
         "owner_token": "owner",
         "generation": 1,
-        "claims": [claim.model_dump(mode="json")] * 1001,
+        "claims": [claim.model_dump(mode="json")] * 1000,
     }
     persistence = AuthorityPersistence()
     app = create_service_app(
         _settings(tmp_path), persistence=cast(ServicePersistence, persistence)
     )
     with TestClient(app) as service:
-        response = service.post("/v1/internal/claim-sessions/authority", json=payload)
-    assert response.status_code == 200
+        accepted = service.post("/v1/internal/claim-sessions/authority", json=payload)
+        rejected = service.post(
+            "/v1/internal/claim-sessions/authority",
+            json={
+                **payload,
+                "claims": [claim.model_dump(mode="json")] * 1001,
+            },
+        )
+    assert accepted.status_code == 200
+    assert rejected.status_code == 422
 
 
 def test_claim_session_authority_backpressure_is_503(tmp_path: Path) -> None:
@@ -3960,6 +4022,62 @@ def test_postgres_acquire_receipt_replays_fixed_width_result(tmp_path: Path) -> 
                 )
         finally:
             persistence.close()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_empty_acquire_is_a_write_free_noop() -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        server_time = persistence.database_time()
+        authority = persistence.open_claim_session(
+            open_request_id="open-empty-acquire",
+            server_time=server_time,
+            open_not_after=server_time + timedelta(seconds=30),
+        )
+        assert authority.remaining_lease_seconds <= 120
+        assert authority.renew_deadline_seconds <= 90
+        statements: list[str] = []
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _many: bool,
+        ) -> None:
+            statements.append(statement)
+
+        event.listen(persistence.engine, "before_cursor_execute", record_statement)
+        try:
+            assert (
+                persistence.acquire_claim_session(
+                    authority,
+                    acquire_request_id="empty-acquire",
+                    query_digest=canonical_query_digest([]),
+                    queries=(),
+                )
+                == ()
+            )
+        finally:
+            event.remove(persistence.engine, "before_cursor_execute", record_statement)
+        assert statements == []
+        with persistence.engine.connect() as connection:
+            assert (
+                connection.execute(
+                    select(func.count()).select_from(claim_session_acquire_receipts)
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                connection.execute(
+                    select(func.count()).select_from(
+                        claim_session_acquire_receipt_items
+                    )
+                ).scalar_one()
+                == 0
+            )
+        persistence.close()
 
 
 @pytest.mark.requires_postgres

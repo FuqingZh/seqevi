@@ -584,6 +584,8 @@ class PostgresEvidencePersistence:
         requested = tuple(queries)
         if len({query.key for query in requested}) != len(requested):
             raise ValueError("acquire batch contains a duplicate evidence key")
+        if not requested:
+            return ()
         results: dict[EvidenceKey, SessionClaimAcquireResult] = {}
         with self._transaction() as connection:
             _lock_evidence_keys(connection, (query.key for query in requested))
@@ -1384,7 +1386,7 @@ def _authority(
     expires_at: datetime,
     now: datetime,
 ) -> ClaimSessionAuthority:
-    remaining = max((expires_at - now).total_seconds(), 0.001)
+    remaining = min(max((expires_at - now).total_seconds(), 0.001), CLAIM_LEASE_SECONDS)
     return ClaimSessionAuthority(
         session_id=session_id,
         owner_token=owner_token,
