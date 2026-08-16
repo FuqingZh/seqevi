@@ -210,7 +210,7 @@ class ToolRunner:
 
         def defer(error: BaseException) -> None:
             nonlocal deferred_error
-            if deferred_error is None:
+            if not isinstance(error, OSError) and deferred_error is None:
                 deferred_error = error
 
         if not send_term:
@@ -385,12 +385,15 @@ class ToolRunner:
         )
         if self.cleanup_observer is None:
             return
-        Thread(
-            target=self._notify_cleanup_observer,
-            args=(observation,),
-            name=f"seqevi-cleanup-observer-{leader_pid}",
-            daemon=True,
-        ).start()
+        try:
+            Thread(
+                target=self._notify_cleanup_observer,
+                args=(observation,),
+                name=f"seqevi-cleanup-observer-{leader_pid}",
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            _LOGGER.exception("external-tool cleanup observer dispatch failed")
 
     def _notify_cleanup_observer(self, observation: ToolCleanupStuck) -> None:
         """Notify operational telemetry without transferring cleanup ownership."""

@@ -450,11 +450,11 @@ def test_subreaper_query_error_retains_cleanup_until_retry_succeeds(
         send_term=False,
     )
 
-    assert isinstance(cleanup_error, OSError)
+    assert cleanup_error is None
     assert events == ["query", "query", "reap", "wait"]
 
 
-def test_cleanup_syscall_errors_are_deferred_until_final_reap(
+def test_recovered_cleanup_syscall_errors_do_not_replace_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     events: list[str] = []
@@ -497,8 +497,50 @@ def test_cleanup_syscall_errors_are_deferred_until_final_reap(
         send_term=False,
     )
 
-    assert isinstance(error, InterruptedError)
+    assert error is None
     assert events == ["clean", "clean", "SIGKILL", "clean", "wait", "wait"]
+
+
+@pytest.mark.parametrize(
+    ("cancelled", "expected_error"),
+    [(True, ToolCancelledError), (False, ToolTimeoutError)],
+)
+def test_recovered_cleanup_error_preserves_structured_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cancelled: bool,
+    expected_error: type[ToolCancelledError] | type[ToolTimeoutError],
+) -> None:
+    cancellation = threading.Event()
+    if cancelled:
+        cancellation.set()
+    original_signal_group = ToolRunner._signal_group
+    attempts = 0
+
+    def flaky_signal_group(
+        process_group_id: int,
+        sent_signal: signal.Signals,
+        *,
+        allow_missing: bool,
+    ) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise InterruptedError(errno.EINTR, "interrupted")
+        return original_signal_group(
+            process_group_id, sent_signal, allow_missing=allow_missing
+        )
+
+    monkeypatch.setattr(ToolRunner, "_signal_group", staticmethod(flaky_signal_group))
+
+    with pytest.raises(expected_error):
+        ToolRunner(termination_grace_seconds=0.01).run(
+            command(tmp_path, "import time; time.sleep(10)"),
+            timeout_seconds=None if cancelled else 0.01,
+            cancellation_signal=cancellation,
+        )
+
+    assert attempts >= 2
 
 
 def test_late_descendant_gets_term_grace_before_kill(
@@ -628,3 +670,50 @@ def test_blocking_cleanup_observer_does_not_block_containment_dispatch(
     assert time.monotonic() - started < 1.0
     assert not release.is_set()
     release.set()
+
+
+def test_observer_thread_start_failure_does_not_abandon_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[str] = []
+    signal_attempts = 0
+
+    class Process:
+        pid = 12345
+
+        @staticmethod
+        def wait() -> None:
+            events.append("wait")
+
+    class FailingThread:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        @staticmethod
+        def start() -> None:
+            raise RuntimeError("thread resources exhausted")
+
+    def signal_group(_pid: int, _sent: signal.Signals, **_kwargs: object) -> bool:
+        nonlocal signal_attempts
+        signal_attempts += 1
+        return signal_attempts > 1
+
+    monkeypatch.setattr(runner_module, "Thread", FailingThread)
+    monkeypatch.setattr(ToolRunner, "_group_snapshot", lambda *_args: ((), False))
+    monkeypatch.setattr(ToolRunner, "_wait_for_clean_group", lambda *_args: False)
+    monkeypatch.setattr(ToolRunner, "_signal_group", staticmethod(signal_group))
+    monkeypatch.setattr(
+        ToolRunner, "_owns_adopted_children", staticmethod(lambda: False)
+    )
+
+    error = ToolRunner(cleanup_observer=lambda _observation: None)._terminate_and_reap(  # pyright: ignore[reportPrivateUsage]
+        Process(),  # type: ignore[arg-type]
+        command(tmp_path, "pass"),
+        send_term=False,
+    )
+
+    assert error is None
+    assert events == ["wait"]
+    assert "cleanup observer dispatch failed" in caplog.text

@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -182,6 +183,52 @@ def _controlled_store_bind(store: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port
 
 
+def _require_unoccupied_store_bind(host: str, port: int) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.2)
+        if probe.connect_ex((host, port)) == 0:
+            raise RuntimeError("accepted C2 Store bind is already occupied")
+
+
+def _child_owns_store_listener(pid: int, host: str, port: int) -> bool:
+    if host != "127.0.0.1":
+        return False
+    expected_address = f"0100007F:{port:04X}"
+    listener_inodes: set[str] = set()
+    try:
+        lines = Path("/proc/net/tcp").read_text(encoding="ascii").splitlines()[1:]
+        for line in lines:
+            fields = line.split()
+            if (
+                len(fields) >= 10
+                and fields[1] == expected_address
+                and fields[3] == "0A"
+            ):
+                listener_inodes.add(fields[9])
+        descriptors = tuple(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError as error:
+        raise RuntimeError("candidate Store listener ownership is ambiguous") from error
+    for descriptor in descriptors:
+        try:
+            target = descriptor.readlink().as_posix()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise RuntimeError(
+                "candidate Store listener ownership is ambiguous"
+            ) from error
+        if target.startswith("socket:[") and target[8:-1] in listener_inodes:
+            return True
+    return False
+
+
+def _redacted_store_command(command: tuple[str, ...]) -> list[str]:
+    recorded = list(command)
+    database_index = recorded.index("--database-url") + 1
+    recorded[database_index] = "<redacted>"
+    return recorded
+
+
 def _start_candidate_store(
     *,
     store: str,
@@ -192,6 +239,7 @@ def _start_candidate_store(
 ) -> tuple[subprocess.Popen[bytes], dict[str, object]]:
     global _ACTIVE_STORE_PROCESS
     host, port = _controlled_store_bind(store)
+    _require_unoccupied_store_bind(host, port)
     artifacts_dir = output_root / "store-artifacts"
     artifacts_dir.mkdir()
     command = (
@@ -235,6 +283,10 @@ def _start_candidate_store(
                     timeout=1.0,
                 )
                 response.raise_for_status()
+                if not _child_owns_store_listener(process.pid, host, port):
+                    raise RuntimeError(
+                        "Store readiness response is not owned by candidate child"
+                    )
                 break
             except httpx.HTTPError:
                 if time.monotonic() >= deadline:
@@ -245,7 +297,7 @@ def _start_candidate_store(
         raise
     return process, {
         "source": str(source_root / "seqevi"),
-        "command": list(command),
+        "command": _redacted_store_command(command),
         "pid": process.pid,
         "cwd": str(source_root.parent),
         "artifacts_dir": str(artifacts_dir),

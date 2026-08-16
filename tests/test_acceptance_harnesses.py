@@ -440,6 +440,8 @@ def test_c2_candidate_store_is_loopback_candidate_and_reaped(
     globals_ = module["_start_candidate_store"].__globals__
     monkeypatch.setattr(subprocess, "Popen", popen)
     monkeypatch.setattr(globals_["httpx"], "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setitem(globals_, "_require_unoccupied_store_bind", lambda *_args: None)
+    monkeypatch.setitem(globals_, "_child_owns_store_listener", lambda *_args: True)
     signalled: list[tuple[int, signal.Signals]] = []
     monkeypatch.setattr("os.killpg", lambda pid, sent: signalled.append((pid, sent)))
     output_root = tmp_path / "evidence"
@@ -447,7 +449,7 @@ def test_c2_candidate_store_is_loopback_candidate_and_reaped(
 
     process, record = module["_start_candidate_store"](
         store="http://127.0.0.1:18083",
-        database_url="postgresql://fresh",
+        database_url="postgresql://user:secret@fresh/database",
         output_root=output_root,
         source_root=source_root,
         environment={"PYTHONPATH": str(source_root)},
@@ -460,10 +462,76 @@ def test_c2_candidate_store_is_loopback_candidate_and_reaped(
     assert observed["cwd"] == source_root.parent
     assert record["pid"] == 4321
     assert record["source"] == str(source_root / "seqevi")
+    assert "secret" not in str(record)
+    assert cast(list[str], record["command"])[6] == "<redacted>"
     assert signalled == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
     for invalid in ("http://store:8000", "https://127.0.0.1:8000", "/tmp/store"):
         with pytest.raises(RuntimeError, match="explicit http"):
             module["_controlled_store_bind"](invalid)
+
+
+def test_c2_stale_endpoint_cannot_satisfy_candidate_readiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _c2()
+    source_root = module["_candidate_source_root"]()
+    stopped: list[object] = []
+
+    class Process:
+        pid = 4321
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    class Response:
+        def raise_for_status(self) -> None:
+            pass
+
+    globals_ = module["_start_candidate_store"].__globals__
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(globals_["httpx"], "get", lambda *_args, **_kwargs: Response())
+    monkeypatch.setitem(globals_, "_require_unoccupied_store_bind", lambda *_args: None)
+    monkeypatch.setitem(globals_, "_child_owns_store_listener", lambda *_args: False)
+    monkeypatch.setitem(globals_, "_stop_candidate_store", stopped.append)
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+
+    with pytest.raises(RuntimeError, match="not owned by candidate child"):
+        module["_start_candidate_store"](
+            store="http://127.0.0.1:18083",
+            database_url="postgresql://fresh",
+            output_root=output_root,
+            source_root=source_root,
+            environment={"PYTHONPATH": str(source_root)},
+        )
+
+    assert len(stopped) == 1
+
+
+def test_c2_occupied_store_bind_fails_before_child_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _c2()
+
+    class Probe:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_error: object) -> None:
+            pass
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def connect_ex(self, _address: tuple[str, int]) -> int:
+            return 0
+
+    globals_ = module["_require_unoccupied_store_bind"].__globals__
+    monkeypatch.setattr(globals_["socket"], "socket", lambda *_args: Probe())
+
+    with pytest.raises(RuntimeError, match="already occupied"):
+        module["_require_unoccupied_store_bind"]("127.0.0.1", 18083)
 
 
 def test_c2_main_failure_always_stops_candidate_store(
