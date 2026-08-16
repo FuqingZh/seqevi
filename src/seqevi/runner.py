@@ -13,7 +13,7 @@ from ctypes import CDLL, byref, c_int, get_errno
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 
 _WAIT_INTERVAL_SECONDS = 0.05
 _CLEANUP_STUCK_AFTER_SECONDS = 2.0
@@ -385,6 +385,17 @@ class ToolRunner:
         )
         if self.cleanup_observer is None:
             return
+        Thread(
+            target=self._notify_cleanup_observer,
+            args=(observation,),
+            name=f"seqevi-cleanup-observer-{leader_pid}",
+            daemon=True,
+        ).start()
+
+    def _notify_cleanup_observer(self, observation: ToolCleanupStuck) -> None:
+        """Notify operational telemetry without transferring cleanup ownership."""
+
+        assert self.cleanup_observer is not None
         try:
             self.cleanup_observer(observation)
         except Exception:

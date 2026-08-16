@@ -22,8 +22,10 @@ import duckdb
 import httpx
 import psycopg
 from psycopg import sql
+import seqevi.service.persistence as persistence_module
 
 from seqevi.sequence import read_fasta
+from seqevi.service.persistence import PostgresEvidencePersistence
 
 _HARNESS_PATH = Path(__file__).resolve()
 _REQUIRED_THREADS = 64
@@ -46,6 +48,8 @@ _FROZEN_RESULT_IDENTITY = {
         "sha256:77a3d83856104f0bdee2d6016fd7bc6e565e46e638b680ddc4679282e92d9ea6"
     ),
 }
+_OPEN_RECEIPT_RETENTION_SECONDS = 120.0
+_ACTIVE_STORE_PROCESS: subprocess.Popen[bytes] | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -116,6 +120,9 @@ def _candidate_source_root() -> Path:
     package_marker = source_root / "seqevi" / "__init__.py"
     if harness_root != repository_root or not package_marker.is_file():
         raise RuntimeError("C2 harness is not bound to the candidate source tree")
+    persistence_path = Path(cast(str, persistence_module.__file__)).resolve()
+    if not persistence_path.is_relative_to(source_root / "seqevi"):
+        raise RuntimeError("C2 persistence is not imported from candidate source")
     subprocess.check_output(
         ["git", "ls-files", "--error-unmatch", "src/seqevi/__init__.py"],
         cwd=repository_root,
@@ -132,6 +139,138 @@ def _candidate_child_environment(source_root: Path) -> dict[str, str]:
 
 def _child_environment_record(environment: Mapping[str, str]) -> dict[str, str]:
     return {"PYTHONPATH": environment["PYTHONPATH"]}
+
+
+def _preflight_candidate_import(
+    source_root: Path, environment: Mapping[str, str]
+) -> str:
+    repository_root = source_root.parent
+    command = (
+        sys.executable,
+        "-P",
+        "-c",
+        "import pathlib, seqevi; print(pathlib.Path(seqevi.__file__).resolve())",
+    )
+    imported = Path(
+        subprocess.check_output(
+            command,
+            cwd=repository_root,
+            env=dict(environment),
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    ).resolve()
+    if not imported.is_relative_to(source_root / "seqevi"):
+        raise RuntimeError("C2 child preflight imported a non-candidate seqevi")
+    return str(imported)
+
+
+def _controlled_store_bind(store: str) -> tuple[str, int]:
+    parsed = urlsplit(store)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port is None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+    ):
+        raise RuntimeError(
+            "accepted C2 --store must be an explicit http://127.0.0.1:PORT bind"
+        )
+    return parsed.hostname, parsed.port
+
+
+def _start_candidate_store(
+    *,
+    store: str,
+    database_url: str,
+    output_root: Path,
+    source_root: Path,
+    environment: Mapping[str, str],
+) -> tuple[subprocess.Popen[bytes], dict[str, object]]:
+    global _ACTIVE_STORE_PROCESS
+    host, port = _controlled_store_bind(store)
+    artifacts_dir = output_root / "store-artifacts"
+    artifacts_dir.mkdir()
+    command = (
+        sys.executable,
+        "-P",
+        "-m",
+        "seqevi",
+        "serve",
+        "--database-url",
+        database_url,
+        "--artifacts-dir",
+        str(artifacts_dir),
+        "--host",
+        host,
+        "--port",
+        str(port),
+    )
+    stdout_path = output_root / "store.stdout.log"
+    stderr_path = output_root / "store.stderr.log"
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        process = subprocess.Popen(  # noqa: S603
+            command,
+            cwd=source_root.parent,
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+    _ACTIVE_STORE_PROCESS = process
+    deadline = time.monotonic() + 30.0
+    try:
+        while True:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"candidate Store exited {process.returncode} at startup"
+                )
+            try:
+                response = httpx.get(
+                    f"{store.rstrip('/')}/v1/internal/claim-sessions/capabilities",
+                    timeout=1.0,
+                )
+                response.raise_for_status()
+                break
+            except httpx.HTTPError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("candidate Store did not become ready") from None
+                time.sleep(0.1)
+    except BaseException:
+        _stop_candidate_store(process)
+        raise
+    return process, {
+        "source": str(source_root / "seqevi"),
+        "command": list(command),
+        "pid": process.pid,
+        "cwd": str(source_root.parent),
+        "artifacts_dir": str(artifacts_dir),
+        "stopped_and_reaped": False,
+    }
+
+
+def _stop_candidate_store(process: subprocess.Popen[bytes]) -> None:
+    global _ACTIVE_STORE_PROCESS
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+    if _ACTIVE_STORE_PROCESS is process:
+        _ACTIVE_STORE_PROCESS = None
 
 
 def _external_tool_processes(output_root: Path) -> list[int]:
@@ -174,9 +313,11 @@ def _run_command(
     stdout_path: Path,
     stderr_path: Path,
     environment: Mapping[str, str],
+    candidate_source_root: Path,
 ) -> subprocess.Popen[bytes]:
     command = (
         sys.executable,
+        "-P",
         "-m",
         "seqevi",
         "annotate",
@@ -202,6 +343,7 @@ def _run_command(
             stderr=stderr,
             start_new_session=True,
             env=dict(environment),
+            cwd=candidate_source_root.parent,
         )
     finally:
         stdout.close()
@@ -458,6 +600,8 @@ def _database_readback(database_url: str) -> dict[str, object]:
         session_count = scalar(cursor)
         cursor.execute("SELECT count(*) FROM session_claims")
         claim_count = scalar(cursor)
+        cursor.execute("SELECT count(*) FROM claim_session_open_receipts")
+        open_receipt_count = scalar(cursor)
         cursor.execute(
             """
             SELECT count(*)
@@ -477,7 +621,37 @@ def _database_readback(database_url: str) -> dict[str, object]:
         "evidence_contract_identities": evidence_contract_identities,
         "claim_sessions": session_count,
         "session_claims": claim_count,
+        "claim_session_open_receipts": open_receipt_count,
         "missing_artifact_references": missing_artifacts,
+    }
+
+
+def _retention_cleanup(
+    database_url: str, cleanup_wait_seconds: float
+) -> dict[str, object]:
+    if cleanup_wait_seconds <= _OPEN_RECEIPT_RETENTION_SECONDS:
+        raise RuntimeError(
+            "accepted C2 cleanup wait must exceed the 120-second receipt retention"
+        )
+    wait_started = time.monotonic()
+    time.sleep(cleanup_wait_seconds)
+    persistence = PostgresEvidencePersistence.open(database_url)
+    sweep_calls = 0
+    try:
+        while persistence.sweep_claim_sessions():
+            sweep_calls += 1
+    finally:
+        persistence.close()
+    return {
+        "required_retention_seconds": _OPEN_RECEIPT_RETENTION_SECONDS,
+        "configured_wait_seconds": cleanup_wait_seconds,
+        "observed_wait_seconds": time.monotonic() - wait_started,
+        "sweep_calls_returning_work": sweep_calls,
+        "persistence_source": str(
+            Path(
+                cast(str, sys.modules[PostgresEvidencePersistence.__module__].__file__)
+            ).resolve()
+        ),
     }
 
 
@@ -497,13 +671,15 @@ def _validate_database_acceptance(
             "evidence_contract_identities": [_FROZEN_RESULT_IDENTITY],
             "claim_sessions": 0,
             "session_claims": 0,
+            "claim_session_open_receipts": 0,
             "missing_artifact_references": 0,
         }
     ):
         raise RuntimeError("C2 database readback did not satisfy acceptance")
 
 
-def main() -> None:
+def _main() -> None:
+    global _ACTIVE_STORE_PROCESS
     parser = argparse.ArgumentParser()
     parser.add_argument("--blf", type=Path, required=True)
     parser.add_argument("--uniprot", type=Path, required=True)
@@ -512,7 +688,7 @@ def main() -> None:
     parser.add_argument("--database-url", required=True)
     parser.add_argument("--threads", type=int, default=64)
     parser.add_argument("--output-root", type=Path, required=True)
-    parser.add_argument("--cleanup-wait-seconds", type=float, default=61.0)
+    parser.add_argument("--cleanup-wait-seconds", type=float, default=121.0)
     args = parser.parse_args()
     try:
         _validate_threads(args.threads)
@@ -524,6 +700,9 @@ def main() -> None:
     source_head = _candidate_head()
     candidate_source_root = _candidate_source_root()
     child_environment = _candidate_child_environment(candidate_source_root)
+    candidate_import = _preflight_candidate_import(
+        candidate_source_root, child_environment
+    )
 
     input_paths = {"blf": args.blf, "uniprot": args.uniprot}
     input_sha256 = _validate_frozen_inputs(input_paths)
@@ -535,10 +714,18 @@ def main() -> None:
     if not uniprot_ids < blf_ids or len(blf_ids | uniprot_ids) != 9116:
         raise RuntimeError("frozen C2 overlap/subset contract is not satisfied")
 
+    args.output_root.mkdir(parents=True)
+    store_process, store_service = _start_candidate_store(
+        store=args.store,
+        database_url=args.database_url,
+        output_root=args.output_root,
+        source_root=candidate_source_root,
+        environment=child_environment,
+    )
+    _ACTIVE_STORE_PROCESS = store_process
     store_binding_probe = _validate_store_database_binding(
         args.store, args.database_url
     )
-    args.output_root.mkdir(parents=True)
     initial_started = time.perf_counter()
     processes = {}
     try:
@@ -554,6 +741,7 @@ def main() -> None:
                 stdout_path=root / "stdout.json",
                 stderr_path=root / "stderr.log",
                 environment=child_environment,
+                candidate_source_root=candidate_source_root,
             )
     except BaseException:
         _stop_and_reap(processes)
@@ -592,6 +780,7 @@ def main() -> None:
             stdout_path=root / "stdout.json",
             stderr_path=root / "stderr.log",
             environment=child_environment,
+            candidate_source_root=candidate_source_root,
         )
         try:
             return_code = process.wait()
@@ -609,8 +798,10 @@ def main() -> None:
     }
     replay_elapsed = time.perf_counter() - replay_started
 
-    if args.cleanup_wait_seconds > 0:
-        time.sleep(args.cleanup_wait_seconds)
+    _stop_candidate_store(store_process)
+    _ACTIVE_STORE_PROCESS = None
+    store_service["stopped_and_reaped"] = True
+    retention_cleanup = _retention_cleanup(args.database_url, args.cleanup_wait_seconds)
     final_readback = _database_readback(args.database_url)
     expected_replay = {"blf": 9116, "uniprot": 9115}
     initial_reuse = [_reuse_counts(result) for result in initial_results.values()]
@@ -640,6 +831,8 @@ def main() -> None:
         "profile": args.profile,
         "threads_per_process": args.threads,
         "annotation_child_environment": _child_environment_record(child_environment),
+        "annotation_candidate_import": candidate_import,
+        "store_service": store_service,
         "store_binding_probe_open_request_id": store_binding_probe,
         "inputs": {
             "blf": {
@@ -663,6 +856,7 @@ def main() -> None:
         "replay_result_identity": replay_identity,
         "replay_elapsed_seconds": replay_elapsed,
         "cleanup_wait_seconds": args.cleanup_wait_seconds,
+        "retention_cleanup": retention_cleanup,
         "finalized_existing_outputs": False,
         "remaining_external_tool_processes": external_tool_processes,
         "final_database": final_readback,
@@ -672,6 +866,17 @@ def main() -> None:
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(report, sort_keys=True))
+
+
+def main() -> None:
+    try:
+        _main()
+    finally:
+        global _ACTIVE_STORE_PROCESS
+        if _ACTIVE_STORE_PROCESS is not None:
+            process = _ACTIVE_STORE_PROCESS
+            _ACTIVE_STORE_PROCESS = None
+            _stop_candidate_store(process)
 
 
 if __name__ == "__main__":

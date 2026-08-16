@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import platform
+import subprocess
 import threading
 import time
 from collections import defaultdict
@@ -19,6 +20,7 @@ from uuid import uuid4
 
 import psycopg
 from sqlalchemy import event, text
+import seqevi.service.persistence as persistence_module
 
 from seqevi.evidence import (
     ClaimDisposition,
@@ -50,6 +52,7 @@ _PHASE_SQL_PER_OPERATION = {
 }
 _OPERATION_DEADLINE_SECONDS = 5.0
 _REQUIRED_COUNTS = (100, 1000, 3000, 9116)
+_HARNESS_PATH = Path(__file__).resolve()
 
 
 def _records_sweep_delete_rows(phase: str) -> bool:
@@ -62,11 +65,14 @@ def _validate_counts(counts: list[int]) -> None:
 
 
 def _candidate_head() -> str:
+    repository_root = _candidate_repository_root()
     dirty = (
         __import__("subprocess")
         .check_output(
             [
                 "git",
+                "-C",
+                str(repository_root),
                 "status",
                 "--porcelain",
                 "--untracked-files=all",
@@ -82,9 +88,44 @@ def _candidate_head() -> str:
         raise RuntimeError("pressure requires committed source and benchmark harnesses")
     return (
         __import__("subprocess")
-        .check_output(["git", "rev-parse", "HEAD"], text=True)
+        .check_output(
+            ["git", "-C", str(repository_root), "rev-parse", "HEAD"], text=True
+        )
         .strip()
     )
+
+
+def _candidate_repository_root() -> Path:
+    harness_root = _HARNESS_PATH.parents[1]
+    repository_root = Path(
+        __import__("subprocess")
+        .check_output(
+            ["git", "-C", str(harness_root), "rev-parse", "--show-toplevel"],
+            text=True,
+        )
+        .strip()
+    ).resolve()
+    source_root = repository_root / "src"
+    imported = Path(cast(str, persistence_module.__file__)).resolve()
+    if repository_root != harness_root or not imported.is_relative_to(
+        source_root / "seqevi"
+    ):
+        raise RuntimeError("pressure harness is not bound to candidate persistence")
+    tracked = subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(repository_root),
+            "ls-files",
+            "--error-unmatch",
+            str(imported.relative_to(repository_root)),
+        ],
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).strip()
+    if not tracked:
+        raise RuntimeError("pressure persistence source is not tracked")
+    return repository_root
 
 
 def _sequence(index: int) -> str:

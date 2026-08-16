@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import runpy
 import signal
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
@@ -115,6 +116,55 @@ def test_c2_child_environment_overrides_stale_pythonpath(
     }
 
 
+def test_c2_preflight_ignores_cwd_shadow_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _c2()
+    shadow = tmp_path / "seqevi"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("SHADOW = True\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    source_root = module["_candidate_source_root"]()
+    environment = module["_candidate_child_environment"](source_root)
+
+    imported = Path(module["_preflight_candidate_import"](source_root, environment))
+
+    assert imported.is_relative_to(source_root / "seqevi")
+    assert not imported.is_relative_to(shadow)
+
+
+def test_c2_annotation_child_uses_safe_candidate_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _c2()
+    source_root = module["_candidate_source_root"]()
+    observed: dict[str, object] = {}
+
+    class Process:
+        pass
+
+    def popen(command: tuple[str, ...], **kwargs: object) -> Process:
+        observed.update(command=command, **kwargs)
+        return Process()
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    module["_run_command"](
+        fasta=tmp_path / "input.fasta",
+        output=tmp_path / "result.duckdb",
+        profile="eggnog-5.0.2",
+        store="http://127.0.0.1:8000",
+        threads=64,
+        stdout_path=tmp_path / "stdout.json",
+        stderr_path=tmp_path / "stderr.log",
+        environment={"PYTHONPATH": str(source_root)},
+        candidate_source_root=source_root,
+    )
+
+    assert cast(tuple[str, ...], observed["command"])[1:3] == ("-P", "-m")
+    assert observed["cwd"] == source_root.parent
+    assert cast(dict[str, str], observed["env"])["PYTHONPATH"] == str(source_root)
+
+
 def test_pressure_listener_includes_final_cleanup_deletes() -> None:
     module = cast(
         dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
@@ -134,6 +184,23 @@ def test_pressure_counts_are_frozen_for_acceptance() -> None:
     for counts in ([100], [100, 1000, 3000], [100, 1000, 3000, 9117]):
         with pytest.raises(ValueError, match="requires counts"):
             validate(counts)
+
+
+def test_pressure_candidate_root_rejects_stale_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = cast(
+        dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
+    )
+    globals_ = module["_candidate_repository_root"].__globals__
+    monkeypatch.setattr(
+        globals_["persistence_module"],
+        "__file__",
+        str(tmp_path / "persistence.py"),
+    )
+
+    with pytest.raises(RuntimeError, match="not bound to candidate persistence"):
+        module["_candidate_repository_root"]()
 
 
 def test_c2_result_identity_is_frozen_fail_closed(tmp_path: Path) -> None:
@@ -180,6 +247,7 @@ def test_c2_store_metadata_identity_is_frozen_fail_closed() -> None:
         **after_initial,
         "claim_sessions": 0,
         "session_claims": 0,
+        "claim_session_open_receipts": 0,
         "missing_artifact_references": 0,
     }
     module["_validate_database_acceptance"](after_initial, final, digest)
@@ -189,6 +257,43 @@ def test_c2_store_metadata_identity_is_frozen_fail_closed() -> None:
     ]
     with pytest.raises(RuntimeError, match="database readback"):
         module["_validate_database_acceptance"](after_initial, wrong, digest)
+
+    residual = deepcopy(final)
+    residual["claim_session_open_receipts"] = 1
+    with pytest.raises(RuntimeError, match="database readback"):
+        module["_validate_database_acceptance"](after_initial, residual, digest)
+
+
+def test_c2_retention_cleanup_waits_then_uses_candidate_sweeper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _c2()
+    events: list[object] = []
+
+    class Persistence:
+        outcomes = iter((1, 0))
+
+        def sweep_claim_sessions(self) -> int:
+            events.append("sweep")
+            return next(self.outcomes)
+
+        def close(self) -> None:
+            events.append("close")
+
+    globals_ = module["_retention_cleanup"].__globals__
+    monkeypatch.setattr(
+        globals_["PostgresEvidencePersistence"],
+        "open",
+        staticmethod(lambda _url: Persistence()),
+    )
+    monkeypatch.setattr(globals_["time"], "sleep", lambda value: events.append(value))
+
+    evidence = module["_retention_cleanup"]("postgresql://db", 121.0)
+
+    assert events == [121.0, "sweep", "sweep", "close"]
+    assert evidence["sweep_calls_returning_work"] == 1
+    with pytest.raises(RuntimeError, match="120-second"):
+        module["_retention_cleanup"]("postgresql://db", 120.0)
 
 
 def test_c2_external_process_inspection_ambiguity_fails_closed(
@@ -304,6 +409,81 @@ def test_c2_store_binding_requires_fresh_matching_shared_database(
         module["_validate_store_database_binding"](
             "http://store", "postgresql://database"
         )
+
+
+def test_c2_candidate_store_is_loopback_candidate_and_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _c2()
+    source_root = module["_candidate_source_root"]()
+    observed: dict[str, object] = {}
+
+    class Process:
+        pid = 4321
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> int:
+            observed.setdefault("waits", []).append(timeout)  # type: ignore[union-attr]
+            return 0
+
+    class Response:
+        def raise_for_status(self) -> None:
+            pass
+
+    def popen(command: tuple[str, ...], **kwargs: object) -> Process:
+        observed.update(command=command, **kwargs)
+        return Process()
+
+    globals_ = module["_start_candidate_store"].__globals__
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(globals_["httpx"], "get", lambda *_args, **_kwargs: Response())
+    signalled: list[tuple[int, signal.Signals]] = []
+    monkeypatch.setattr("os.killpg", lambda pid, sent: signalled.append((pid, sent)))
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+
+    process, record = module["_start_candidate_store"](
+        store="http://127.0.0.1:18083",
+        database_url="postgresql://fresh",
+        output_root=output_root,
+        source_root=source_root,
+        environment={"PYTHONPATH": str(source_root)},
+    )
+    module["_stop_candidate_store"](process)
+
+    command = cast(tuple[str, ...], observed["command"])
+    assert command[1:4] == ("-P", "-m", "seqevi")
+    assert command[4] == "serve"
+    assert observed["cwd"] == source_root.parent
+    assert record["pid"] == 4321
+    assert record["source"] == str(source_root / "seqevi")
+    assert signalled == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
+    for invalid in ("http://store:8000", "https://127.0.0.1:8000", "/tmp/store"):
+        with pytest.raises(RuntimeError, match="explicit http"):
+            module["_controlled_store_bind"](invalid)
+
+
+def test_c2_main_failure_always_stops_candidate_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _c2()
+    globals_ = module["main"].__globals__
+    process = object()
+    stopped: list[object] = []
+    monkeypatch.setitem(globals_, "_ACTIVE_STORE_PROCESS", process)
+    monkeypatch.setitem(
+        globals_, "_main", lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+    )
+    monkeypatch.setitem(globals_, "_stop_candidate_store", stopped.append)
+
+    with pytest.raises(KeyboardInterrupt):
+        module["main"]()
+
+    assert stopped == [process]
+    assert globals_["_ACTIVE_STORE_PROCESS"] is None
 
 
 def test_c2_binding_probe_removes_exact_closed_zero_receipt(

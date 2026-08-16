@@ -606,3 +606,25 @@ def test_cleanup_stuck_remains_synchronously_owned_until_clean(
     assert observed_at[0] - forced_at[0] >= 0.05
     assert observed[0].members == ((observed[0].leader_pid, "D"),)
     assert release.is_set()
+
+
+def test_blocking_cleanup_observer_does_not_block_containment_dispatch(
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def observe(_stuck) -> None:
+        entered.set()
+        release.wait()
+
+    runner = runner_module.ToolRunner(cleanup_observer=observe)
+    started = time.monotonic()
+    runner._report_cleanup_stuck(  # pyright: ignore[reportPrivateUsage]
+        command(tmp_path, "pass"), 123, ()
+    )
+
+    assert entered.wait(1.0)
+    assert time.monotonic() - started < 1.0
+    assert not release.is_set()
+    release.set()
