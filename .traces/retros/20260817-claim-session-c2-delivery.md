@@ -63,9 +63,10 @@ hours.
 review convergence rather than the accepted C2 runtime itself.
 
 **Rule To Carry Forward:** Evidence-only successors must preserve mechanically
-identifiable code, harness, and input lineage. When those identities are
-unchanged, do not repeat an expensive acceptance run merely to attach it to a
-later documentation SHA.
+identifiable code, harness, input, ToolRuntimeDigest, ResourceID, and semantic
+parameters. When that complete frozen execution identity is unchanged, do not
+repeat an expensive acceptance run merely to attach it to a later documentation
+SHA.
 
 ## Promoted Authority
 

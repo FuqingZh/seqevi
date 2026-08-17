@@ -40,8 +40,9 @@
   architecture document.
 - Shared-store changes must be tested against PostgreSQL as well as SQLite.
 - Evidence-only successors must preserve mechanically identifiable code,
-  harness, and input lineage. Do not repeat an expensive acceptance gate when
-  those identities are unchanged.
+  harness, input, ToolRuntimeDigest, ResourceID, and semantic-parameter
+  lineage. Do not repeat an expensive acceptance gate when that complete
+  frozen execution identity is unchanged.
 
 ## AO Delivery
 
