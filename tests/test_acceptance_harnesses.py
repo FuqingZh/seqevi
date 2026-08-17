@@ -461,6 +461,9 @@ def test_c2_candidate_store_is_loopback_candidate_and_reaped(
     monkeypatch.setattr(globals_["httpx"], "get", lambda *_args, **_kwargs: Response())
     monkeypatch.setitem(globals_, "_require_unoccupied_store_bind", lambda *_args: None)
     monkeypatch.setitem(globals_, "_child_owns_store_listener", lambda *_args: True)
+    monkeypatch.setitem(
+        globals_, "_store_leader_exited_without_reap", lambda _pid: True
+    )
     signalled: list[tuple[int, signal.Signals]] = []
     monkeypatch.setattr("os.killpg", lambda pid, sent: signalled.append((pid, sent)))
     output_root = tmp_path / "evidence"
@@ -483,7 +486,7 @@ def test_c2_candidate_store_is_loopback_candidate_and_reaped(
     assert record["source"] == str(source_root / "seqevi")
     assert "secret" not in str(record)
     assert cast(list[str], record["command"])[6] == "<redacted>"
-    assert signalled == [(4321, signal.SIGTERM)]
+    assert signalled == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
     for invalid in ("http://store:8000", "https://127.0.0.1:8000", "/tmp/store"):
         with pytest.raises(RuntimeError, match="explicit http"):
             module["_controlled_store_bind"](invalid)
@@ -573,7 +576,7 @@ def test_c2_main_failure_always_stops_candidate_store(
     assert globals_["_ACTIVE_STORE_PROCESS"] is None
 
 
-def test_c2_store_timeout_kills_group_before_reaping(
+def test_c2_store_normal_leader_exit_fences_surviving_group_before_reap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _c2()
@@ -581,18 +584,19 @@ def test_c2_store_timeout_kills_group_before_reaping(
 
     class Process:
         pid = 4321
+        returncode = None
 
         @staticmethod
-        def poll() -> None:
-            return None
-
-        @staticmethod
-        def wait(timeout: float | None = None) -> int:
-            events.append(("wait", timeout))
-            if timeout is not None:
-                raise subprocess.TimeoutExpired("store", timeout)
+        def wait() -> int:
+            events.append("reap-leader")
             return 0
 
+    globals_ = module["_stop_candidate_store"].__globals__
+    monkeypatch.setitem(
+        globals_,
+        "_store_leader_exited_without_reap",
+        lambda pid: events.append(("observe-exited-without-reap", pid)) or True,
+    )
     monkeypatch.setattr(
         "os.killpg", lambda pid, sent: events.append(("signal", pid, sent))
     )
@@ -601,10 +605,36 @@ def test_c2_store_timeout_kills_group_before_reaping(
 
     assert events == [
         ("signal", 4321, signal.SIGTERM),
-        ("wait", 5.0),
+        ("observe-exited-without-reap", 4321),
         ("signal", 4321, signal.SIGKILL),
-        ("wait", None),
+        "reap-leader",
     ]
+
+
+def test_c2_store_group_fence_never_runs_after_leader_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _c2()
+    events: list[str] = []
+
+    class Process:
+        pid = 4321
+        returncode = None
+
+        @staticmethod
+        def wait() -> int:
+            events.append("reap")
+            return 0
+
+    globals_ = module["_stop_candidate_store"].__globals__
+    monkeypatch.setitem(
+        globals_, "_store_leader_exited_without_reap", lambda _pid: True
+    )
+    monkeypatch.setattr("os.killpg", lambda _pid, sent: events.append(sent.name))
+
+    module["_stop_candidate_store"](Process())
+
+    assert events == ["SIGTERM", "SIGKILL", "reap"]
 
 
 def test_c2_binding_probe_removes_exact_closed_zero_receipt(

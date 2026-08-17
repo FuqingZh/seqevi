@@ -313,21 +313,37 @@ def _start_candidate_store(
 
 def _stop_candidate_store(process: subprocess.Popen[bytes]) -> None:
     global _ACTIVE_STORE_PROCESS
-    if process.poll() is None:
+    if process.returncode is None:
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+        grace_deadline = time.monotonic() + 5.0
+        while not _store_leader_exited_without_reap(process.pid):
+            if time.monotonic() >= grace_deadline:
+                break
+            time.sleep(0.05)
         try:
-            process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
     if _ACTIVE_STORE_PROCESS is process:
         _ACTIVE_STORE_PROCESS = None
+
+
+def _store_leader_exited_without_reap(pid: int) -> bool:
+    try:
+        observed = os.waitid(
+            os.P_PID,
+            pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except ChildProcessError as error:
+        raise RuntimeError(
+            "candidate Store leader ownership was lost before group fence"
+        ) from error
+    return observed is not None
 
 
 def _external_tool_processes(output_root: Path) -> list[int]:
