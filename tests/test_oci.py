@@ -197,6 +197,7 @@ def test_managed_annotation_mounts_are_narrow_and_ephemeral(
 
     assert output.is_file()
     assert result.summary.output_dir == output
+    assert result.summary.metrics.existing_finalizations == 0
     create = next(call for call in calls if call[0] == "create")
     assert create[create.index("--network") + 1] == "none"
     assert create[create.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"

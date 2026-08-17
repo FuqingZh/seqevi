@@ -277,6 +277,7 @@ def test_annotate_cli_json_reports_result_and_metrics(
         "hits": 1,
         "no_hits": 0,
     }
+    assert payload["metrics"]["existing_finalizations"] == 0
     assert payload["output"].endswith("output.duckdb")
 
 

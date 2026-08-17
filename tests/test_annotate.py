@@ -14,6 +14,7 @@ from seqevi.annotate import run_annotation
 from seqevi.errors import (
     AdapterError,
     AnnotationError,
+    EvidenceClaimLostError,
     FastaValidationError,
 )
 from seqevi.evidence import (
@@ -25,6 +26,7 @@ from seqevi.evidence import (
     FetchedEvidence,
 )
 from seqevi.sequence import identify_protein_sequence
+from seqevi.runner import ToolCommand
 from seqevi.store import ClaimSession, LocalStore
 
 from .support import (
@@ -158,6 +160,145 @@ class _RecordingThreadsAdapter:
         assert isinstance(threads, int)
         self.threads.append(threads)
         return self.delegate.run_batch(**kwargs)  # type: ignore[arg-type]
+
+
+class _SlowToolAdapter:
+    def __init__(self, delegate: FixtureAdapter) -> None:
+        self.contract = delegate.contract
+        self.evidence_schema = delegate.evidence_schema
+
+    def run_batch(self, **kwargs: object) -> AdapterBatchResult:
+        work_dir = kwargs["work_dir"]
+        runner = kwargs["runner"]
+        assert isinstance(work_dir, Path)
+        runner.run(  # type: ignore[union-attr]
+            ToolCommand(
+                arguments=(
+                    __import__("sys").executable,
+                    "-c",
+                    "import time; time.sleep(10)",
+                ),
+                working_dir=work_dir,
+                stdout_path=work_dir / "slow.stdout",
+                stderr_path=work_dir / "slow.stderr",
+            )
+        )
+        raise AssertionError("cancelled tool unexpectedly returned")
+
+
+class _AuthorityLosingStore(_CountingStore):
+    def __init__(self, delegate: LocalStore) -> None:
+        super().__init__(delegate)
+        self.finalize_calls = 0
+
+    def claim_session(self) -> ClaimSession:
+        delegate = self.delegate.claim_session()
+        owner = self
+
+        class AuthorityLosingSession:
+            def __init__(self) -> None:
+                self.cancellation_signal = threading.Event()
+                self.lost: BaseException | None = None
+                self.timer: threading.Timer | None = None
+
+            def __enter__(self):
+                delegate.__enter__()
+                return self
+
+            def __exit__(self, *_error):
+                if self.timer is not None:
+                    self.timer.cancel()
+                return delegate.__exit__(*_error)
+
+            def acquire_many(self, queries):
+                acquired = delegate.acquire_many(queries)
+
+                def lose_authority() -> None:
+                    self.lost = RuntimeError("injected renewal exhaustion")
+                    self.cancellation_signal.set()
+
+                self.timer = threading.Timer(0.1, lose_authority)
+                self.timer.start()
+                return acquired
+
+            def raise_if_lost(self) -> None:
+                if self.lost is not None:
+                    raise EvidenceClaimLostError(
+                        "ClaimSession authority was lost"
+                    ) from self.lost
+                delegate.raise_if_lost()
+
+            def finalize_many(self, commits):
+                owner.finalize_calls += 1
+                return delegate.finalize_many(commits)
+
+            def __getattr__(self, name):
+                return getattr(delegate, name)
+
+        return AuthorityLosingSession()  # type: ignore[return-value]
+
+
+class _ManualAuthorityLosingStore(_CountingStore):
+    def __init__(self, delegate: LocalStore) -> None:
+        super().__init__(delegate)
+        self.lost = threading.Event()
+
+    def lose_authority(self) -> None:
+        self.lost.set()
+
+    def claim_session(self) -> ClaimSession:
+        delegate = self.delegate.claim_session()
+        owner = self
+
+        class ManualSession:
+            cancellation_signal = owner.lost
+
+            def __enter__(self):
+                delegate.__enter__()
+                return self
+
+            def __exit__(self, *_error):
+                return delegate.__exit__(*_error)
+
+            def raise_if_lost(self) -> None:
+                if owner.lost.is_set():
+                    raise EvidenceClaimLostError("injected packaging authority loss")
+                delegate.raise_if_lost()
+
+            def __getattr__(self, name):
+                return getattr(delegate, name)
+
+        return ManualSession()  # type: ignore[return-value]
+
+
+class _CloseAuthorityLosingStore(_CountingStore):
+    def claim_session(self) -> ClaimSession:
+        delegate = self.delegate.claim_session()
+
+        class CloseLosingSession:
+            cancellation_signal = delegate.cancellation_signal
+
+            def __init__(self) -> None:
+                self.lost = False
+
+            def __enter__(self):
+                delegate.__enter__()
+                return self
+
+            def __exit__(self, *_error):
+                result = delegate.__exit__(*_error)
+                self.lost = True
+                return result
+
+            def raise_if_lost(self) -> None:
+                if self.lost:
+                    raise EvidenceClaimLostError("injected close authority loss")
+                delegate.raise_if_lost()
+
+            def __getattr__(self, name):
+                return getattr(delegate, name)
+
+        return CloseLosingSession()  # type: ignore[return-value]
 
 
 class _ConcurrentRecordingAdapter:
@@ -509,6 +650,7 @@ def test_annotation_classifies_finalize_peer_winner_as_cache_hit(
 
     assert summary.cache_hits == 1
     assert summary.computed == 0
+    assert summary.metrics.existing_finalizations == 1
     assert read_result_table(summary.output_dir, "main.sequence_map").get_column(
         "EvidenceSource"
     ).to_list() == ["cache"]
@@ -551,6 +693,150 @@ def test_cancellation_stops_renewal_and_releases_active_claims(
 
     assert reacquired is not None
     assert reacquired.generation == 2
+
+
+def test_claim_authority_loss_cancels_tool_before_finalize(tmp_path: Path) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    delegate = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+
+    with LocalStore.open(tmp_path / "store") as local:
+        store = _AuthorityLosingStore(local)
+        started = __import__("time").monotonic()
+        with pytest.raises(AnnotationError) as raised:
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=tmp_path / "output",
+                adapter=_SlowToolAdapter(delegate),
+                store=store,
+                runner=annotate_module.ToolRunner(termination_grace_seconds=0.1),
+            )
+        cancellation_elapsed = __import__("time").monotonic() - started
+
+    assert isinstance(raised.value.__cause__, EvidenceClaimLostError)
+    assert cancellation_elapsed < 1.0
+    assert store.finalize_calls == 0
+
+
+def test_claim_authority_loss_during_packaging_never_publishes_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    original_materialize = annotate_module.materialize_result_database
+
+    with LocalStore.open(tmp_path / "store") as local:
+        store = _ManualAuthorityLosingStore(local)
+
+        def materialize(**kwargs: object) -> None:
+            original_materialize(**kwargs)  # type: ignore[arg-type]
+            store.lose_authority()
+
+        monkeypatch.setattr(annotate_module, "materialize_result_database", materialize)
+        output = tmp_path / "output.duckdb"
+        with pytest.raises(AnnotationError) as raised:
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=output,
+                adapter=adapter,
+                store=store,
+            )
+
+    assert isinstance(raised.value.__cause__, EvidenceClaimLostError)
+    assert not output.exists()
+
+
+def test_atomic_publish_never_replaces_or_deletes_concurrent_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    output = tmp_path / "output.duckdb"
+    original_link = annotate_module.os.link
+
+    def publish_after_other_invocation(source: Path, target: Path) -> None:
+        if Path(target) != output:
+            original_link(source, target)
+            return
+        Path(target).write_bytes(b"concurrent-winner")
+        original_link(source, target)
+
+    monkeypatch.setattr(annotate_module.os, "link", publish_after_other_invocation)
+    with LocalStore.open(tmp_path / "store") as store:
+        with pytest.raises(AnnotationError):
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=output,
+                adapter=adapter,
+                store=store,
+            )
+
+    assert output.read_bytes() == b"concurrent-winner"
+
+
+def test_interrupt_immediately_after_link_removes_only_owned_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    output = tmp_path / "output.duckdb"
+    original_link = annotate_module.os.link
+
+    def link_then_interrupt(source: Path, target: Path) -> None:
+        original_link(source, target)
+        if Path(target) == output:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(annotate_module.os, "link", link_then_interrupt)
+    with LocalStore.open(tmp_path / "store") as store:
+        with pytest.raises(KeyboardInterrupt):
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=output,
+                adapter=adapter,
+                store=store,
+            )
+
+    assert not output.exists()
+
+
+def test_claim_authority_loss_during_close_never_returns_success(
+    tmp_path: Path,
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+
+    with LocalStore.open(tmp_path / "store") as local:
+        output = tmp_path / "output.duckdb"
+        with pytest.raises(AnnotationError) as raised:
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=output,
+                adapter=adapter,
+                store=_CloseAuthorityLosingStore(local),
+            )
+
+    assert isinstance(raised.value.__cause__, EvidenceClaimLostError)
+    assert not output.exists()
 
 
 def test_annotation_preserves_primary_failure_when_session_close_also_fails(

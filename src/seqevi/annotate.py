@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -25,7 +27,7 @@ from .evidence import (
     EvidenceStatus,
 )
 from .result import RESULT_FORMAT_VERSION, materialize_result_database
-from .runner import ToolCommand, ToolRunResult, ToolRunner
+from .runner import ToolCancelledError, ToolCommand, ToolRunResult, ToolRunner
 from .sequence import (
     SequenceIdentity,
     iter_staged_identities,
@@ -46,7 +48,12 @@ _CLAIM_RUNWAY_SECONDS = 5.0
 
 @dataclass(frozen=True, slots=True)
 class AnnotationMetrics:
-    """Operational measurements for one successful annotation invocation."""
+    """Operational measurements for one successful annotation invocation.
+
+    ``existing_finalizations`` counts proposed terminal records that a
+    ClaimSession resolved to immutable evidence already finalized by a peer.
+    It is observational and does not change computed/cache provenance.
+    """
 
     elapsed_seconds: float
     fasta_staging_seconds: float
@@ -63,6 +70,7 @@ class AnnotationMetrics:
     tool_batches: int
     unique_artifact_reads: int
     configured_threads: int
+    existing_finalizations: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +93,18 @@ class _BatchMetrics:
     adapter_seconds: float
     store_commit_seconds: float
     peer_completed_sequence_ids: frozenset[str] = frozenset()
+    existing_finalizations: int = 0
 
 
 class _MeasuringToolRunner(ToolRunner):
-    def __init__(self, delegate: ToolRunner) -> None:
+    def __init__(
+        self,
+        delegate: ToolRunner,
+        *,
+        cancellation_signal: threading.Event | None = None,
+    ) -> None:
         self.delegate = delegate
+        self.cancellation_signal = cancellation_signal
         self.duration_seconds = 0.0
 
     def run(
@@ -97,8 +112,13 @@ class _MeasuringToolRunner(ToolRunner):
         command: ToolCommand,
         *,
         timeout_seconds: float | None = None,
+        cancellation_signal: threading.Event | None = None,
     ) -> ToolRunResult:
-        result = self.delegate.run(command, timeout_seconds=timeout_seconds)
+        result = self.delegate.run(
+            command,
+            timeout_seconds=timeout_seconds,
+            cancellation_signal=cancellation_signal or self.cancellation_signal,
+        )
         self.duration_seconds += result.duration_seconds
         return result
 
@@ -146,8 +166,27 @@ def run_annotation(
     store_lookup_seconds = 0.0
     adapter_seconds = 0.0
     store_commit_seconds = 0.0
+    existing_finalizations = 0
     claim_session: ClaimSession | None = None
     primary_failure: BaseException | None = None
+    close_failure: BaseException | None = None
+    published_output_identity: tuple[int, int] | None = None
+    published_output_marker: Path | None = None
+
+    def unlink_owned_output() -> None:
+        if published_output_identity is None or published_output_marker is None:
+            return
+        try:
+            current = output_dir.stat(follow_symlinks=False)
+            marker = published_output_marker.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino) == published_output_identity and (
+            marker.st_dev,
+            marker.st_ino,
+        ) == published_output_identity:
+            output_dir.unlink()
+
     try:
         keys_by_sequence_id = {}
         computed_ids: set[str] = set()
@@ -156,7 +195,12 @@ def run_annotation(
         busy_retry_after: float | None = None
         if is_claim_session_capable_store(store):
             claim_session = store.claim_session().__enter__()
-        tool_runner = _MeasuringToolRunner(runner or ToolRunner())
+        tool_runner = _MeasuringToolRunner(
+            runner or ToolRunner(),
+            cancellation_signal=(
+                claim_session.cancellation_signal if claim_session is not None else None
+            ),
+        )
 
         for identity_batch in batched(iter_staged_identities(stage), _STORE_BATCH_SIZE):
             queries = tuple(
@@ -219,6 +263,7 @@ def run_annotation(
                 commit_batches += batch_metrics.commit_batches
                 adapter_seconds += batch_metrics.adapter_seconds
                 store_commit_seconds += batch_metrics.store_commit_seconds
+                existing_finalizations += batch_metrics.existing_finalizations
                 computed_ids.difference_update(
                     batch_metrics.peer_completed_sequence_ids
                 )
@@ -240,6 +285,7 @@ def run_annotation(
             commit_batches += batch_metrics.commit_batches
             adapter_seconds += batch_metrics.adapter_seconds
             store_commit_seconds += batch_metrics.store_commit_seconds
+            existing_finalizations += batch_metrics.existing_finalizations
             computed_ids.difference_update(batch_metrics.peer_completed_sequence_ids)
 
         while busy_queries:
@@ -286,15 +332,20 @@ def run_annotation(
                 commit_batches += batch_metrics.commit_batches
                 adapter_seconds += batch_metrics.adapter_seconds
                 store_commit_seconds += batch_metrics.store_commit_seconds
+                existing_finalizations += batch_metrics.existing_finalizations
                 computed_ids.difference_update(
                     batch_metrics.peer_completed_sequence_ids
                 )
             busy_queries = next_busy
             busy_retry_after = next_retry_after
 
+        if claim_session is not None:
+            claim_session.raise_if_lost()
         fetch_started = time.perf_counter()
         fetched_by_key = store.fetch_many(keys_by_sequence_id.values())
         store_fetch_seconds = time.perf_counter() - fetch_started
+        if claim_session is not None:
+            claim_session.raise_if_lost()
         missing_keys = set(keys_by_sequence_id.values()) - fetched_by_key.keys()
         if missing_keys:
             raise AnnotationError(
@@ -321,8 +372,17 @@ def run_annotation(
         metadata = dict(result_metadata or _default_result_metadata(adapter))
         metadata["InputDigest"] = stage.input_digest
         metadata.setdefault("CreatedAt", datetime.now(UTC).isoformat())
+        package_output = (
+            work_dir / "candidate-result.duckdb"
+            if claim_session is not None
+            else output_dir
+        )
+        if claim_session is not None:
+            claim_session.raise_if_lost()
+            if output_dir.exists():
+                raise AnnotationError(f"output path already exists: {output_dir}")
         materialize_result_database(
-            output_path=output_dir,
+            output_path=package_output,
             records=iter_staged_records(stage),
             input_record_count=stage.input_records,
             fetched_by_sequence_id=fetched_by_sequence_id,
@@ -338,8 +398,20 @@ def run_annotation(
                 "computed": len(computed_ids),
                 "hits": statuses.count(EvidenceStatus.HIT),
                 "no_hits": statuses.count(EvidenceStatus.NO_HIT),
+                "existing_finalizations": existing_finalizations,
             },
         )
+        if claim_session is not None:
+            try:
+                claim_session.raise_if_lost()
+                candidate = package_output.stat(follow_symlinks=False)
+                published_output_identity = (candidate.st_dev, candidate.st_ino)
+                published_output_marker = package_output
+                os.link(package_output, output_dir)
+                claim_session.raise_if_lost()
+            except BaseException:
+                unlink_owned_output()
+                raise
         package_seconds = time.perf_counter() - package_started
     except BaseException as error:
         primary_failure = error
@@ -348,19 +420,33 @@ def run_annotation(
         raise AnnotationError(
             f"annotation failed; diagnostics retained at {work_dir}: {error}"
         ) from error
-    else:
-        shutil.rmtree(work_dir, ignore_errors=True)
     finally:
         if claim_session is not None:
             try:
                 claim_session.__exit__(None, None, None)
             except BaseException as close_error:
                 if primary_failure is None:
-                    raise
-                primary_failure.add_note(
-                    f"ClaimSession cleanup also failed: {close_error!r}"
-                )
+                    close_failure = close_error
+                else:
+                    primary_failure.add_note(
+                        f"ClaimSession cleanup also failed: {close_error!r}"
+                    )
         shutil.rmtree(stage.root, ignore_errors=True)
+
+    if close_failure is not None:
+        unlink_owned_output()
+        raise close_failure
+    if claim_session is not None:
+        try:
+            claim_session.raise_if_lost()
+        except BaseException as error:
+            unlink_owned_output()
+            if not isinstance(error, Exception):
+                raise
+            raise AnnotationError(
+                f"annotation failed; diagnostics retained at {work_dir}: {error}"
+            ) from error
+    shutil.rmtree(work_dir, ignore_errors=True)
 
     statuses = [fetched.record.status for fetched in fetched_by_sequence_id.values()]
     artifact_digests = {
@@ -396,6 +482,7 @@ def run_annotation(
             tool_batches=tool_batches,
             unique_artifact_reads=len(artifact_digests),
             configured_threads=threads,
+            existing_finalizations=existing_finalizations,
         ),
     )
 
@@ -460,18 +547,26 @@ def _run_annotation_batch(
     with misses_fasta.open("w", encoding="ascii", newline="\n") as handle:
         handle.writelines(iter_fasta_lines(identities))
     adapter_started = time.perf_counter()
-    batch = adapter.run_batch(
-        identities=identities,
-        input_fasta=misses_fasta,
-        work_dir=batch_dir,
-        runner=runner,
-        timeout_seconds=timeout_seconds,
-        threads=threads,
-    )
+    try:
+        batch = adapter.run_batch(
+            identities=identities,
+            input_fasta=misses_fasta,
+            work_dir=batch_dir,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+            threads=threads,
+        )
+    except ToolCancelledError:
+        if claim_session is not None:
+            claim_session.raise_if_lost()
+        raise
     adapter_seconds = time.perf_counter() - adapter_started
+    if claim_session is not None:
+        claim_session.raise_if_lost()
     commits = _build_commits(batch=batch, identities=identities, adapter=adapter)
     batches = 0
     peer_completed_sequence_ids: set[str] = set()
+    existing_finalizations = 0
     commit_started = time.perf_counter()
     for commit_batch in batched(commits, _STORE_BATCH_SIZE):
         if claim_session is None:
@@ -480,10 +575,14 @@ def _run_annotation_batch(
         else:
             claim_session.raise_if_lost()
             outcomes = claim_session.finalize_many(commit_batch)
+            claim_session.raise_if_lost()
             peer_completed_sequence_ids.update(
                 commit.identity.sequence_id
                 for commit, outcome in zip(commit_batch, outcomes, strict=True)
                 if outcome is CommitOutcome.EXISTING
+            )
+            existing_finalizations += sum(
+                outcome is CommitOutcome.EXISTING for outcome in outcomes
             )
             batches += 1
     return _BatchMetrics(
@@ -491,6 +590,7 @@ def _run_annotation_batch(
         adapter_seconds=adapter_seconds,
         store_commit_seconds=time.perf_counter() - commit_started,
         peer_completed_sequence_ids=frozenset(peer_completed_sequence_ids),
+        existing_finalizations=existing_finalizations,
     )
 
 
