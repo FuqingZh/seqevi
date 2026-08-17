@@ -78,6 +78,12 @@ def _validate_profile(profile: str) -> None:
         raise ValueError(f"accepted C2 requires profile {_REQUIRED_PROFILE}")
 
 
+def _resolve_filesystem_arguments(args: argparse.Namespace) -> None:
+    args.blf = args.blf.resolve()
+    args.uniprot = args.uniprot.resolve()
+    args.output_root = args.output_root.resolve()
+
+
 def _identity_set(path: Path) -> set[str]:
     return {record.identity.sequence_id for record in read_fasta(path)}
 
@@ -315,12 +321,11 @@ def _stop_candidate_store(process: subprocess.Popen[bytes]) -> None:
         try:
             process.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    process.wait()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
     if _ACTIVE_STORE_PROCESS is process:
         _ACTIVE_STORE_PROCESS = None
 
@@ -742,6 +747,7 @@ def _main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--cleanup-wait-seconds", type=float, default=121.0)
     args = parser.parse_args()
+    _resolve_filesystem_arguments(args)
     try:
         _validate_threads(args.threads)
         _validate_profile(args.profile)

@@ -151,7 +151,14 @@ class ToolRunner:
             )
             live_members = ()
             try:
-                while not self._leader_exited(process.pid):
+                while True:
+                    leader_exited = self._leader_exited(process.pid)
+                    if leader_exited:
+                        if cancellation_signal.is_set():
+                            reason = "cancelled"
+                        elif deadline is not None and time.monotonic() >= deadline:
+                            reason = "timeout"
+                        break
                     if cancellation_signal.is_set():
                         reason = "cancelled"
                         break

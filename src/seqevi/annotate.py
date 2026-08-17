@@ -162,6 +162,23 @@ def run_annotation(
     claim_session: ClaimSession | None = None
     primary_failure: BaseException | None = None
     close_failure: BaseException | None = None
+    published_output_identity: tuple[int, int] | None = None
+    published_output_marker: Path | None = None
+
+    def unlink_owned_output() -> None:
+        if published_output_identity is None or published_output_marker is None:
+            return
+        try:
+            current = output_dir.stat(follow_symlinks=False)
+            marker = published_output_marker.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino) == published_output_identity and (
+            marker.st_dev,
+            marker.st_ino,
+        ) == published_output_identity:
+            output_dir.unlink()
+
     try:
         keys_by_sequence_id = {}
         computed_ids: set[str] = set()
@@ -375,10 +392,13 @@ def run_annotation(
         if claim_session is not None:
             try:
                 claim_session.raise_if_lost()
-                os.replace(package_output, output_dir)
+                candidate = package_output.stat(follow_symlinks=False)
+                os.link(package_output, output_dir)
+                published_output_identity = (candidate.st_dev, candidate.st_ino)
+                published_output_marker = package_output
                 claim_session.raise_if_lost()
             except BaseException:
-                output_dir.unlink(missing_ok=True)
+                unlink_owned_output()
                 raise
         package_seconds = time.perf_counter() - package_started
     except BaseException as error:
@@ -402,13 +422,13 @@ def run_annotation(
         shutil.rmtree(stage.root, ignore_errors=True)
 
     if close_failure is not None:
-        output_dir.unlink(missing_ok=True)
+        unlink_owned_output()
         raise close_failure
     if claim_session is not None:
         try:
             claim_session.raise_if_lost()
         except BaseException as error:
-            output_dir.unlink(missing_ok=True)
+            unlink_owned_output()
             if not isinstance(error, Exception):
                 raise
             raise AnnotationError(

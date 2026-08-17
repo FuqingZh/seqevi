@@ -58,7 +58,11 @@ through the production persistence implementation. It records per-operation
 SQL and transaction counts, pool-acquisition timing, PostgreSQL activity and
 lock-wait samples, receipt and bounded-sweeper rows, and latency while renew
 traffic overlaps acquire/finalize. It then waits for retained receipts and
-proves zero residual coordination:
+proves zero residual coordination, including one protected open receipt per
+lane before the 120-second retention boundary and none after the bounded
+sweep. Because the harness invokes persistence directly, HTTP 412/503 status
+observations are explicitly unavailable; HTTP response behavior belongs to
+the fault-injection gates:
 
 ```bash
 PYTHONPATH=src:. pdm run python benchmarks/claim_session_pressure.py \

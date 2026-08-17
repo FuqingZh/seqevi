@@ -195,6 +195,8 @@ def _validate_lane_report(
     }
     if expected_operations["renew"] < 1:
         raise RuntimeError("pressure lane did not overlap heartbeat traffic")
+    if report["http_status_observation"] != "unavailable-direct-persistence":
+        raise RuntimeError("pressure HTTP status observation is not applicable")
     intervals = cast(dict[str, list[tuple[float, float]]], report["intervals"])
     if not _has_interval_overlap(
         intervals["renew"], intervals["acquire"] + intervals["finalize"]
@@ -236,12 +238,11 @@ def _validate_lane_report(
             or pool_latency[-1] >= _OPERATION_DEADLINE_SECONDS
         ):
             raise RuntimeError(f"pressure {phase} pool wait exceeded its invariant")
-    if report["http_status_counts"] != {"412": 0, "503": 0}:
-        raise RuntimeError("pressure observed unexpected authority/backpressure status")
     residual = cast(dict[str, int], report["residual"])
     expected_residual = {
         "claim_sessions": expected_sessions,
         "session_claims": 0,
+        "claim_session_open_receipts": expected_sessions,
         "claim_session_acquire_receipts": expected_receipt_headers,
         "claim_session_acquire_receipt_items": expected_terminal,
     }
@@ -326,7 +327,7 @@ def main() -> None:
     parser.add_argument(
         "--counts", type=int, nargs="+", default=[100, 1000, 3000, 9116]
     )
-    parser.add_argument("--cleanup-wait-seconds", type=float, default=61.0)
+    parser.add_argument("--cleanup-wait-seconds", type=float, default=121.0)
     args = parser.parse_args()
     try:
         _validate_counts(args.counts)
@@ -597,6 +598,7 @@ def main() -> None:
                     for table in (
                         "claim_sessions",
                         "session_claims",
+                        "claim_session_open_receipts",
                         "claim_session_acquire_receipts",
                         "claim_session_acquire_receipt_items",
                     )
@@ -647,7 +649,7 @@ def main() -> None:
                 "claims": count,
                 "workload_client_concurrency": 2,
                 "heartbeat_calls": heartbeat_calls,
-                "http_status_counts": {"412": 0, "503": 0},
+                "http_status_observation": "unavailable-direct-persistence",
                 "phases": phase_metrics,
                 "intervals": dict(operation_intervals),
                 "sweep_calls_returning_work": sweep_calls,
@@ -664,6 +666,18 @@ def main() -> None:
                 ),
             )
             reports.append(lane_report)
+        with persistence.engine.connect() as connection:
+            protected_open_receipts = connection.execute(
+                text("SELECT count(*) FROM claim_session_open_receipts")
+            ).scalar_one()
+        if protected_open_receipts != len(args.counts):
+            raise RuntimeError(
+                "pressure did not retain one protected open receipt per lane"
+            )
+        if args.cleanup_wait_seconds <= 120.0:
+            raise RuntimeError(
+                "accepted pressure cleanup wait must exceed 120-second retention"
+            )
         if args.cleanup_wait_seconds > 0:
             time.sleep(args.cleanup_wait_seconds)
         final_cleanup_started = time.perf_counter()
@@ -686,6 +700,7 @@ def main() -> None:
                 for table in (
                     "claim_sessions",
                     "session_claims",
+                    "claim_session_open_receipts",
                     "claim_session_acquire_receipts",
                     "claim_session_acquire_receipt_items",
                 )
@@ -718,6 +733,7 @@ def main() -> None:
     expected_zero = {
         "claim_sessions": 0,
         "session_claims": 0,
+        "claim_session_open_receipts": 0,
         "claim_session_acquire_receipts": 0,
         "claim_session_acquire_receipt_items": 0,
     }
@@ -750,6 +766,7 @@ def main() -> None:
         },
         "counts": reports,
         "cleanup_wait_seconds": args.cleanup_wait_seconds,
+        "protected_open_receipts_before_retention": protected_open_receipts,
         "final_cleanup": final_cleanup,
         "final_residual": final_residual,
     }

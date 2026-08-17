@@ -752,6 +752,38 @@ def test_claim_authority_loss_during_packaging_never_publishes_success(
     assert not output.exists()
 
 
+def test_atomic_publish_never_replaces_or_deletes_concurrent_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    adapter = FixtureAdapter(
+        executable=write_fixture_tool(tmp_path / "fixture-tool"),
+        database=write_fixture_database(tmp_path / "database"),
+    )
+    output = tmp_path / "output.duckdb"
+    original_link = annotate_module.os.link
+
+    def publish_after_other_invocation(source: Path, target: Path) -> None:
+        if Path(target) != output:
+            original_link(source, target)
+            return
+        Path(target).write_bytes(b"concurrent-winner")
+        original_link(source, target)
+
+    monkeypatch.setattr(annotate_module.os, "link", publish_after_other_invocation)
+    with LocalStore.open(tmp_path / "store") as store:
+        with pytest.raises(AnnotationError):
+            run_annotation(
+                fasta_path=fasta,
+                output_dir=output,
+                adapter=adapter,
+                store=store,
+            )
+
+    assert output.read_bytes() == b"concurrent-winner"
+
+
 def test_claim_authority_loss_during_close_never_returns_success(
     tmp_path: Path,
 ) -> None:

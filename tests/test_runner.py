@@ -55,6 +55,30 @@ def test_runner_terminates_timed_out_process_group(tmp_path: Path) -> None:
     assert raised.value.result.stderr_path.is_file()
 
 
+def test_runner_deadline_wins_at_leader_exit_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    moments = iter((0.0, 0.0, 0.2, 0.3))
+
+    class Process:
+        pid = 12345
+        returncode = 0
+
+    monkeypatch.setattr(runner_module.time, "monotonic", lambda: next(moments))
+    monkeypatch.setattr(
+        runner_module.subprocess, "Popen", lambda *_args, **_kwargs: Process()
+    )
+    monkeypatch.setattr(ToolRunner, "_leader_exited", staticmethod(lambda _pid: True))
+    monkeypatch.setattr(
+        ToolRunner, "_terminate_and_reap", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(ToolTimeoutError) as raised:
+        ToolRunner().run(command(tmp_path, "pass"), timeout_seconds=0.1)
+
+    assert raised.value.result.timed_out is True
+
+
 def test_runner_cleans_up_process_group_on_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

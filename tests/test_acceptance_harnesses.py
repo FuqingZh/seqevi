@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import errno
 import runpy
 import signal
@@ -96,6 +97,24 @@ def test_c2_frozen_input_digests_and_threads_are_hard_gates(tmp_path: Path) -> N
     module["_validate_profile"]("eggnog-5.0.2")
     with pytest.raises(ValueError, match="profile eggnog-5.0.2"):
         module["_validate_profile"]("diagnostic-profile")
+
+
+def test_c2_resolves_relative_filesystem_arguments_from_caller_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _c2()
+    monkeypatch.chdir(tmp_path)
+    args = argparse.Namespace(
+        blf=Path("inputs/blf.fasta"),
+        uniprot=Path("inputs/uniprot.fasta"),
+        output_root=Path("evidence/run"),
+    )
+
+    module["_resolve_filesystem_arguments"](args)
+
+    assert args.blf == tmp_path / "inputs/blf.fasta"
+    assert args.uniprot == tmp_path / "inputs/uniprot.fasta"
+    assert args.output_root == tmp_path / "evidence/run"
 
 
 def test_c2_child_environment_overrides_stale_pythonpath(
@@ -464,7 +483,7 @@ def test_c2_candidate_store_is_loopback_candidate_and_reaped(
     assert record["source"] == str(source_root / "seqevi")
     assert "secret" not in str(record)
     assert cast(list[str], record["command"])[6] == "<redacted>"
-    assert signalled == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
+    assert signalled == [(4321, signal.SIGTERM)]
     for invalid in ("http://store:8000", "https://127.0.0.1:8000", "/tmp/store"):
         with pytest.raises(RuntimeError, match="explicit http"):
             module["_controlled_store_bind"](invalid)
@@ -554,6 +573,40 @@ def test_c2_main_failure_always_stops_candidate_store(
     assert globals_["_ACTIVE_STORE_PROCESS"] is None
 
 
+def test_c2_store_timeout_kills_group_before_reaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _c2()
+    events: list[object] = []
+
+    class Process:
+        pid = 4321
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+        @staticmethod
+        def wait(timeout: float | None = None) -> int:
+            events.append(("wait", timeout))
+            if timeout is not None:
+                raise subprocess.TimeoutExpired("store", timeout)
+            return 0
+
+    monkeypatch.setattr(
+        "os.killpg", lambda pid, sent: events.append(("signal", pid, sent))
+    )
+
+    module["_stop_candidate_store"](Process())
+
+    assert events == [
+        ("signal", 4321, signal.SIGTERM),
+        ("wait", 5.0),
+        ("signal", 4321, signal.SIGKILL),
+        ("wait", None),
+    ]
+
+
 def test_c2_binding_probe_removes_exact_closed_zero_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -630,7 +683,7 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
     report = {
         "claims": 100,
         "heartbeat_calls": 2,
-        "http_status_counts": {"412": 0, "503": 0},
+        "http_status_observation": "unavailable-direct-persistence",
         "phases": phases,
         "intervals": {
             "renew": [(1.5, 2.5)],
@@ -641,6 +694,7 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
         "residual": {
             "claim_sessions": 1,
             "session_claims": 0,
+            "claim_session_open_receipts": 1,
             "claim_session_acquire_receipts": 1,
             "claim_session_acquire_receipt_items": 100,
         },
@@ -653,6 +707,7 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
         expected_sessions=1,
         expected_receipt_headers=1,
     )
+    assert "http_status_counts" not in report
     invalid = deepcopy(report)
     if violation == "sql":
         invalid["phases"]["renew"]["sql_executions"] += 1
