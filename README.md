@@ -11,11 +11,11 @@ single-file DuckDB result for the current FASTA.
 ## Status
 
 The target architecture and v1.1 result contracts are approved. The SeqEvi
-0.2.0 source tree uses strict protein sequence identity, the single-host
+0.3.0 source tree uses strict protein sequence identity, the single-host
 SQLite/POSIX Store, the external tool runner, exact cache-miss orchestration,
 and atomic DuckDB result materialization.
 
-SeqEvi 0.2.0 provides managed setup for dbCAN only. The `eggnog` and
+SeqEvi 0.3.0 provides managed setup for dbCAN only. The `eggnog` and
 `interpro-pfam` adapters remain supported through explicit runtimes and named
 host profiles; managed setup for them is later feature work. The
 [Slice D gate record](docs/benchmarks/20260806-v1.4-dbcan-public-release-gate.md)

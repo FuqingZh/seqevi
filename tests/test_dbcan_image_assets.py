@@ -127,3 +127,5 @@ def test_publish_workflow_uses_ghcr_attestations_without_latest() -> None:
     assert 'docker run --rm --entrypoint sh "${reference}" -c' in workflow
     assert "database_url" not in workflow.casefold()
     assert "resource_url" not in workflow.casefold()
+    assert "steps.project.outputs.version" in workflow
+    assert "seqevi-0.2.0" not in workflow

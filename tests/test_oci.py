@@ -9,6 +9,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from seqevi import __version__
 import seqevi.distribution.oci as oci
 from seqevi.adapters import AdapterName
 from seqevi.errors import AnnotationError
@@ -108,7 +109,7 @@ def _write_result(path: Path, resource_id: str) -> None:
             [
                 "seqevi-duckdb/1",
                 "dbcan-cazyme/5",
-                "0.2.0",
+                __version__,
                 "dbcan-cazyme",
                 "dbcan-cazyme/1",
                 "dbCAN",

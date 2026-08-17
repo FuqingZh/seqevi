@@ -16,6 +16,8 @@ def test_ci_image_migration_check_uses_installed_internal_revision() -> None:
     assert "from seqevi.store.migration import _CURRENT_REVISION" in workflow
     assert 'grep -Fx "${expected_revision}"' in workflow
     assert 'grep -Fx "0003_evidence_claim_leases"' not in workflow
+    assert 'project_version="$(pdm show --version)"' in workflow
+    assert "seqevi-0.2.0" not in workflow
 
 
 def test_publish_workflow_preserves_trusted_publisher_boundaries() -> None:
