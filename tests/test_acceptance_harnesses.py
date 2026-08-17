@@ -117,6 +117,42 @@ def test_c2_resolves_relative_filesystem_arguments_from_caller_cwd(
     assert args.output_root == tmp_path / "evidence/run"
 
 
+def test_c2_candidate_state_rejects_drift_between_child_launches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _c2()
+    globals_ = module["_verify_candidate_state"].__globals__
+
+    def check_output(command: list[str], **_kwargs: object) -> str:
+        if "rev-parse" in command:
+            return "changed-head\n"
+        return ""
+
+    monkeypatch.setattr(globals_["subprocess"], "check_output", check_output)
+    with pytest.raises(RuntimeError, match="before replay blf child lifecycle"):
+        module["_verify_candidate_state"](
+            "expected-head", "before replay blf child lifecycle"
+        )
+
+
+def test_c2_candidate_state_rejects_final_report_worktree_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _c2()
+    globals_ = module["_verify_candidate_state"].__globals__
+
+    def check_output(command: list[str], **_kwargs: object) -> str:
+        if "rev-parse" in command:
+            return "expected-head\n"
+        return "?? untracked-evidence\n"
+
+    monkeypatch.setattr(globals_["subprocess"], "check_output", check_output)
+    with pytest.raises(RuntimeError, match="before accepted report write"):
+        module["_verify_candidate_state"](
+            "expected-head", "before accepted report write"
+        )
+
+
 def test_c2_child_environment_overrides_stale_pythonpath(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

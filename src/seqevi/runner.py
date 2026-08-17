@@ -286,7 +286,10 @@ class ToolRunner:
                 defer(error)
                 continue
             if not stuck_reported:
-                self._report_cleanup_stuck(command, leader_pid, live)
+                try:
+                    self._report_cleanup_stuck(command, leader_pid, live)
+                except _DEFERRED_CLEANUP_ERRORS as error:
+                    defer(error)
                 stuck_reported = True
             try:
                 time.sleep(_WAIT_INTERVAL_SECONDS)
@@ -313,7 +316,10 @@ class ToolRunner:
                 defer(error)
                 if time.monotonic() - cleanup_started >= _CLEANUP_STUCK_AFTER_SECONDS:
                     if not stuck_reported:
-                        self._report_cleanup_stuck(command, leader_pid, ())
+                        try:
+                            self._report_cleanup_stuck(command, leader_pid, ())
+                        except _DEFERRED_CLEANUP_ERRORS as report_error:
+                            defer(report_error)
                         stuck_reported = True
                 try:
                     time.sleep(_WAIT_INTERVAL_SECONDS)
@@ -330,7 +336,10 @@ class ToolRunner:
                     break
                 if time.monotonic() - cleanup_started >= _CLEANUP_STUCK_AFTER_SECONDS:
                     if not stuck_reported:
-                        self._report_cleanup_stuck(command, leader_pid, ())
+                        try:
+                            self._report_cleanup_stuck(command, leader_pid, ())
+                        except _DEFERRED_CLEANUP_ERRORS as error:
+                            defer(error)
                         stuck_reported = True
                 try:
                     time.sleep(_WAIT_INTERVAL_SECONDS)

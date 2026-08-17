@@ -393,9 +393,9 @@ def run_annotation(
             try:
                 claim_session.raise_if_lost()
                 candidate = package_output.stat(follow_symlinks=False)
-                os.link(package_output, output_dir)
                 published_output_identity = (candidate.st_dev, candidate.st_ino)
                 published_output_marker = package_output
+                os.link(package_output, output_dir)
                 claim_session.raise_if_lost()
             except BaseException:
                 unlink_owned_output()

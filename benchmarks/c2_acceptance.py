@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -94,6 +94,18 @@ def _identity_digest(identities: set[str]) -> str:
 
 def _candidate_head() -> str:
     repository_root = _HARNESS_PATH.parents[1]
+    head = subprocess.check_output(
+        ["git", "-C", str(repository_root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    _verify_candidate_state(head, "initial candidate binding")
+    return head
+
+
+def _verify_candidate_state(expected_head: str, phase: str) -> None:
+    repository_root = _HARNESS_PATH.parents[1]
+    observed_head = subprocess.check_output(
+        ["git", "-C", str(repository_root), "rev-parse", "HEAD"], text=True
+    ).strip()
     dirty = subprocess.check_output(
         [
             "git",
@@ -102,17 +114,11 @@ def _candidate_head() -> str:
             "status",
             "--porcelain",
             "--untracked-files=all",
-            "--",
-            "src",
-            "benchmarks",
         ],
         text=True,
     ).strip()
-    if dirty:
-        raise RuntimeError("C2 requires committed source and benchmark harnesses")
-    return subprocess.check_output(
-        ["git", "-C", str(repository_root), "rev-parse", "HEAD"], text=True
-    ).strip()
+    if observed_head != expected_head or dirty:
+        raise RuntimeError(f"C2 candidate worktree changed during {phase}")
 
 
 def _candidate_source_root() -> Path:
@@ -457,7 +463,10 @@ def _stop_and_reap(
     return deferred
 
 
-def _wait_initial(processes: dict[str, subprocess.Popen[bytes]]) -> dict[str, int]:
+def _wait_initial(
+    processes: dict[str, subprocess.Popen[bytes]],
+    child_finished: Callable[[str], None] | None = None,
+) -> dict[str, int]:
     return_codes: dict[str, int] = {}
     pending = dict(processes)
     try:
@@ -468,6 +477,8 @@ def _wait_initial(processes: dict[str, subprocess.Popen[bytes]]) -> dict[str, in
                     continue
                 return_codes[name] = return_code
                 del pending[name]
+                if child_finished is not None:
+                    child_finished(name)
                 if return_code != 0:
                     cleanup_error = _stop_and_reap(pending)
                     if cleanup_error is not None:
@@ -786,6 +797,7 @@ def _main() -> None:
         raise RuntimeError("frozen C2 overlap/subset contract is not satisfied")
 
     args.output_root.mkdir(parents=True)
+    _verify_candidate_state(source_head, "before Store child lifecycle")
     store_process, store_service = _start_candidate_store(
         store=args.store,
         database_url=args.database_url,
@@ -801,6 +813,9 @@ def _main() -> None:
     processes = {}
     try:
         for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
+            _verify_candidate_state(
+                source_head, f"before initial {name} child lifecycle"
+            )
             root = args.output_root / f"initial-{name}"
             root.mkdir()
             processes[name] = _run_command(
@@ -817,7 +832,12 @@ def _main() -> None:
     except BaseException:
         _stop_and_reap(processes)
         raise
-    return_codes = _wait_initial(processes)
+    return_codes = _wait_initial(
+        processes,
+        lambda name: _verify_candidate_state(
+            source_head, f"after initial {name} child lifecycle"
+        ),
+    )
     _require_no_external_tools(args.output_root, "immediately after initial children")
     initial_results = {
         name: _result(
@@ -840,6 +860,7 @@ def _main() -> None:
     replay_results = {}
     replay_started = time.perf_counter()
     for name, fasta in (("blf", args.blf), ("uniprot", args.uniprot)):
+        _verify_candidate_state(source_head, f"before replay {name} child lifecycle")
         root = args.output_root / f"replay-{name}"
         root.mkdir()
         process = _run_command(
@@ -858,6 +879,7 @@ def _main() -> None:
         except BaseException:
             _stop_and_reap({name: process})
             raise
+        _verify_candidate_state(source_head, f"after replay {name} child lifecycle")
         replay_results[name] = _result(root / "stdout.json", return_code)
         _validate_frozen_result(name, replay_results[name])
     _require_no_external_tools(args.output_root, "immediately after replay children")
@@ -872,6 +894,7 @@ def _main() -> None:
     _stop_candidate_store(store_process)
     _ACTIVE_STORE_PROCESS = None
     store_service["stopped_and_reaped"] = True
+    _verify_candidate_state(source_head, "after Store child lifecycle")
     retention_cleanup = _retention_cleanup(args.database_url, args.cleanup_wait_seconds)
     final_readback = _database_readback(args.database_url)
     expected_replay = {"blf": 9116, "uniprot": 9115}
@@ -933,6 +956,7 @@ def _main() -> None:
         "final_database": final_readback,
     }
     report_path = args.output_root / "acceptance.json"
+    _verify_candidate_state(source_head, "before accepted report write")
     report_path.write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

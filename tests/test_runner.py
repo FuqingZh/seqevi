@@ -604,6 +604,93 @@ def test_late_descendant_gets_term_grace_before_kill(
     assert events[-1] == "wait"
 
 
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt(), SystemExit(2)])
+def test_cleanup_stuck_reporting_interrupt_is_deferred_until_reap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: BaseException,
+) -> None:
+    events: list[str] = []
+    signal_attempts = 0
+
+    class Process:
+        pid = 12345
+
+        @staticmethod
+        def wait() -> None:
+            events.append("wait")
+
+    def signal_group(_pid: int, _sent: signal.Signals, **_kwargs: object) -> bool:
+        nonlocal signal_attempts
+        signal_attempts += 1
+        return signal_attempts > 1
+
+    def report(*_args: object) -> None:
+        events.append("report")
+        raise interruption
+
+    monkeypatch.setattr(ToolRunner, "_group_snapshot", lambda *_args: ((), False))
+    monkeypatch.setattr(ToolRunner, "_wait_for_clean_group", lambda *_args: False)
+    monkeypatch.setattr(ToolRunner, "_signal_group", staticmethod(signal_group))
+    monkeypatch.setattr(ToolRunner, "_report_cleanup_stuck", report)
+    monkeypatch.setattr(
+        ToolRunner, "_owns_adopted_children", staticmethod(lambda: False)
+    )
+
+    error = ToolRunner()._terminate_and_reap(  # pyright: ignore[reportPrivateUsage]
+        Process(),  # type: ignore[arg-type]
+        command(tmp_path, "pass"),
+        send_term=False,
+    )
+
+    assert error is interruption
+    assert events == ["report", "wait"]
+
+
+def test_adopted_cleanup_reporting_interrupt_is_deferred_until_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    adopted_snapshots = iter((False, True))
+    interruption = KeyboardInterrupt()
+
+    class Process:
+        pid = 12345
+
+        @staticmethod
+        def wait() -> None:
+            events.append("wait")
+
+    def report(*_args: object) -> None:
+        events.append("report")
+        raise interruption
+
+    monkeypatch.setattr(runner_module, "_CLEANUP_STUCK_AFTER_SECONDS", 0.0)
+    monkeypatch.setattr(ToolRunner, "_group_snapshot", lambda *_args: ((), False))
+    monkeypatch.setattr(ToolRunner, "_wait_for_clean_group", lambda *_args: False)
+    monkeypatch.setattr(
+        ToolRunner, "_signal_group", staticmethod(lambda *_args, **_kwargs: True)
+    )
+    monkeypatch.setattr(ToolRunner, "_report_cleanup_stuck", report)
+    monkeypatch.setattr(
+        ToolRunner, "_owns_adopted_children", staticmethod(lambda: True)
+    )
+    monkeypatch.setattr(
+        ToolRunner,
+        "_reap_adopted_group_zombies",
+        staticmethod(lambda _pid: next(adopted_snapshots)),
+    )
+
+    error = ToolRunner()._terminate_and_reap(  # pyright: ignore[reportPrivateUsage]
+        Process(),  # type: ignore[arg-type]
+        command(tmp_path, "pass"),
+        send_term=False,
+    )
+
+    assert error is interruption
+    assert events == ["report", "wait"]
+
+
 def test_cleanup_stuck_remains_synchronously_owned_until_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
