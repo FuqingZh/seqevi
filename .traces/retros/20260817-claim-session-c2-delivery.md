@@ -5,10 +5,11 @@ Date: 2026-08-17
 ## Outcome
 
 ClaimSession authority-loss handling, generic external-tool cancellation,
-PostgreSQL pressure, and the eggNOG two-process C2 gate are closed. The
-accepted benchmark record preserves the tested implementation, harness, and
-input lineage and records independent zero-compute replay; this retro adds no
-runtime evidence.
+PostgreSQL pressure, and the separate 64-thread fresh-Store eggNOG contention
+gate are closed. The accepted benchmark record preserves the tested
+implementation, harness, and input lineage and records independent zero-compute
+replay; this retro adds no runtime evidence and does not close the target-Store
+cache-seeding C2 gate.
 
 ## Delivery Shape
 
@@ -76,10 +77,10 @@ delivery only and do not establish numeric repository gates.
 
 ## Continuation
 
-Cache seeding continues one adapter family at a time. With eggNOG C2 accepted,
-the next gate is InterPro-Pfam serial sanity plus independent zero-compute
-replay, then its C1 and C2 gates after acceptance. The shared Store is a
-test/cache-seeding Store: preserve immutable state, retain the prior
-export/readback validation as historical precondition, and refresh only
-health, identity, input, output-isolation, and capacity checks before that
-lane.
+Cache seeding continues one adapter family at a time. Its eggNOG target-Store
+qualification remains unproven; the next plan step is to resume and accept the
+read-only Preflight before eggNOG serial sanity, C1, or C2. The shared Store is
+a test/cache-seeding Store: preserve immutable state, retain the prior
+export/readback validation as historical precondition, and refresh health,
+identity, input, output-isolation, and capacity checks. A fresh coordinated
+production backup is not required for this continuation boundary.
