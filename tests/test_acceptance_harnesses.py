@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import math
 import runpy
 import signal
 import subprocess
@@ -16,6 +17,63 @@ import pytest
 
 def _c2() -> dict[str, Any]:
     return cast(dict[str, Any], runpy.run_path("benchmarks/c2_acceptance.py"))
+
+
+def _pressure_lane_report(
+    module: dict[str, Any], *, claims: int, lane_count: int
+) -> dict[str, Any]:
+    phase_sql = module["_PHASE_SQL_PER_OPERATION"]
+    receipt_headers = math.ceil(claims / 1000)
+    operations = {
+        "acquire": receipt_headers,
+        "renew": 1,
+        "finalize": receipt_headers,
+        "close": 1,
+        "sweep": 1,
+    }
+    return {
+        "claims": claims,
+        "heartbeat_calls": 1,
+        "sweep_calls_returning_work": 0,
+        "http_status_observation": "unavailable-direct-persistence",
+        "phases": {
+            phase: {
+                "operations": count,
+                "sql_executions": count * phase_sql[phase],
+                "transactions": count,
+                "pool_checkouts": count,
+                "p50_seconds": 0.1,
+                "p95_seconds": 0.2,
+                "p99_seconds": 0.3,
+                "maximum_seconds": 0.4,
+                "pool_wait_p95_seconds": 0.01,
+                "pool_wait_maximum_seconds": 0.02,
+            }
+            for phase, count in operations.items()
+        },
+        "intervals": {
+            "renew": [(1.5, 2.5)],
+            "acquire": [(1.0, 2.0)],
+            "finalize": [(3.0, 4.0)],
+        },
+        "sweep_delete_rows": {},
+        "current_lane_residual": {
+            "claim_sessions": 1,
+            "session_claims": 0,
+            "claim_session_open_receipts": 1,
+            "claim_session_acquire_receipts": receipt_headers,
+            "claim_session_acquire_receipt_items": claims,
+            "terminal_evidence": claims,
+        },
+        "residual": {
+            "claim_sessions": 1,
+            "session_claims": 0,
+            "claim_session_open_receipts": lane_count,
+            "claim_session_acquire_receipts": receipt_headers,
+            "claim_session_acquire_receipt_items": claims,
+        },
+        "terminal_evidence_total": claims,
+    }
 
 
 class _Process:
@@ -815,6 +873,14 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
             "finalize": [(3.0, 4.0)],
         },
         "sweep_delete_rows": {},
+        "current_lane_residual": {
+            "claim_sessions": 1,
+            "session_claims": 0,
+            "claim_session_open_receipts": 1,
+            "claim_session_acquire_receipts": 1,
+            "claim_session_acquire_receipt_items": 100,
+            "terminal_evidence": 100,
+        },
         "residual": {
             "claim_sessions": 1,
             "session_claims": 0,
@@ -828,8 +894,8 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
     validate(
         report,
         expected_terminal=100,
-        expected_sessions=1,
-        expected_receipt_headers=1,
+        lane_count=1,
+        cumulative_receipt_headers=1,
     )
     assert "http_status_counts" not in report
     invalid = deepcopy(report)
@@ -847,8 +913,8 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
         validate(
             invalid,
             expected_terminal=100,
-            expected_sessions=1,
-            expected_receipt_headers=1,
+            lane_count=1,
+            cumulative_receipt_headers=1,
         )
 
 
@@ -884,6 +950,14 @@ def test_pressure_report_counts_each_sweep_call_as_an_operation() -> None:
             "finalize": [(3.0, 4.0)],
         },
         "sweep_delete_rows": {},
+        "current_lane_residual": {
+            "claim_sessions": 1,
+            "session_claims": 0,
+            "claim_session_open_receipts": 1,
+            "claim_session_acquire_receipts": 1,
+            "claim_session_acquire_receipt_items": 100,
+            "terminal_evidence": 100,
+        },
         "residual": {
             "claim_sessions": 1,
             "session_claims": 0,
@@ -897,9 +971,48 @@ def test_pressure_report_counts_each_sweep_call_as_an_operation() -> None:
     module["_validate_lane_report"](
         report,
         expected_terminal=100,
-        expected_sessions=1,
-        expected_receipt_headers=1,
+        lane_count=1,
+        cumulative_receipt_headers=1,
     )
+
+
+def test_pressure_accepts_retention_cleanup_of_prior_lanes() -> None:
+    module = cast(
+        dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
+    )
+    report = _pressure_lane_report(module, claims=9116, lane_count=4)
+    report["residual"] = {
+        "claim_sessions": 2,
+        "session_claims": 0,
+        "claim_session_open_receipts": 4,
+        "claim_session_acquire_receipts": 13,
+        "claim_session_acquire_receipt_items": 12116,
+    }
+    report["terminal_evidence_total"] = 13216
+
+    module["_validate_lane_report"](
+        report,
+        expected_terminal=13216,
+        lane_count=4,
+        cumulative_receipt_headers=13,
+    )
+
+
+@pytest.mark.parametrize("missing", ["claim_sessions", "terminal_evidence"])
+def test_pressure_rejects_loss_of_current_lane_rows_or_evidence(missing: str) -> None:
+    module = cast(
+        dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
+    )
+    report = _pressure_lane_report(module, claims=100, lane_count=1)
+    report["current_lane_residual"][missing] = 0
+
+    with pytest.raises(RuntimeError, match="current lane residual"):
+        module["_validate_lane_report"](
+            report,
+            expected_terminal=100,
+            lane_count=1,
+            cumulative_receipt_headers=1,
+        )
 
 
 def test_pressure_measures_each_sweep_call_including_final_empty_call() -> None:

@@ -196,8 +196,8 @@ def _validate_lane_report(
     report: dict[str, Any],
     *,
     expected_terminal: int,
-    expected_sessions: int,
-    expected_receipt_headers: int,
+    lane_count: int,
+    cumulative_receipt_headers: int,
 ) -> None:
     claims = cast(int, report["claims"])
     expected_operations = {
@@ -252,16 +252,35 @@ def _validate_lane_report(
             or pool_latency[-1] >= _OPERATION_DEADLINE_SECONDS
         ):
             raise RuntimeError(f"pressure {phase} pool wait exceeded its invariant")
-    residual = cast(dict[str, int], report["residual"])
-    expected_residual = {
-        "claim_sessions": expected_sessions,
+    current = cast(dict[str, int], report["current_lane_residual"])
+    current_receipt_headers = math.ceil(claims / 1000)
+    expected_current = {
+        "claim_sessions": 1,
         "session_claims": 0,
-        "claim_session_open_receipts": expected_sessions,
-        "claim_session_acquire_receipts": expected_receipt_headers,
-        "claim_session_acquire_receipt_items": expected_terminal,
+        "claim_session_open_receipts": 1,
+        "claim_session_acquire_receipts": current_receipt_headers,
+        "claim_session_acquire_receipt_items": claims,
+        "terminal_evidence": claims,
     }
-    if residual != expected_residual:
-        raise RuntimeError(f"pressure lane residual is not canonical: {residual}")
+    if current != expected_current:
+        raise RuntimeError(
+            f"pressure current lane residual is not canonical: {current}"
+        )
+    residual = cast(dict[str, int], report["residual"])
+    if (
+        residual["session_claims"] != 0
+        or residual["claim_session_open_receipts"] != lane_count
+        or not 1 <= residual["claim_sessions"] <= lane_count
+        or not current_receipt_headers
+        <= residual["claim_session_acquire_receipts"]
+        <= cumulative_receipt_headers
+        or not claims
+        <= residual["claim_session_acquire_receipt_items"]
+        <= expected_terminal
+    ):
+        raise RuntimeError(
+            f"pressure global residual is not retention-aware: {residual}"
+        )
     if report["terminal_evidence_total"] != expected_terminal:
         raise RuntimeError(
             f"pressure terminal evidence was {report['terminal_evidence_total']}, "
@@ -474,12 +493,14 @@ def main() -> None:
         for lane, count in enumerate(args.counts, start=1):
             queries = _queries(count, lane)
             server_time = persistence.database_time()
+            open_request_id = uuid4().hex
             authority = persistence.open_claim_session(
-                open_request_id=uuid4().hex,
+                open_request_id=open_request_id,
                 server_time=server_time,
                 open_not_after=server_time + timedelta(seconds=30),
             )
             acquired = []
+            acquire_request_ids: list[str] = []
             operation_latencies: dict[str, list[float]] = defaultdict(list)
             operation_intervals: dict[str, list[tuple[float, float]]] = defaultdict(
                 list
@@ -523,10 +544,12 @@ def main() -> None:
                     batch = queries[offset : offset + 1000]
                     models = [EvidenceQueryModel.from_domain(query) for query in batch]
                     started = time.perf_counter()
+                    acquire_request_id = uuid4().hex
+                    acquire_request_ids.append(acquire_request_id)
                     with _measured("acquire"):
                         outcomes = persistence.acquire_claim_session(
                             authority,
-                            acquire_request_id=uuid4().hex,
+                            acquire_request_id=acquire_request_id,
                             query_digest=canonical_query_digest(models),
                             queries=batch,
                         )
@@ -619,6 +642,63 @@ def main() -> None:
                         "WHERE adapter_contract_version = 'pressure/1'"
                     )
                 ).scalar_one()
+                current_session_id = authority.session_id
+                current_acquire_ids = tuple(
+                    connection.execute(
+                        text(
+                            "SELECT request_id FROM claim_session_acquire_receipts "
+                            "WHERE session_id = :session_id ORDER BY request_id"
+                        ),
+                        {"session_id": current_session_id},
+                    ).scalars()
+                )
+                current_lane_residual = {
+                    "claim_sessions": connection.execute(
+                        text(
+                            "SELECT count(*) FROM claim_sessions "
+                            "WHERE session_id = :session_id"
+                        ),
+                        {"session_id": current_session_id},
+                    ).scalar_one(),
+                    "session_claims": connection.execute(
+                        text(
+                            "SELECT count(*) FROM session_claims "
+                            "WHERE session_id = :session_id"
+                        ),
+                        {"session_id": current_session_id},
+                    ).scalar_one(),
+                    "claim_session_open_receipts": connection.execute(
+                        text(
+                            "SELECT count(*) FROM claim_session_open_receipts "
+                            "WHERE open_request_id = :open_request_id "
+                            "AND session_id = :session_id"
+                        ),
+                        {
+                            "open_request_id": open_request_id,
+                            "session_id": current_session_id,
+                        },
+                    ).scalar_one(),
+                    "claim_session_acquire_receipts": len(current_acquire_ids),
+                    "claim_session_acquire_receipt_items": connection.execute(
+                        text(
+                            "SELECT count(*) FROM claim_session_acquire_receipt_items "
+                            "WHERE session_id = :session_id"
+                        ),
+                        {"session_id": current_session_id},
+                    ).scalar_one(),
+                    "terminal_evidence": connection.execute(
+                        text(
+                            "SELECT count(*) FROM evidence "
+                            "WHERE adapter_contract_version = 'pressure/1' "
+                            "AND semantic_parameters_json = :semantic"
+                        ),
+                        {"semantic": queries[0].key.semantic_parameters_json},
+                    ).scalar_one(),
+                }
+            if current_acquire_ids != tuple(sorted(acquire_request_ids)):
+                raise RuntimeError(
+                    "pressure current lane acquire receipt identities are not exact"
+                )
             phase_metrics = {}
             for phase in ("acquire", "renew", "finalize", "close", "sweep"):
                 values = operation_latencies[phase]
@@ -664,14 +744,20 @@ def main() -> None:
                 "intervals": dict(operation_intervals),
                 "sweep_calls_returning_work": sweep_calls,
                 "sweep_delete_rows": delete_rows,
+                "lane_identity": {
+                    "open_request_id": open_request_id,
+                    "session_id": authority.session_id,
+                    "acquire_request_ids": acquire_request_ids,
+                },
+                "current_lane_residual": current_lane_residual,
                 "residual": residual,
                 "terminal_evidence_total": terminal,
             }
             _validate_lane_report(
                 lane_report,
                 expected_terminal=expected_terminal,
-                expected_sessions=lane,
-                expected_receipt_headers=sum(
+                lane_count=lane,
+                cumulative_receipt_headers=sum(
                     math.ceil(value / 1000) for value in args.counts[:lane]
                 ),
             )
