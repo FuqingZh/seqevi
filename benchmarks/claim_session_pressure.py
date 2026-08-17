@@ -164,6 +164,20 @@ def _has_interval_overlap(
     )
 
 
+def _measure_sweeps(
+    persistence: Any, operation_latencies: dict[str, list[float]]
+) -> int:
+    calls_returning_work = 0
+    while True:
+        started = time.perf_counter()
+        with _measured("sweep"):
+            swept = persistence.sweep_claim_sessions()
+        operation_latencies["sweep"].append(time.perf_counter() - started)
+        if not swept:
+            return calls_returning_work
+        calls_returning_work += 1
+
+
 def _cleanup_failed_lane(persistence: Any, authority: Any) -> list[BaseException]:
     errors: list[BaseException] = []
     try:
@@ -191,7 +205,7 @@ def _validate_lane_report(
         "renew": cast(int, report["heartbeat_calls"]),
         "finalize": math.ceil(claims / 1000),
         "close": 1,
-        "sweep": 1,
+        "sweep": cast(int, report["sweep_calls_returning_work"]) + 1,
     }
     if expected_operations["renew"] < 1:
         raise RuntimeError("pressure lane did not overlap heartbeat traffic")
@@ -573,12 +587,9 @@ def main() -> None:
                     ) from None
                 raise
             operation_latencies["close"].append(time.perf_counter() - started)
-            sweep_started = time.perf_counter()
             sweep_calls = 0
             try:
-                with _measured("sweep"):
-                    while persistence.sweep_claim_sessions():
-                        sweep_calls += 1
+                sweep_calls = _measure_sweeps(persistence, operation_latencies)
             except BaseException as error:
                 cleanup_errors = _cleanup_failed_lane(persistence, authority)
                 if cleanup_errors:
@@ -586,7 +597,6 @@ def main() -> None:
                         "pressure sweep and cleanup failed", [error, *cleanup_errors]
                     ) from None
                 raise
-            operation_latencies["sweep"].append(time.perf_counter() - sweep_started)
             if heartbeat_errors:
                 raise RuntimeError(f"heartbeat failed: {heartbeat_errors}")
 

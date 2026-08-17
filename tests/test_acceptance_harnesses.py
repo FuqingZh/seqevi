@@ -5,6 +5,7 @@ import errno
 import runpy
 import signal
 import subprocess
+from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
@@ -805,6 +806,7 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
     report = {
         "claims": 100,
         "heartbeat_calls": 2,
+        "sweep_calls_returning_work": 0,
         "http_status_observation": "unavailable-direct-persistence",
         "phases": phases,
         "intervals": {
@@ -848,6 +850,95 @@ def test_pressure_report_invariants_fail_closed(violation: str) -> None:
             expected_sessions=1,
             expected_receipt_headers=1,
         )
+
+
+def test_pressure_report_counts_each_sweep_call_as_an_operation() -> None:
+    module = cast(
+        dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
+    )
+    phase_sql = module["_PHASE_SQL_PER_OPERATION"]
+    operations = {"acquire": 1, "renew": 1, "finalize": 1, "close": 1, "sweep": 3}
+    report = {
+        "claims": 100,
+        "heartbeat_calls": 1,
+        "sweep_calls_returning_work": 2,
+        "http_status_observation": "unavailable-direct-persistence",
+        "phases": {
+            phase: {
+                "operations": count,
+                "sql_executions": count * phase_sql[phase],
+                "transactions": count,
+                "pool_checkouts": count,
+                "p50_seconds": 0.1,
+                "p95_seconds": 0.2,
+                "p99_seconds": 0.3,
+                "maximum_seconds": 0.4,
+                "pool_wait_p95_seconds": 0.01,
+                "pool_wait_maximum_seconds": 0.02,
+            }
+            for phase, count in operations.items()
+        },
+        "intervals": {
+            "renew": [(1.5, 2.5)],
+            "acquire": [(1.0, 2.0)],
+            "finalize": [(3.0, 4.0)],
+        },
+        "sweep_delete_rows": {},
+        "residual": {
+            "claim_sessions": 1,
+            "session_claims": 0,
+            "claim_session_open_receipts": 1,
+            "claim_session_acquire_receipts": 1,
+            "claim_session_acquire_receipt_items": 100,
+        },
+        "terminal_evidence_total": 100,
+    }
+
+    module["_validate_lane_report"](
+        report,
+        expected_terminal=100,
+        expected_sessions=1,
+        expected_receipt_headers=1,
+    )
+
+
+def test_pressure_measures_each_sweep_call_including_final_empty_call() -> None:
+    module = cast(
+        dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
+    )
+    phases = []
+
+    class Persistence:
+        outcomes = iter((1, 1, 0))
+
+        def sweep_claim_sessions(self) -> int:
+            phases.append(module["_phase"].get())
+            return next(self.outcomes)
+
+    latencies: dict[str, list[float]] = defaultdict(list)
+    calls_returning_work = module["_measure_sweeps"](Persistence(), latencies)
+
+    assert calls_returning_work == 2
+    assert phases == ["sweep", "sweep", "sweep"]
+    assert len(latencies["sweep"]) == 3
+
+
+def test_c2_rejects_existing_finalizations_in_initial_run() -> None:
+    validate = _c2()["_validate_initial_reuse"]
+    results = {
+        "blf": {
+            "counts": {"cache_hits": 9115, "computed": 1},
+            "metrics": {"existing_finalizations": 1},
+        },
+        "uniprot": {
+            "counts": {"cache_hits": 0, "computed": 9115},
+            "metrics": {"existing_finalizations": 0},
+        },
+    }
+    with pytest.raises(RuntimeError, match="existing finalizations"):
+        validate(results)
+    results["blf"]["metrics"] = {"existing_finalizations": 0}
+    assert validate(results) == 0
 
 
 def test_pressure_requires_real_heartbeat_overlap() -> None:

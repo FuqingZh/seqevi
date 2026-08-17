@@ -650,6 +650,7 @@ def test_annotation_classifies_finalize_peer_winner_as_cache_hit(
 
     assert summary.cache_hits == 1
     assert summary.computed == 0
+    assert summary.metrics.existing_finalizations == 1
     assert read_result_table(summary.output_dir, "main.sequence_map").get_column(
         "EvidenceSource"
     ).to_list() == ["cache"]

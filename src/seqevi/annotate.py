@@ -48,7 +48,12 @@ _CLAIM_RUNWAY_SECONDS = 5.0
 
 @dataclass(frozen=True, slots=True)
 class AnnotationMetrics:
-    """Operational measurements for one successful annotation invocation."""
+    """Operational measurements for one successful annotation invocation.
+
+    ``existing_finalizations`` counts proposed terminal records that a
+    ClaimSession resolved to immutable evidence already finalized by a peer.
+    It is observational and does not change computed/cache provenance.
+    """
 
     elapsed_seconds: float
     fasta_staging_seconds: float
@@ -65,6 +70,7 @@ class AnnotationMetrics:
     tool_batches: int
     unique_artifact_reads: int
     configured_threads: int
+    existing_finalizations: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +93,7 @@ class _BatchMetrics:
     adapter_seconds: float
     store_commit_seconds: float
     peer_completed_sequence_ids: frozenset[str] = frozenset()
+    existing_finalizations: int = 0
 
 
 class _MeasuringToolRunner(ToolRunner):
@@ -159,6 +166,7 @@ def run_annotation(
     store_lookup_seconds = 0.0
     adapter_seconds = 0.0
     store_commit_seconds = 0.0
+    existing_finalizations = 0
     claim_session: ClaimSession | None = None
     primary_failure: BaseException | None = None
     close_failure: BaseException | None = None
@@ -255,6 +263,7 @@ def run_annotation(
                 commit_batches += batch_metrics.commit_batches
                 adapter_seconds += batch_metrics.adapter_seconds
                 store_commit_seconds += batch_metrics.store_commit_seconds
+                existing_finalizations += batch_metrics.existing_finalizations
                 computed_ids.difference_update(
                     batch_metrics.peer_completed_sequence_ids
                 )
@@ -276,6 +285,7 @@ def run_annotation(
             commit_batches += batch_metrics.commit_batches
             adapter_seconds += batch_metrics.adapter_seconds
             store_commit_seconds += batch_metrics.store_commit_seconds
+            existing_finalizations += batch_metrics.existing_finalizations
             computed_ids.difference_update(batch_metrics.peer_completed_sequence_ids)
 
         while busy_queries:
@@ -322,6 +332,7 @@ def run_annotation(
                 commit_batches += batch_metrics.commit_batches
                 adapter_seconds += batch_metrics.adapter_seconds
                 store_commit_seconds += batch_metrics.store_commit_seconds
+                existing_finalizations += batch_metrics.existing_finalizations
                 computed_ids.difference_update(
                     batch_metrics.peer_completed_sequence_ids
                 )
@@ -387,6 +398,7 @@ def run_annotation(
                 "computed": len(computed_ids),
                 "hits": statuses.count(EvidenceStatus.HIT),
                 "no_hits": statuses.count(EvidenceStatus.NO_HIT),
+                "existing_finalizations": existing_finalizations,
             },
         )
         if claim_session is not None:
@@ -470,6 +482,7 @@ def run_annotation(
             tool_batches=tool_batches,
             unique_artifact_reads=len(artifact_digests),
             configured_threads=threads,
+            existing_finalizations=existing_finalizations,
         ),
     )
 
@@ -553,6 +566,7 @@ def _run_annotation_batch(
     commits = _build_commits(batch=batch, identities=identities, adapter=adapter)
     batches = 0
     peer_completed_sequence_ids: set[str] = set()
+    existing_finalizations = 0
     commit_started = time.perf_counter()
     for commit_batch in batched(commits, _STORE_BATCH_SIZE):
         if claim_session is None:
@@ -567,12 +581,16 @@ def _run_annotation_batch(
                 for commit, outcome in zip(commit_batch, outcomes, strict=True)
                 if outcome is CommitOutcome.EXISTING
             )
+            existing_finalizations += sum(
+                outcome is CommitOutcome.EXISTING for outcome in outcomes
+            )
             batches += 1
     return _BatchMetrics(
         commit_batches=batches,
         adapter_seconds=adapter_seconds,
         store_commit_seconds=time.perf_counter() - commit_started,
         peer_completed_sequence_ids=frozenset(peer_completed_sequence_ids),
+        existing_finalizations=existing_finalizations,
     )
 
 

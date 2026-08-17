@@ -241,6 +241,9 @@ def annotate_command(
                         "elapsed_seconds": summary.metrics.elapsed_seconds,
                         "package_seconds": summary.metrics.package_seconds,
                         "configured_threads": summary.metrics.configured_threads,
+                        "existing_finalizations": (
+                            summary.metrics.existing_finalizations
+                        ),
                     },
                 },
                 sort_keys=True,

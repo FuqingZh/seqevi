@@ -400,6 +400,11 @@ def _summary_from_payload(
             tool_batches=0,
             unique_artifact_reads=0,
             configured_threads=_integer(metrics, "configured_threads"),
+            existing_finalizations=(
+                _integer(metrics, "existing_finalizations")
+                if "existing_finalizations" in metrics
+                else 0
+            ),
         ),
     )
 

@@ -502,6 +502,28 @@ def _reuse_counts(result: dict[str, object]) -> tuple[int, int]:
     return cache_hits, computed
 
 
+def _existing_finalizations(result: dict[str, object]) -> int:
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        raise RuntimeError("annotation JSON result has no metrics object")
+    existing = metrics.get("existing_finalizations")
+    if not isinstance(existing, int) or existing < 0:
+        raise RuntimeError(
+            "annotation JSON result has invalid existing_finalizations metric"
+        )
+    return existing
+
+
+def _validate_initial_reuse(results: Mapping[str, dict[str, object]]) -> int:
+    reuse = [_reuse_counts(result) for result in results.values()]
+    existing = sum(_existing_finalizations(result) for result in results.values())
+    if sum(item[1] for item in reuse) != 9116 or sum(item[0] for item in reuse) != 9115:
+        raise RuntimeError("initial C2 results did not prove duplicate suppression")
+    if existing != 0:
+        raise RuntimeError("initial C2 observed existing finalizations")
+    return existing
+
+
 def _status_counts(result: dict[str, object]) -> tuple[int, int]:
     counts = result.get("counts")
     if not isinstance(counts, dict):
@@ -898,12 +920,7 @@ def _main() -> None:
     retention_cleanup = _retention_cleanup(args.database_url, args.cleanup_wait_seconds)
     final_readback = _database_readback(args.database_url)
     expected_replay = {"blf": 9116, "uniprot": 9115}
-    initial_reuse = [_reuse_counts(result) for result in initial_results.values()]
-    if (
-        sum(item[1] for item in initial_reuse) != 9116
-        or sum(item[0] for item in initial_reuse) != 9115
-    ):
-        raise RuntimeError("initial C2 results did not prove duplicate suppression")
+    initial_existing_finalizations = _validate_initial_reuse(initial_results)
     for name, expected in expected_replay.items():
         cache_hits, computed = _reuse_counts(replay_results[name])
         if cache_hits != expected or computed != 0:
@@ -943,6 +960,7 @@ def _main() -> None:
             "union": len(blf_ids | uniprot_ids),
         },
         "initial": initial_results,
+        "initial_existing_finalizations": initial_existing_finalizations,
         "initial_result_identity": initial_identity,
         "initial_elapsed_seconds": initial_elapsed,
         "after_initial_database": after_initial,
