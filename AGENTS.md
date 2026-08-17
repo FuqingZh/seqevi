@@ -30,6 +30,8 @@
 - Use argument arrays for subprocesses and never use `shell=True`.
 - Add a dependency only when it removes meaningful complexity from SeqEvi.
 - Update public contracts and their tests together.
+- Validate the dominant scaling unit at representative scale before broad
+  implementation or hardening.
 
 ## Validation
 
@@ -37,6 +39,10 @@
 - Contract changes require focused tests plus an update to the authoritative
   architecture document.
 - Shared-store changes must be tested against PostgreSQL as well as SQLite.
+- Evidence-only successors must preserve mechanically identifiable code,
+  harness, input, ToolRuntimeDigest, ResourceID, and semantic-parameter
+  lineage. Do not repeat an expensive acceptance gate when that complete
+  frozen execution identity is unchanged.
 
 ## AO Delivery
 
@@ -45,5 +51,9 @@
   Merge readiness requires platform-native review completion against the exact
   current head SHA and zero unresolved review threads before native auto-merge
   is enabled; do not merge a task branch directly.
+- Treat exact-head review as the final-candidate gate, not a review loop for
+  each development commit. Batch in-contract feedback; pause remote review and
+  calibrate if feedback expands the accepted scope or loses a bounded
+  convergence path.
 - For freeform tasks, follow the requested delivery boundary without inventing
   an issue or pull request.
