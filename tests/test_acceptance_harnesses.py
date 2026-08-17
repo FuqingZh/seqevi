@@ -461,8 +461,9 @@ def test_c2_candidate_store_is_loopback_candidate_and_reaped(
     monkeypatch.setattr(globals_["httpx"], "get", lambda *_args, **_kwargs: Response())
     monkeypatch.setitem(globals_, "_require_unoccupied_store_bind", lambda *_args: None)
     monkeypatch.setitem(globals_, "_child_owns_store_listener", lambda *_args: True)
+    leader_states = iter((False, True))
     monkeypatch.setitem(
-        globals_, "_store_leader_exited_without_reap", lambda _pid: True
+        globals_, "_store_leader_exited_without_reap", lambda _pid: next(leader_states)
     )
     signalled: list[tuple[int, signal.Signals]] = []
     monkeypatch.setattr("os.killpg", lambda pid, sent: signalled.append((pid, sent)))
@@ -515,6 +516,9 @@ def test_c2_stale_endpoint_cannot_satisfy_candidate_readiness(
     monkeypatch.setattr(globals_["httpx"], "get", lambda *_args, **_kwargs: Response())
     monkeypatch.setitem(globals_, "_require_unoccupied_store_bind", lambda *_args: None)
     monkeypatch.setitem(globals_, "_child_owns_store_listener", lambda *_args: False)
+    monkeypatch.setitem(
+        globals_, "_store_leader_exited_without_reap", lambda _pid: False
+    )
     monkeypatch.setitem(globals_, "_stop_candidate_store", stopped.append)
     output_root = tmp_path / "evidence"
     output_root.mkdir()
@@ -529,6 +533,58 @@ def test_c2_stale_endpoint_cannot_satisfy_candidate_readiness(
         )
 
     assert len(stopped) == 1
+
+
+def test_c2_store_startup_exit_fences_surviving_group_before_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _c2()
+    source_root = module["_candidate_source_root"]()
+    events: list[object] = []
+
+    class Process:
+        pid = 4321
+        returncode = None
+
+        @staticmethod
+        def wait() -> int:
+            events.append("reap-leader")
+            return 1
+
+    globals_ = module["_start_candidate_store"].__globals__
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setitem(globals_, "_require_unoccupied_store_bind", lambda *_args: None)
+    leader_states = iter((True, True))
+
+    def observe_without_reap(pid: int) -> bool:
+        events.append(("observe-without-reap", pid))
+        return next(leader_states)
+
+    monkeypatch.setitem(
+        globals_, "_store_leader_exited_without_reap", observe_without_reap
+    )
+    monkeypatch.setattr(
+        "os.killpg", lambda pid, sent: events.append(("signal", pid, sent))
+    )
+    output_root = tmp_path / "evidence"
+    output_root.mkdir()
+
+    with pytest.raises(RuntimeError, match="exited during startup"):
+        module["_start_candidate_store"](
+            store="http://127.0.0.1:18083",
+            database_url="postgresql://fresh",
+            output_root=output_root,
+            source_root=source_root,
+            environment={"PYTHONPATH": str(source_root)},
+        )
+
+    assert events == [
+        ("observe-without-reap", 4321),
+        ("signal", 4321, signal.SIGTERM),
+        ("observe-without-reap", 4321),
+        ("signal", 4321, signal.SIGKILL),
+        "reap-leader",
+    ]
 
 
 def test_c2_occupied_store_bind_fails_before_child_launch(

@@ -279,10 +279,8 @@ def _start_candidate_store(
     deadline = time.monotonic() + 30.0
     try:
         while True:
-            if process.poll() is not None:
-                raise RuntimeError(
-                    f"candidate Store exited {process.returncode} at startup"
-                )
+            if _store_leader_exited_without_reap(process.pid):
+                raise RuntimeError("candidate Store exited during startup")
             try:
                 response = httpx.get(
                     f"{store.rstrip('/')}/v1/internal/claim-sessions/capabilities",
@@ -313,21 +311,20 @@ def _start_candidate_store(
 
 def _stop_candidate_store(process: subprocess.Popen[bytes]) -> None:
     global _ACTIVE_STORE_PROCESS
-    if process.returncode is None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        grace_deadline = time.monotonic() + 5.0
-        while not _store_leader_exited_without_reap(process.pid):
-            if time.monotonic() >= grace_deadline:
-                break
-            time.sleep(0.05)
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    grace_deadline = time.monotonic() + 5.0
+    while not _store_leader_exited_without_reap(process.pid):
+        if time.monotonic() >= grace_deadline:
+            break
+        time.sleep(0.05)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
     if _ACTIVE_STORE_PROCESS is process:
         _ACTIVE_STORE_PROCESS = None
 
