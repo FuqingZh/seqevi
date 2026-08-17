@@ -4,7 +4,7 @@ adapter = "dbcan-cazyme"
 platform = "linux/amd64"
 dbcan_version = "5.2.9"
 diamond_version = "2.1.15"
-image = "ghcr.io/fuqingzh/seqevi-dbcan@sha256:57976d498711ba83835485d2621b60ad4c49fcd08ab13b5bdb9105977f7b4f66"
+image = "ghcr.io/fuqingzh/seqevi-dbcan@sha256:4dc125b7c6ee28ca29a90025478938c1f3958072ff6fd076c8a4df1b9b5c747c"
 
 [resource]
 name = "dbcan"
