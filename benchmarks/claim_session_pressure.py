@@ -53,6 +53,17 @@ _PHASE_SQL_PER_OPERATION = {
 _OPERATION_DEADLINE_SECONDS = 5.0
 _REQUIRED_COUNTS = (100, 1000, 3000, 9116)
 _HARNESS_PATH = Path(__file__).resolve()
+_FRESH_DATABASE_TABLES = (
+    "sequence",
+    "artifact",
+    "evidence",
+    "evidence_claim_generations",
+    "claim_sessions",
+    "session_claims",
+    "claim_session_open_receipts",
+    "claim_session_acquire_receipts",
+    "claim_session_acquire_receipt_items",
+)
 
 
 def _records_sweep_delete_rows(phase: str) -> bool:
@@ -62,6 +73,23 @@ def _records_sweep_delete_rows(phase: str) -> bool:
 def _validate_counts(counts: list[int]) -> None:
     if tuple(counts) != _REQUIRED_COUNTS:
         raise ValueError("accepted pressure requires counts 100 1000 3000 9116 exactly")
+
+
+def _require_fresh_database(persistence: PostgresEvidencePersistence) -> None:
+    with persistence.engine.connect() as connection:
+        counts = {
+            table: cast(
+                int,
+                connection.execute(
+                    text(f'SELECT count(*) FROM "{table}"')
+                ).scalar_one(),
+            )
+            for table in _FRESH_DATABASE_TABLES
+        }
+    occupied = {table: count for table, count in counts.items() if count != 0}
+    if occupied:
+        details = ", ".join(f"{table}={count}" for table, count in occupied.items())
+        raise RuntimeError(f"pressure requires a fresh PostgreSQL database: {details}")
 
 
 def _candidate_head() -> str:
@@ -373,6 +401,11 @@ def main() -> None:
     persistence = PostgresEvidencePersistence.open(
         args.database_url, pool_size=32, max_overflow=32
     )
+    try:
+        _require_fresh_database(persistence)
+    except BaseException:
+        persistence.close()
+        raise
     statement_counts: dict[str, int] = defaultdict(int)
     statement_started: dict[int, tuple[str, float]] = {}
     statement_latencies: dict[str, list[float]] = defaultdict(list)

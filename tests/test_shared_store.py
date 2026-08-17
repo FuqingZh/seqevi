@@ -5,6 +5,7 @@ import importlib
 import os
 import logging
 import json
+import runpy
 import socket
 import subprocess
 import sys
@@ -3320,6 +3321,55 @@ def _isolated_postgres_url() -> Iterator[str]:
         with admin_engine.begin() as connection:
             connection.exec_driver_sql(f'DROP SCHEMA "{schema}" CASCADE')
         admin_engine.dispose()
+
+
+def test_pressure_fresh_database_guard_accepts_empty_and_rejects_data() -> None:
+    module = cast(
+        dict[str, Any], runpy.run_path("benchmarks/claim_session_pressure.py")
+    )
+    expected_tables = (
+        "sequence",
+        "artifact",
+        "evidence",
+        "evidence_claim_generations",
+        "claim_sessions",
+        "session_claims",
+        "claim_session_open_receipts",
+        "claim_session_acquire_receipts",
+        "claim_session_acquire_receipt_items",
+    )
+    assert module["_FRESH_DATABASE_TABLES"] == expected_tables
+
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        try:
+            module["_require_fresh_database"](persistence)
+            with persistence.engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO sequence "
+                        "(sequence_id, md5, length, sequence) "
+                        "VALUES ('sha256:occupied', :md5, 1, 'M')"
+                    ),
+                    {"md5": "0" * 32},
+                )
+                connection.execute(
+                    text(
+                        "INSERT INTO artifact "
+                        "(digest, media_type, byte_size, relative_path) "
+                        "VALUES (:digest, 'application/octet-stream', 0, "
+                        "'occupied/artifact')"
+                    ),
+                    {"digest": "1" * 64},
+                )
+
+            with pytest.raises(
+                RuntimeError,
+                match=("fresh PostgreSQL database: sequence=1, artifact=1"),
+            ):
+                module["_require_fresh_database"](persistence)
+        finally:
+            persistence.close()
 
 
 def _seed_0002_evidence(connection) -> None:
