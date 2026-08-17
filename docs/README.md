@@ -29,15 +29,12 @@ managed-v2 scientific parity and later-process replay are accepted. SeqEvi
 use their supported explicit or profile runtimes; managed setup for them is
 later feature work.
 
-> **Current ClaimSession delivery authority:** the [v1.2 closure
-> addendum](implementation-plan/20260813-v1.2-claim-session-delivery-closure-addendum.md)
-> plus the [v1.3 conflict-unfreeze
-> addendum](implementation-plan/20260813-v1.3-claim-session-conflict-unfreeze-addendum.md)
-> and the [v1.4 strict-gate exception
-> addendum](implementation-plan/20260813-v1.4-claim-session-strict-gate-exception-addendum.md)
-> govern the unchanged PR #31 delivery. The v1.4 addendum supersedes only the
-> unexecutable strict-status freshness assumption; v1.2/v1.3 otherwise remain
-> authoritative, including the temporary compatibility-line treatment below.
+> **ClaimSession delivery is closed:** generic external-tool cancellation,
+> ClaimSession authority-loss handling, PostgreSQL pressure, and the eggNOG
+> two-process C2 gate are accepted in the [cancellation and contention
+> record](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md).
+> The delivery addenda remain historical records, not active navigation for an
+> open ClaimSession pull request.
 
 ## Capability Status
 
@@ -48,15 +45,11 @@ later feature work.
 | dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; managed onboarding remains separate | [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [dbCAN plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
 | execution profiles | v1 host profiles remain compatible; managed v2.2 setup and OCI execution are implemented and accepted | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md), [managed profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
 | managed onboarding | dbCAN only for 0.2.0; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
-| shared Store cache seeding | approved staged execution plan; execution not started | [cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
-| evidence claim leases | per-EvidenceKey duplicate-suppression implementation validation accepted | [evidence contract v1.2](architecture/20260810-v1.2-sequence-evidence-contract.md), [claim-lease plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md) |
-| evidence claim coordination | ClaimSession coordination with bounded internal protocol edges, actively cancellable per-session HTTP transport, and bounded PostgreSQL maintenance acquisition; external-tool cancellation remains a separate delivery unit | [evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md), [storage architecture v1.6](architecture/20260814-v1.6-storage-deployment-architecture.md), [maintenance runbook v1.1](operations/20260813-v1.1-claim-session-store-maintenance.md) |
+| shared Store cache seeding | measured execution in progress; eggNOG C2 accepted, InterPro-Pfam serial sanity and independent zero-compute replay next | [cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
+| historical evidence claim leases | accepted per-EvidenceKey duplicate-suppression predecessor, superseded by ClaimSession coordination | [historical evidence contract v1.2](architecture/20260810-v1.2-sequence-evidence-contract.md), [historical claim-lease plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md), [current evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md) |
+| evidence claim coordination | ClaimSession coordination with bounded internal protocol edges, actively cancellable per-session HTTP transport, bounded PostgreSQL maintenance acquisition, and generic external-tool cancellation accepted | [evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md), [storage architecture v1.6](architecture/20260814-v1.6-storage-deployment-architecture.md), [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [maintenance runbook v1.1](operations/20260813-v1.1-claim-session-store-maintenance.md) |
 | shared Store claim contention hardening | ClaimSession and issue #37 cancellation accepted: cold two-process C2 at `9d417da`, plus fresh-database-guarded PostgreSQL 17 pressure at `7edc5e7` | [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [delivery rebaseline addendum and settled boundaries](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md), [ClaimSession technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md) |
 | PostgreSQL maintenance acquisition deadlines | implemented and validated; two independent fixed budgets include pool checkout and physical connect | [implementation plan](implementation-plan/20260814-v1.0-postgresql-maintenance-acquisition-deadline-plan.md) |
-
-Issue #33 review convergence retains one PR and one owner because resolver,
-artifact-reader, logical-operation drain, and close ownership form one lifecycle
-invariant. See the [HTTP review-convergence addendum](implementation-plan/20260813-v1.5-claim-session-http-review-convergence-addendum.md).
 
 ## Start Here
 
@@ -101,6 +94,7 @@ invariant. See the [HTTP review-convergence addendum](implementation-plan/202608
 39. [ClaimSession and tool cancellation technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md)
 40. [Superseded shared Store claim contention hardening plan](implementation-plan/20260811-v1.0-shared-store-claim-contention-hardening.md)
 41. [ClaimSession Store maintenance runbook](operations/20260813-v1.1-claim-session-store-maintenance.md)
+42. [ClaimSession cancellation and contention acceptance](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md)
 
 ## Managed Boundary Contracts
 
