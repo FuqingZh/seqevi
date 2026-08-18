@@ -38,12 +38,13 @@ later feature work.
 > The delivery addenda remain historical records, not active navigation for an
 > open ClaimSession pull request.
 
-> **eggNOG target-Store closeout is approved but not started:** the active
-> [closeout addendum](implementation-plan/20260817-v1.0-eggnog-target-store-closeout-implementation-plan.md)
-> first requires a compatible SeqEvi 0.3.1 corrective release and exact released
-> service/client deployment, then read-only Preflight and the bounded eggNOG
-> evidence sequence. It does not claim target-Store execution from the accepted
-> fresh-Store C2 record.
+> **eggNOG target-Store closeout is accepted:** the
+> [2026-08-18 benchmark](benchmarks/20260818-v1.0-eggnog-target-store-closeout.md)
+> records the released SeqEvi 0.3.1 service/client, fenced schema readback,
+> all-present frozen-set inventory, zero-compute target replay, and unchanged
+> Store/CAS state. It keeps the accepted fresh-Store C2 mechanism run distinct
+> from target execution. Global cache seeding remains incomplete; the next
+> step is InterPro Preflight under the master plan.
 
 ## Capability Status
 
@@ -54,7 +55,7 @@ later feature work.
 | dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; managed onboarding remains separate | [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [dbCAN plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
 | execution profiles | v1 host profiles remain compatible; managed v2.2 setup and OCI execution are implemented and accepted | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md), [managed profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
 | managed onboarding | dbCAN only for 0.2.0; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
-| shared Store cache seeding | eggNOG closeout approved but not started; SeqEvi 0.3.1 corrective release/deployment is the prerequisite before target-Store Preflight | [eggNOG closeout addendum](implementation-plan/20260817-v1.0-eggnog-target-store-closeout-implementation-plan.md), [master cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
+| shared Store cache seeding | eggNOG target-Store closeout accepted with released 0.3.1 all-present replay; global seeding incomplete; InterPro Preflight is next | [eggNOG closeout benchmark](benchmarks/20260818-v1.0-eggnog-target-store-closeout.md), [eggNOG closeout addendum](implementation-plan/20260817-v1.0-eggnog-target-store-closeout-implementation-plan.md), [master cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
 | historical evidence claim leases | accepted per-EvidenceKey duplicate-suppression predecessor, superseded by ClaimSession coordination | [historical evidence contract v1.2](architecture/20260810-v1.2-sequence-evidence-contract.md), [historical claim-lease plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md), [current evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md) |
 | evidence claim coordination | ClaimSession coordination with bounded internal protocol edges, actively cancellable per-session HTTP transport, bounded PostgreSQL maintenance acquisition, and generic external-tool cancellation accepted | [evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md), [storage architecture v1.6](architecture/20260814-v1.6-storage-deployment-architecture.md), [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [maintenance runbook v1.2](operations/20260818-v1.2-claim-session-store-maintenance.md) |
 | shared Store claim contention hardening | ClaimSession and issue #37 cancellation accepted: cold two-process C2 at `9d417da`, plus fresh-database-guarded PostgreSQL 17 pressure at `7edc5e7` | [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [delivery rebaseline addendum and settled boundaries](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md), [ClaimSession technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md) |
@@ -105,6 +106,7 @@ later feature work.
 41. [ClaimSession Store maintenance runbook](operations/20260818-v1.2-claim-session-store-maintenance.md)
 42. [ClaimSession cancellation and contention acceptance](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md)
 43. [eggNOG target-Store closeout implementation plan](implementation-plan/20260817-v1.0-eggnog-target-store-closeout-implementation-plan.md)
+44. [eggNOG target-Store closeout benchmark](benchmarks/20260818-v1.0-eggnog-target-store-closeout.md)
 
 ## Managed Boundary Contracts
 
