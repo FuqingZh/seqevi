@@ -379,6 +379,25 @@ def _run_preparation_transition(
         connection.rollback()
         raise RuntimeError("preparation acknowledgement has a stale revision")
     try:
+        if (
+            source == _AUTOMATIC_EXISTING_CEILING
+            and target == _PREPARATION_SOURCE_REVISION
+        ):
+            clock = (
+                "clock_timestamp()"
+                if connection.dialect.name == "postgresql"
+                else "CURRENT_TIMESTAMP"
+            )
+            live_claims = connection.execute(
+                text(  # noqa: S608
+                    f"SELECT count(*) FROM evidence_claim WHERE expires_at > {clock}"
+                )
+            ).scalar_one()
+            if live_claims:
+                connection.rollback()
+                raise RuntimeError(
+                    "maintenance preparation rollback refuses unexpired evidence claims"
+                )
         _remaining(deadline)
         if target == _AUTOMATIC_EXISTING_CEILING:
             command.upgrade(_configure(connection), target)

@@ -3528,6 +3528,60 @@ def test_sqlite_preparation_rejects_stale_acknowledgement(tmp_path: Path) -> Non
     engine.dispose()
 
 
+def test_sqlite_preparation_rollback_refuses_unexpired_claim(tmp_path: Path) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    engine = create_engine(f"sqlite+pysqlite:///{store_root / 'store.sqlite3'}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0003_evidence_claim_leases")
+        connection.execute(
+            text(
+                "INSERT INTO evidence_claim (sequence_id, adapter_contract_version, "
+                "tool_runtime_digest, resource_id, semantic_parameters_hash, "
+                "semantic_parameters_json, owner_token, generation, expires_at) "
+                "VALUES (:sequence_id, :adapter, :runtime, :resource, :parameters, "
+                ":parameters_json, :owner, 1, :expires_at)"
+            ),
+            {
+                "sequence_id": "sha256:" + "1" * 64,
+                "adapter": "eggnog-mapper/v1",
+                "runtime": "sha256:" + "2" * 64,
+                "resource": "sha256:" + "3" * 64,
+                "parameters": "4" * 64,
+                "parameters_json": "{}",
+                "owner": "live-owner",
+                "expires_at": datetime.now(UTC) + timedelta(minutes=5),
+            },
+        )
+        connection.commit()
+    identity = store_migration._database_identity(engine, store_root)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(RuntimeError, match="refuses unexpired evidence claims"):
+        store_migration.maintenance_prepare_database(
+            engine,
+            store_root,
+            store_migration.MaintenanceAcknowledgement(
+                identity, "0003_evidence_claim_leases"
+            ),
+            rollback=True,
+        )
+
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0003_evidence_claim_leases"  # pyright: ignore[reportPrivateUsage]
+        assert "evidence_claim" in inspect(connection).get_table_names()
+        assert (
+            connection.execute(text("SELECT count(*) FROM evidence_claim")).scalar_one()
+            == 1
+        )
+    engine.dispose()
+
+
 def test_sqlite_preparation_bounds_database_lock_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
