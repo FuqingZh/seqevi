@@ -665,6 +665,100 @@ def store_maintenance_upgrade_command(
     typer.echo("Store maintenance upgrade completed at 0004_claim_sessions")
 
 
+@app.command("store-maintenance-prepare")
+def store_maintenance_prepare_command(
+    database_url: Annotated[
+        str, typer.Option("--database-url", envvar="SEQEVI_DATABASE_URL")
+    ],
+    acknowledge_database: Annotated[str, typer.Option("--acknowledge-database")],
+    acknowledge_revision: Annotated[
+        str, typer.Option("--acknowledge-revision")
+    ] = "0002_artifact_byte_size_bigint",
+    store_root: Annotated[
+        Path | None,
+        typer.Option("--store-root", file_okay=False, resolve_path=True),
+    ] = None,
+) -> None:
+    """Prepare an acknowledged 0002 Store at the automatic 0003 ceiling."""
+
+    _run_store_preparation(
+        database_url,
+        acknowledge_database,
+        acknowledge_revision,
+        store_root,
+        rollback=False,
+    )
+    typer.echo("Store maintenance preparation completed at 0003_evidence_claim_leases")
+
+
+@app.command("store-maintenance-prepare-rollback")
+def store_maintenance_prepare_rollback_command(
+    database_url: Annotated[
+        str, typer.Option("--database-url", envvar="SEQEVI_DATABASE_URL")
+    ],
+    acknowledge_database: Annotated[str, typer.Option("--acknowledge-database")],
+    acknowledge_revision: Annotated[
+        str, typer.Option("--acknowledge-revision")
+    ] = "0003_evidence_claim_leases",
+    store_root: Annotated[
+        Path | None,
+        typer.Option("--store-root", file_okay=False, resolve_path=True),
+    ] = None,
+) -> None:
+    """Roll an acknowledged preparation-only 0003 Store back to 0002."""
+
+    _run_store_preparation(
+        database_url,
+        acknowledge_database,
+        acknowledge_revision,
+        store_root,
+        rollback=True,
+    )
+    typer.echo(
+        "Store maintenance preparation rollback completed at 0002_artifact_byte_size_bigint"
+    )
+
+
+def _run_store_preparation(
+    database_url: str,
+    acknowledge_database: str,
+    acknowledge_revision: str,
+    store_root: Path | None,
+    *,
+    rollback: bool,
+) -> None:
+    try:
+        from sqlalchemy import create_engine
+
+        from .store.migration import (
+            MaintenanceAcknowledgement,
+            maintenance_prepare_database,
+        )
+
+        from .service.config import _normalize_postgres_database_url
+
+        engine = create_engine(
+            _normalize_postgres_database_url(database_url)
+            if database_url.startswith("postgresql")
+            else database_url
+        )
+        try:
+            maintenance_prepare_database(
+                engine,
+                store_root,
+                MaintenanceAcknowledgement(
+                    database_identity=acknowledge_database,
+                    expected_revision=acknowledge_revision,
+                ),
+                rollback=rollback,
+            )
+        finally:
+            engine.dispose()
+    except Exception as error:
+        typer.echo(f"Error: {error}", err=True)
+        raise typer.Exit(code=1) from error
+
+
 @app.command("store-maintenance-downgrade")
 def store_maintenance_downgrade_command(
     database_url: Annotated[

@@ -3454,6 +3454,123 @@ def _snapshot_legacy_rows(connection) -> dict[str, tuple[tuple[object, ...], ...
     }
 
 
+def test_sqlite_acknowledged_0002_preparation_and_rollback_preserve_rows(
+    tmp_path: Path,
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    engine = create_engine(f"sqlite+pysqlite:///{store_root / 'store.sqlite3'}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0002_artifact_byte_size_bigint")
+        _seed_0002_evidence(connection)
+        before = _snapshot_legacy_rows(connection)
+        connection.commit()
+    identity = store_migration._database_identity(engine, store_root)  # pyright: ignore[reportPrivateUsage]
+
+    store_migration.maintenance_prepare_database(
+        engine,
+        store_root,
+        store_migration.MaintenanceAcknowledgement(
+            identity, "0002_artifact_byte_size_bigint"
+        ),
+    )
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0003_evidence_claim_leases"  # pyright: ignore[reportPrivateUsage]
+        assert "evidence_claim" in inspect(connection).get_table_names()
+        assert _snapshot_legacy_rows(connection) == before
+
+    store_migration.maintenance_prepare_database(
+        engine,
+        store_root,
+        store_migration.MaintenanceAcknowledgement(
+            identity, "0003_evidence_claim_leases"
+        ),
+        rollback=True,
+    )
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0002_artifact_byte_size_bigint"  # pyright: ignore[reportPrivateUsage]
+        assert "evidence_claim" not in inspect(connection).get_table_names()
+        assert _snapshot_legacy_rows(connection) == before
+    engine.dispose()
+
+
+def test_sqlite_preparation_rejects_stale_acknowledgement(tmp_path: Path) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    engine = create_engine(f"sqlite+pysqlite:///{store_root / 'store.sqlite3'}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0003_evidence_claim_leases")
+        connection.commit()
+    identity = store_migration._database_identity(engine, store_root)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(RuntimeError, match="stale revision"):
+        store_migration.maintenance_prepare_database(
+            engine,
+            store_root,
+            store_migration.MaintenanceAcknowledgement(
+                identity, "0002_artifact_byte_size_bigint"
+            ),
+        )
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0003_evidence_claim_leases"  # pyright: ignore[reportPrivateUsage]
+    engine.dispose()
+
+
+@pytest.mark.requires_postgres
+def test_postgres_acknowledged_0002_preparation_and_rollback_preserve_rows() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0002_artifact_byte_size_bigint")
+            _seed_0002_evidence(connection)
+            before = _snapshot_legacy_rows(connection)
+            connection.commit()
+        identity = store_migration._database_identity(engine)  # pyright: ignore[reportPrivateUsage]
+        store_migration.maintenance_prepare_database(
+            engine,
+            None,
+            store_migration.MaintenanceAcknowledgement(
+                identity, "0002_artifact_byte_size_bigint"
+            ),
+        )
+        with engine.connect() as connection:
+            assert store_migration._revision(connection) == "0003_evidence_claim_leases"  # pyright: ignore[reportPrivateUsage]
+            assert _snapshot_legacy_rows(connection) == before
+        store_migration.maintenance_prepare_database(
+            engine,
+            None,
+            store_migration.MaintenanceAcknowledgement(
+                identity, "0003_evidence_claim_leases"
+            ),
+            rollback=True,
+        )
+        with engine.connect() as connection:
+            assert (
+                store_migration._revision(connection)
+                == "0002_artifact_byte_size_bigint"
+            )  # pyright: ignore[reportPrivateUsage]
+            assert _snapshot_legacy_rows(connection) == before
+        engine.dispose()
+
+
 @pytest.mark.requires_postgres
 def test_postgres_migrates_artifact_byte_size_from_integer_to_bigint() -> None:
     with _isolated_postgres_url() as database_url:
