@@ -35,7 +35,7 @@ def test_dbcan_kit_manifest_is_hash_and_digest_locked() -> None:
     assert manifest.adapter.value == "dbcan-cazyme"
     assert manifest.platform == "linux/amd64"
     assert manifest.image.endswith(
-        "@sha256:4dc125b7c6ee28ca29a90025478938c1f3958072ff6fd076c8a4df1b9b5c747c"
+        "@sha256:10bb278a42ec4daab2dafc14f0d551f93f01d4a0ad1fc5acf3ba870f9c719d2e"
     )
     assert [(component.name, component.path) for component in manifest.components] == [
         ("CAZy-diamond", "CAZy.dmnd"),
