@@ -28,10 +28,13 @@ jobs:
           python-version: "3.13"
           cache: true
       - run: pdm build
+      - name: Read project version
+        id: project
+        run: echo "version=$(pdm show --version)" >> "${GITHUB_OUTPUT}"
       - name: Prepare exact-revision wheel context
         run: |
           mkdir -p "${RUNNER_TEMP}/seqevi-wheel"
-          cp dist/seqevi-0.2.0-*.whl "${RUNNER_TEMP}/seqevi-wheel/"
+          cp dist/seqevi-${{ steps.project.outputs.version }}-*.whl "${RUNNER_TEMP}/seqevi-wheel/"
           cp LICENSE "${RUNNER_TEMP}/seqevi-wheel/LICENSE"
       - uses: docker/setup-buildx-action@v3
       - name: Build runtime for pre-publication probes
@@ -43,6 +46,7 @@ jobs:
             seqevi-wheel=${{ runner.temp }}/seqevi-wheel
           build-args: |
             REVISION=${{ github.sha }}
+            VERSION=${{ steps.project.outputs.version }}
           platforms: linux/amd64
           load: true
           tags: seqevi-dbcan:release-candidate
@@ -52,7 +56,7 @@ jobs:
         run: |
           test "$(docker image inspect seqevi-dbcan:release-candidate --format '{{.Architecture}}')" = amd64
           test "$(docker image inspect seqevi-dbcan:release-candidate --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "${GITHUB_SHA}"
-          docker run --rm --entrypoint /opt/venv/bin/seqevi seqevi-dbcan:release-candidate --version | grep -Fx 0.2.0
+          docker run --rm --entrypoint /opt/venv/bin/seqevi seqevi-dbcan:release-candidate --version | grep -Fx "${{ steps.project.outputs.version }}"
           docker run --rm --entrypoint /opt/dbcan-venv/bin/run_dbcan seqevi-dbcan:release-candidate version | grep -F '5.2.9'
           docker run --rm --entrypoint diamond seqevi-dbcan:release-candidate version | grep -F '2.1.15'
           docker run --rm --entrypoint sh seqevi-dbcan:release-candidate -c \
@@ -72,10 +76,11 @@ jobs:
             seqevi-wheel=${{ runner.temp }}/seqevi-wheel
           build-args: |
             REVISION=${{ github.sha }}
+            VERSION=${{ steps.project.outputs.version }}
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/fuqingzh/seqevi-dbcan:0.2.0-rev-${{ github.sha }}
+            ghcr.io/fuqingzh/seqevi-dbcan:${{ steps.project.outputs.version }}-rev-${{ github.sha }}
             ghcr.io/fuqingzh/seqevi-dbcan:rev-${{ github.sha }}
           sbom: true
           provenance: mode=max
@@ -88,7 +93,7 @@ jobs:
           printf '%s\n' "${reference}" | tee dbcan-image-digest.txt
           docker pull "${reference}"
           test "$(docker image inspect "${reference}" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "${GITHUB_SHA}"
-          docker run --rm --entrypoint /opt/venv/bin/seqevi "${reference}" --version | grep -Fx 0.2.0
+          docker run --rm --entrypoint /opt/venv/bin/seqevi "${reference}" --version | grep -Fx "${{ steps.project.outputs.version }}"
           docker run --rm --entrypoint /opt/dbcan-venv/bin/run_dbcan "${reference}" version | grep -F '5.2.9'
           docker run --rm --entrypoint diamond "${reference}" version | grep -F '2.1.15'
           docker run --rm --entrypoint sh "${reference}" -c \

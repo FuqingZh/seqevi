@@ -25,7 +25,7 @@ def test_cli_reports_version() -> None:
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "0.2.0"
+    assert result.stdout.strip() == "0.3.0"
 
 
 def test_cli_without_command_describes_current_surface() -> None:
@@ -41,6 +41,11 @@ def test_cli_without_command_describes_current_surface() -> None:
     ("command", "maintenance_name", "revision"),
     [
         (
+            "store-maintenance-prepare",
+            "maintenance_prepare_database",
+            "0002_artifact_byte_size_bigint",
+        ),
+        (
             "store-maintenance-upgrade",
             "maintenance_upgrade_database",
             "0003_evidence_claim_leases",
@@ -49,6 +54,11 @@ def test_cli_without_command_describes_current_surface() -> None:
             "store-maintenance-downgrade",
             "maintenance_downgrade_database",
             "0004_claim_sessions",
+        ),
+        (
+            "store-maintenance-prepare-rollback",
+            "maintenance_prepare_database",
+            "0003_evidence_claim_leases",
         ),
     ],
 )
@@ -70,7 +80,7 @@ def test_maintenance_commands_normalize_postgresql_url_for_psycopg3(
 
     monkeypatch.setattr(sqlalchemy, "create_engine", fake_create_engine)
     monkeypatch.setattr(
-        f"seqevi.store.migration.{maintenance_name}", lambda *_args: None
+        f"seqevi.store.migration.{maintenance_name}", lambda *_args, **_kwargs: None
     )
     result = runner.invoke(
         app,

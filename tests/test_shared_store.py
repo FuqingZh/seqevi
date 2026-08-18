@@ -3454,6 +3454,369 @@ def _snapshot_legacy_rows(connection) -> dict[str, tuple[tuple[object, ...], ...
     }
 
 
+def test_sqlite_acknowledged_0002_preparation_and_rollback_preserve_rows(
+    tmp_path: Path,
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    engine = create_engine(f"sqlite+pysqlite:///{store_root / 'store.sqlite3'}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0002_artifact_byte_size_bigint")
+        _seed_0002_evidence(connection)
+        before = _snapshot_legacy_rows(connection)
+        connection.commit()
+    identity = store_migration._database_identity(engine, store_root)  # pyright: ignore[reportPrivateUsage]
+
+    store_migration.maintenance_prepare_database(
+        engine,
+        store_root,
+        store_migration.MaintenanceAcknowledgement(
+            identity, "0002_artifact_byte_size_bigint"
+        ),
+    )
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0003_evidence_claim_leases"  # pyright: ignore[reportPrivateUsage]
+        assert "evidence_claim" in inspect(connection).get_table_names()
+        assert _snapshot_legacy_rows(connection) == before
+
+    store_migration.maintenance_prepare_database(
+        engine,
+        store_root,
+        store_migration.MaintenanceAcknowledgement(
+            identity, "0003_evidence_claim_leases"
+        ),
+        rollback=True,
+    )
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0002_artifact_byte_size_bigint"  # pyright: ignore[reportPrivateUsage]
+        assert "evidence_claim" not in inspect(connection).get_table_names()
+        assert _snapshot_legacy_rows(connection) == before
+    engine.dispose()
+
+
+def test_sqlite_preparation_rejects_stale_acknowledgement(tmp_path: Path) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    engine = create_engine(f"sqlite+pysqlite:///{store_root / 'store.sqlite3'}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0003_evidence_claim_leases")
+        connection.commit()
+    identity = store_migration._database_identity(engine, store_root)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(RuntimeError, match="stale revision"):
+        store_migration.maintenance_prepare_database(
+            engine,
+            store_root,
+            store_migration.MaintenanceAcknowledgement(
+                identity, "0002_artifact_byte_size_bigint"
+            ),
+        )
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0003_evidence_claim_leases"  # pyright: ignore[reportPrivateUsage]
+    engine.dispose()
+
+
+def test_sqlite_preparation_rollback_refuses_unexpired_claim(tmp_path: Path) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    engine = create_engine(f"sqlite+pysqlite:///{store_root / 'store.sqlite3'}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0003_evidence_claim_leases")
+        connection.execute(
+            text(
+                "INSERT INTO evidence_claim (sequence_id, adapter_contract_version, "
+                "tool_runtime_digest, resource_id, semantic_parameters_hash, "
+                "semantic_parameters_json, owner_token, generation, expires_at) "
+                "VALUES (:sequence_id, :adapter, :runtime, :resource, :parameters, "
+                ":parameters_json, :owner, 1, :expires_at)"
+            ),
+            {
+                "sequence_id": "sha256:" + "1" * 64,
+                "adapter": "eggnog-mapper/v1",
+                "runtime": "sha256:" + "2" * 64,
+                "resource": "sha256:" + "3" * 64,
+                "parameters": "4" * 64,
+                "parameters_json": "{}",
+                "owner": "live-owner",
+                "expires_at": datetime.now(UTC) + timedelta(minutes=5),
+            },
+        )
+        connection.commit()
+    identity = store_migration._database_identity(engine, store_root)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(RuntimeError, match="refuses unexpired evidence claims"):
+        store_migration.maintenance_prepare_database(
+            engine,
+            store_root,
+            store_migration.MaintenanceAcknowledgement(
+                identity, "0003_evidence_claim_leases"
+            ),
+            rollback=True,
+        )
+
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0003_evidence_claim_leases"  # pyright: ignore[reportPrivateUsage]
+        assert "evidence_claim" in inspect(connection).get_table_names()
+        assert (
+            connection.execute(text("SELECT count(*) FROM evidence_claim")).scalar_one()
+            == 1
+        )
+    engine.dispose()
+
+
+def test_sqlite_preparation_bounds_database_lock_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0002_artifact_byte_size_bigint")
+        connection.commit()
+    identity = store_migration._database_identity(engine, store_root)  # pyright: ignore[reportPrivateUsage]
+    blocker = create_engine(f"sqlite+pysqlite:///{database_path}").connect()
+    blocker.exec_driver_sql("BEGIN EXCLUSIVE")
+    monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 0.1)
+    started = time.monotonic()
+    try:
+        with pytest.raises(DBAPIError, match="database is locked"):
+            store_migration.maintenance_prepare_database(
+                engine,
+                store_root,
+                store_migration.MaintenanceAcknowledgement(
+                    identity, "0002_artifact_byte_size_bigint"
+                ),
+            )
+        assert time.monotonic() - started < 1.0
+    finally:
+        blocker.rollback()
+        blocker.close()
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0002_artifact_byte_size_bigint"  # pyright: ignore[reportPrivateUsage]
+    engine.dispose()
+
+
+def test_postgres_preparation_invalidates_unknown_advisory_lock_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedResult:
+        def scalar_one(self) -> bool:
+            raise RuntimeError("advisory lock result was lost")
+
+    class FakeConnection:
+        invalidated = False
+
+        def exec_driver_sql(self, statement: str, _parameters: object) -> FailedResult:
+            assert "pg_try_advisory_lock" in statement
+            return FailedResult()
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+    class FakeWatchdog:
+        expired = threading.Event()
+
+        def __init__(self, _connection: object, _deadline: float) -> None:
+            pass
+
+        def cancel(self) -> None:
+            pass
+
+    connection = FakeConnection()
+
+    @contextmanager
+    def fake_connect(_engine: object, _deadline: float):
+        yield connection
+
+    def verify_cleanup(
+        cleanup_connection: FakeConnection, acquired: bool, _deadline: float
+    ) -> None:
+        assert cleanup_connection.invalidated
+        assert not acquired
+
+    monkeypatch.setattr(store_migration, "_bounded_postgres_connect", fake_connect)
+    monkeypatch.setattr(store_migration, "_MaintenanceWatchdog", FakeWatchdog)
+    monkeypatch.setattr(
+        store_migration, "_cleanup_postgres_maintenance", verify_cleanup
+    )
+
+    with pytest.raises(RuntimeError, match="advisory lock result was lost"):
+        store_migration._maintenance_prepare_postgres(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, object()),
+            "0002_artifact_byte_size_bigint",
+            "0003_evidence_claim_leases",
+            time.monotonic() + 5,
+        )
+    assert connection.invalidated
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("0002_artifact_byte_size_bigint", "0003_evidence_claim_leases"),
+        ("0003_evidence_claim_leases", "0002_artifact_byte_size_bigint"),
+    ],
+)
+def test_postgres_preparation_retries_transient_table_fence(
+    monkeypatch: pytest.MonkeyPatch, source: str, target: str
+) -> None:
+    class LockUnavailable(Exception):
+        sqlstate = "55P03"
+
+    class AdvisoryResult:
+        def scalar_one(self) -> bool:
+            return True
+
+    class FakeConnection:
+        invalidated = False
+        lock_attempts = 0
+        rollbacks = 0
+
+        def exec_driver_sql(
+            self, statement: str, _parameters: object | None = None
+        ) -> AdvisoryResult | None:
+            if "pg_try_advisory_lock" in statement:
+                return AdvisoryResult()
+            if statement.startswith("LOCK TABLE"):
+                self.lock_attempts += 1
+                if self.lock_attempts == 1:
+                    raise DBAPIError(statement, {}, LockUnavailable(), False)
+            return None
+
+        def commit(self) -> None:
+            pass
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+    class FakeWatchdog:
+        expired = threading.Event()
+
+        def __init__(self, _connection: object, _deadline: float) -> None:
+            self.cancelled = False
+
+        def commit(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    connection = FakeConnection()
+    transitions: list[tuple[str, str]] = []
+
+    @contextmanager
+    def fake_connect(_engine: object, _deadline: float):
+        yield connection
+
+    def fake_transition(
+        _connection: object,
+        transition_source: str,
+        transition_target: str,
+        _deadline: float,
+        commit: Any,
+    ) -> None:
+        transitions.append((transition_source, transition_target))
+        commit()
+
+    def verify_cleanup(
+        cleanup_connection: FakeConnection, acquired: bool, _deadline: float
+    ) -> None:
+        assert cleanup_connection is connection
+        assert acquired
+
+    monkeypatch.setattr(store_migration, "_bounded_postgres_connect", fake_connect)
+    monkeypatch.setattr(store_migration, "_MaintenanceWatchdog", FakeWatchdog)
+    monkeypatch.setattr(
+        store_migration, "_arm_postgres_transaction_timeout", FakeWatchdog
+    )
+    monkeypatch.setattr(store_migration, "_run_preparation_transition", fake_transition)
+    monkeypatch.setattr(
+        store_migration, "_cleanup_postgres_maintenance", verify_cleanup
+    )
+    monkeypatch.setattr(store_migration.random, "uniform", lambda *_args: 0.0)
+    monkeypatch.setattr(store_migration.time, "sleep", lambda _seconds: None)
+
+    store_migration._maintenance_prepare_postgres(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, object()), source, target, time.monotonic() + 5
+    )
+
+    assert connection.lock_attempts == 2
+    assert connection.rollbacks == 1
+    assert not connection.invalidated
+    assert transitions == [(source, target)]
+
+
+@pytest.mark.requires_postgres
+def test_postgres_acknowledged_0002_preparation_and_rollback_preserve_rows() -> None:
+    with _isolated_postgres_url() as database_url:
+        engine = create_engine(database_url)
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0002_artifact_byte_size_bigint")
+            _seed_0002_evidence(connection)
+            before = _snapshot_legacy_rows(connection)
+            connection.commit()
+        identity = store_migration._database_identity(engine)  # pyright: ignore[reportPrivateUsage]
+        store_migration.maintenance_prepare_database(
+            engine,
+            None,
+            store_migration.MaintenanceAcknowledgement(
+                identity, "0002_artifact_byte_size_bigint"
+            ),
+        )
+        with engine.connect() as connection:
+            assert store_migration._revision(connection) == "0003_evidence_claim_leases"  # pyright: ignore[reportPrivateUsage]
+            assert _snapshot_legacy_rows(connection) == before
+        store_migration.maintenance_prepare_database(
+            engine,
+            None,
+            store_migration.MaintenanceAcknowledgement(
+                identity, "0003_evidence_claim_leases"
+            ),
+            rollback=True,
+        )
+        with engine.connect() as connection:
+            assert (
+                store_migration._revision(connection)
+                == "0002_artifact_byte_size_bigint"
+            )  # pyright: ignore[reportPrivateUsage]
+            assert _snapshot_legacy_rows(connection) == before
+        engine.dispose()
+
+
 @pytest.mark.requires_postgres
 def test_postgres_migrates_artifact_byte_size_from_integer_to_bigint() -> None:
     with _isolated_postgres_url() as database_url:

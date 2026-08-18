@@ -1,6 +1,9 @@
 ARG PYTHON_IMAGE=python:3.13.11-slim-bookworm@sha256:ac76900038d8606cc99b413d4ede77bc7152f1e42b94cf5d50d4b80a999652fe
+ARG VERSION=0.3.0
 
 FROM ${PYTHON_IMAGE} AS builder
+
+ARG VERSION
 
 COPY requirements-seqevi.lock requirements-dbcan.lock /tmp/requirements/
 RUN python -m venv /opt/venv \
@@ -11,7 +14,7 @@ RUN python -m venv /opt/venv \
         -r /tmp/requirements/requirements-dbcan.lock
 
 COPY --from=seqevi-wheel / /tmp/seqevi-wheel/
-RUN wheel_path="$(find /tmp/seqevi-wheel -maxdepth 1 -name 'seqevi-0.2.0-*.whl' -print -quit)" \
+RUN wheel_path="$(find /tmp/seqevi-wheel -maxdepth 1 -name "seqevi-${VERSION}-*.whl" -print -quit)" \
     && test -n "${wheel_path}" \
     && /opt/venv/bin/pip install --no-cache-dir --no-deps "${wheel_path}" \
     && /opt/venv/bin/pip check \
@@ -34,7 +37,7 @@ RUN /opt/venv/bin/python /tmp/collect_python_compliance.py /tmp/seqevi-python-co
 FROM ${PYTHON_IMAGE} AS runtime
 
 ARG REVISION
-ARG VERSION=0.2.0
+ARG VERSION
 LABEL org.opencontainers.image.source="https://github.com/FuqingZh/seqevi" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.version="${VERSION}" \

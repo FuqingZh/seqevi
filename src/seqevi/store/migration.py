@@ -28,6 +28,7 @@ _MAINTENANCE_TIMEOUT_SECONDS = 60.0
 _MAINTENANCE_READBACK_TIMEOUT_SECONDS = 60.0
 _CURRENT_REVISION = "0004_claim_sessions"
 _AUTOMATIC_EXISTING_CEILING = "0003_evidence_claim_leases"
+_PREPARATION_SOURCE_REVISION = "0002_artifact_byte_size_bigint"
 _CLAIM_SESSION_TABLES = {
     "claim_sessions",
     "session_claims",
@@ -284,6 +285,215 @@ def upgrade_postgres_database(engine: Engine) -> None:
             connection.commit()
 
 
+def maintenance_prepare_database(
+    engine: Engine,
+    store_root: Path | None,
+    acknowledgement: MaintenanceAcknowledgement,
+    *,
+    rollback: bool = False,
+) -> None:
+    """Move an acknowledged existing Store between 0002 and 0003 only."""
+
+    deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
+    source = _AUTOMATIC_EXISTING_CEILING if rollback else _PREPARATION_SOURCE_REVISION
+    target = _PREPARATION_SOURCE_REVISION if rollback else _AUTOMATIC_EXISTING_CEILING
+    if acknowledgement.expected_revision != source:
+        raise RuntimeError("preparation acknowledgement has a stale revision")
+    if engine.dialect.name == "sqlite":
+        if store_root is None:
+            raise ValueError("SQLite maintenance requires the Store root")
+        database_path = _canonical_sqlite_database_path(engine, store_root)
+        identity = engine.url.set(database=str(database_path)).render_as_string(
+            hide_password=True
+        )
+        if acknowledgement.database_identity != identity:
+            raise RuntimeError("maintenance acknowledgement targets another database")
+        acknowledged_identity = _sqlite_file_identity(database_path)
+        engine.dispose()
+        with _pinned_sqlite_database(
+            database_path, acknowledged_identity
+        ) as pinned_descriptor:
+            try:
+                with (
+                    _bounded_file_lock(store_root, deadline),
+                    engine.connect() as connection,
+                ):
+                    _validate_opened_sqlite_target(
+                        connection, database_path, pinned_descriptor
+                    )
+                    remaining = _remaining(deadline)
+                    connection.exec_driver_sql(
+                        f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
+                    )
+                    raw = cast(Any, connection.connection.driver_connection)
+                    raw.set_progress_handler(
+                        lambda: 1 if time.monotonic() >= deadline else 0, 1000
+                    )
+                    try:
+                        connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                        _run_preparation_transition(
+                            connection, source, target, deadline
+                        )
+                        _validate_opened_sqlite_target(
+                            connection, database_path, pinned_descriptor
+                        )
+                    finally:
+                        raw.set_progress_handler(None, 0)
+            except _AmbiguousMaintenanceCommit as error:
+                _classify_ambiguous_transition(
+                    engine,
+                    source,
+                    target,
+                    _readback_deadline(),
+                    error,
+                    sqlite_binding=(database_path, pinned_descriptor),
+                )
+                return
+            _verify_maintenance_completion(
+                engine,
+                target,
+                _readback_deadline(),
+                sqlite_binding=(database_path, pinned_descriptor),
+            )
+        return
+    if acknowledgement.database_identity != _database_identity(engine, store_root):
+        raise RuntimeError("maintenance acknowledgement targets another database")
+    try:
+        _maintenance_prepare_postgres(engine, source, target, deadline)
+    except _AmbiguousMaintenanceCommit as error:
+        _classify_ambiguous_transition(
+            engine, source, target, _readback_deadline(), error
+        )
+        return
+    _verify_maintenance_completion(engine, target, _readback_deadline())
+
+
+def _run_preparation_transition(
+    connection: Connection,
+    source: str,
+    target: str,
+    deadline: float,
+    commit: Callable[[], None] | None = None,
+) -> None:
+    if _revision(connection) != source:
+        connection.rollback()
+        raise RuntimeError("preparation acknowledgement has a stale revision")
+    try:
+        if (
+            source == _AUTOMATIC_EXISTING_CEILING
+            and target == _PREPARATION_SOURCE_REVISION
+        ):
+            clock = (
+                "clock_timestamp()"
+                if connection.dialect.name == "postgresql"
+                else "CURRENT_TIMESTAMP"
+            )
+            live_claims = connection.execute(
+                text(  # noqa: S608
+                    f"SELECT count(*) FROM evidence_claim WHERE expires_at > {clock}"
+                )
+            ).scalar_one()
+            if live_claims:
+                connection.rollback()
+                raise RuntimeError(
+                    "maintenance preparation rollback refuses unexpired evidence claims"
+                )
+        _remaining(deadline)
+        if target == _AUTOMATIC_EXISTING_CEILING:
+            command.upgrade(_configure(connection), target)
+        else:
+            command.downgrade(_configure(connection), target)
+        _remaining(deadline)
+        if commit is None:
+            try:
+                connection.commit()
+            except DBAPIError as error:
+                raise _AmbiguousMaintenanceCommit from error
+        else:
+            commit()
+    except _AmbiguousMaintenanceCommit:
+        raise
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def _maintenance_prepare_postgres(
+    engine: Engine, source: str, target: str, deadline: float
+) -> None:
+    with _bounded_postgres_connect(engine, deadline) as connection:
+        acquired = False
+        primary: BaseException | None = None
+        cleanup: BaseException | None = None
+        try:
+            while not acquired:
+                lock_watchdog = _MaintenanceWatchdog(connection, deadline)
+                try:
+                    acquired = bool(
+                        connection.exec_driver_sql(
+                            "SELECT pg_try_advisory_lock(%s)",
+                            (_POSTGRES_MIGRATION_LOCK_ID,),
+                        ).scalar_one()
+                    )
+                    connection.commit()
+                except BaseException:
+                    connection.invalidate()
+                    raise
+                finally:
+                    lock_watchdog.cancel()
+                if lock_watchdog.expired.is_set():
+                    connection.invalidate()
+                    raise TimeoutError(
+                        "ClaimSession maintenance advisory lock exceeded deadline"
+                    )
+                if not acquired:
+                    time.sleep(min(random.uniform(1.0, 5.0), _remaining(deadline)))
+            while True:
+                watchdog: _MaintenanceWatchdog | None = None
+                try:
+                    watchdog = _arm_postgres_transaction_timeout(connection, deadline)
+                    connection.exec_driver_sql("BEGIN")
+                    lock_ms = max(min(int(_remaining(deadline) * 1000), 5000), 1)
+                    connection.exec_driver_sql(
+                        f"SET LOCAL lock_timeout = '{lock_ms}ms'"
+                    )
+                    tables = "sequence, artifact, evidence"
+                    if source == _AUTOMATIC_EXISTING_CEILING:
+                        tables += ", evidence_claim"
+                    connection.exec_driver_sql(
+                        f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE"
+                    )
+                    _run_preparation_transition(
+                        connection, source, target, deadline, watchdog.commit
+                    )
+                    break
+                except DBAPIError as error:
+                    connection.rollback()
+                    sqlstate = getattr(error.orig, "sqlstate", None) or getattr(
+                        error.orig, "pgcode", None
+                    )
+                    if sqlstate not in {"40P01", "55P03"}:
+                        raise
+                    time.sleep(min(random.uniform(1.0, 5.0), _remaining(deadline)))
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
+        except BaseException as error:
+            primary = error
+        finally:
+            try:
+                _cleanup_postgres_maintenance(connection, acquired, deadline)
+            except BaseException as error:
+                cleanup = error
+                connection.invalidate()
+        if primary is not None:
+            if cleanup is not None:
+                primary.add_note(f"maintenance connection cleanup failed: {cleanup!r}")
+            raise primary
+        if cleanup is not None:
+            raise cleanup
+
+
 def maintenance_upgrade_database(
     engine: Engine,
     store_root: Path | None,
@@ -505,6 +715,8 @@ def _state_matches_target(revision: str | None, tables: set[str], target: str) -
         return False
     if target == _CURRENT_REVISION:
         return _CLAIM_SESSION_TABLES <= tables and "evidence_claim" not in tables
+    if target == _PREPARATION_SOURCE_REVISION:
+        return "evidence_claim" not in tables and not (_CLAIM_SESSION_TABLES & tables)
     return "evidence_claim" in tables and not (_CLAIM_SESSION_TABLES & tables)
 
 
@@ -540,6 +752,27 @@ def _classify_ambiguous_maintenance(
         if target == _CURRENT_REVISION
         else _CURRENT_REVISION
     )
+    if _state_matches_target(revision, tables, source):
+        raise RuntimeError(
+            "maintenance commit did not change the acknowledged source schema"
+        ) from error
+    raise RuntimeError("maintenance commit outcome left mixed schema state") from error
+
+
+def _classify_ambiguous_transition(
+    engine: Engine,
+    source: str,
+    target: str,
+    deadline: float,
+    error: BaseException,
+    *,
+    sqlite_binding: tuple[Path, int] | None = None,
+) -> None:
+    revision, tables = _maintenance_state(
+        engine, deadline, sqlite_binding=sqlite_binding
+    )
+    if _state_matches_target(revision, tables, target):
+        return
     if _state_matches_target(revision, tables, source):
         raise RuntimeError(
             "maintenance commit did not change the acknowledged source schema"

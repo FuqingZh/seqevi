@@ -35,7 +35,7 @@ def test_dbcan_kit_manifest_is_hash_and_digest_locked() -> None:
     assert manifest.adapter.value == "dbcan-cazyme"
     assert manifest.platform == "linux/amd64"
     assert manifest.image.endswith(
-        "@sha256:57976d498711ba83835485d2621b60ad4c49fcd08ab13b5bdb9105977f7b4f66"
+        "@sha256:4dc125b7c6ee28ca29a90025478938c1f3958072ff6fd076c8a4df1b9b5c747c"
     )
     assert [(component.name, component.path) for component in manifest.components] == [
         ("CAZy-diamond", "CAZy.dmnd"),
@@ -83,7 +83,7 @@ def _write_v2_profile(path: Path, resource: Path, **extra: str) -> None:
         'kind = "oci"',
         'kit_id = "dbcan-cazyme-5.2.9-db-2026.05.05"',
         'engine = "docker"',
-        'image = "ghcr.io/fuqingzh/seqevi-dbcan@sha256:57976d498711ba83835485d2621b60ad4c49fcd08ab13b5bdb9105977f7b4f66"',
+        'image = "ghcr.io/fuqingzh/seqevi-dbcan@sha256:4dc125b7c6ee28ca29a90025478938c1f3958072ff6fd076c8a4df1b9b5c747c"',
     ]
     lines.extend(f"{key} = {value!r}" for key, value in extra.items())
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
