@@ -3675,6 +3675,105 @@ def test_postgres_preparation_invalidates_unknown_advisory_lock_outcome(
     assert connection.invalidated
 
 
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("0002_artifact_byte_size_bigint", "0003_evidence_claim_leases"),
+        ("0003_evidence_claim_leases", "0002_artifact_byte_size_bigint"),
+    ],
+)
+def test_postgres_preparation_retries_transient_table_fence(
+    monkeypatch: pytest.MonkeyPatch, source: str, target: str
+) -> None:
+    class LockUnavailable(Exception):
+        sqlstate = "55P03"
+
+    class AdvisoryResult:
+        def scalar_one(self) -> bool:
+            return True
+
+    class FakeConnection:
+        invalidated = False
+        lock_attempts = 0
+        rollbacks = 0
+
+        def exec_driver_sql(
+            self, statement: str, _parameters: object | None = None
+        ) -> AdvisoryResult | None:
+            if "pg_try_advisory_lock" in statement:
+                return AdvisoryResult()
+            if statement.startswith("LOCK TABLE"):
+                self.lock_attempts += 1
+                if self.lock_attempts == 1:
+                    raise DBAPIError(statement, {}, LockUnavailable(), False)
+            return None
+
+        def commit(self) -> None:
+            pass
+
+        def rollback(self) -> None:
+            self.rollbacks += 1
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+    class FakeWatchdog:
+        expired = threading.Event()
+
+        def __init__(self, _connection: object, _deadline: float) -> None:
+            self.cancelled = False
+
+        def commit(self) -> None:
+            pass
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    connection = FakeConnection()
+    transitions: list[tuple[str, str]] = []
+
+    @contextmanager
+    def fake_connect(_engine: object, _deadline: float):
+        yield connection
+
+    def fake_transition(
+        _connection: object,
+        transition_source: str,
+        transition_target: str,
+        _deadline: float,
+        commit: Any,
+    ) -> None:
+        transitions.append((transition_source, transition_target))
+        commit()
+
+    def verify_cleanup(
+        cleanup_connection: FakeConnection, acquired: bool, _deadline: float
+    ) -> None:
+        assert cleanup_connection is connection
+        assert acquired
+
+    monkeypatch.setattr(store_migration, "_bounded_postgres_connect", fake_connect)
+    monkeypatch.setattr(store_migration, "_MaintenanceWatchdog", FakeWatchdog)
+    monkeypatch.setattr(
+        store_migration, "_arm_postgres_transaction_timeout", FakeWatchdog
+    )
+    monkeypatch.setattr(store_migration, "_run_preparation_transition", fake_transition)
+    monkeypatch.setattr(
+        store_migration, "_cleanup_postgres_maintenance", verify_cleanup
+    )
+    monkeypatch.setattr(store_migration.random, "uniform", lambda *_args: 0.0)
+    monkeypatch.setattr(store_migration.time, "sleep", lambda _seconds: None)
+
+    store_migration._maintenance_prepare_postgres(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, object()), source, target, time.monotonic() + 5
+    )
+
+    assert connection.lock_attempts == 2
+    assert connection.rollbacks == 1
+    assert not connection.invalidated
+    assert transitions == [(source, target)]
+
+
 @pytest.mark.requires_postgres
 def test_postgres_acknowledged_0002_preparation_and_rollback_preserve_rows() -> None:
     with _isolated_postgres_url() as database_url:

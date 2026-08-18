@@ -448,22 +448,36 @@ def _maintenance_prepare_postgres(
                     )
                 if not acquired:
                     time.sleep(min(random.uniform(1.0, 5.0), _remaining(deadline)))
-            watchdog = _arm_postgres_transaction_timeout(connection, deadline)
-            try:
-                connection.exec_driver_sql("BEGIN")
-                lock_ms = max(min(int(_remaining(deadline) * 1000), 5000), 1)
-                connection.exec_driver_sql(f"SET LOCAL lock_timeout = '{lock_ms}ms'")
-                tables = "sequence, artifact, evidence"
-                if source == _AUTOMATIC_EXISTING_CEILING:
-                    tables += ", evidence_claim"
-                connection.exec_driver_sql(
-                    f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE"
-                )
-                _run_preparation_transition(
-                    connection, source, target, deadline, watchdog.commit
-                )
-            finally:
-                watchdog.cancel()
+            while True:
+                watchdog: _MaintenanceWatchdog | None = None
+                try:
+                    watchdog = _arm_postgres_transaction_timeout(connection, deadline)
+                    connection.exec_driver_sql("BEGIN")
+                    lock_ms = max(min(int(_remaining(deadline) * 1000), 5000), 1)
+                    connection.exec_driver_sql(
+                        f"SET LOCAL lock_timeout = '{lock_ms}ms'"
+                    )
+                    tables = "sequence, artifact, evidence"
+                    if source == _AUTOMATIC_EXISTING_CEILING:
+                        tables += ", evidence_claim"
+                    connection.exec_driver_sql(
+                        f"LOCK TABLE {tables} IN ACCESS EXCLUSIVE MODE"
+                    )
+                    _run_preparation_transition(
+                        connection, source, target, deadline, watchdog.commit
+                    )
+                    break
+                except DBAPIError as error:
+                    connection.rollback()
+                    sqlstate = getattr(error.orig, "sqlstate", None) or getattr(
+                        error.orig, "pgcode", None
+                    )
+                    if sqlstate not in {"40P01", "55P03"}:
+                        raise
+                    time.sleep(min(random.uniform(1.0, 5.0), _remaining(deadline)))
+                finally:
+                    if watchdog is not None:
+                        watchdog.cancel()
         except BaseException as error:
             primary = error
         finally:
