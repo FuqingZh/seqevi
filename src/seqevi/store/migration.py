@@ -321,11 +321,24 @@ def maintenance_prepare_database(
                     _validate_opened_sqlite_target(
                         connection, database_path, pinned_descriptor
                     )
-                    connection.exec_driver_sql("BEGIN EXCLUSIVE")
-                    _run_preparation_transition(connection, source, target, deadline)
-                    _validate_opened_sqlite_target(
-                        connection, database_path, pinned_descriptor
+                    remaining = _remaining(deadline)
+                    connection.exec_driver_sql(
+                        f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
                     )
+                    raw = cast(Any, connection.connection.driver_connection)
+                    raw.set_progress_handler(
+                        lambda: 1 if time.monotonic() >= deadline else 0, 1000
+                    )
+                    try:
+                        connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                        _run_preparation_transition(
+                            connection, source, target, deadline
+                        )
+                        _validate_opened_sqlite_target(
+                            connection, database_path, pinned_descriptor
+                        )
+                    finally:
+                        raw.set_progress_handler(None, 0)
             except _AmbiguousMaintenanceCommit as error:
                 _classify_ambiguous_transition(
                     engine,

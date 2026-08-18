@@ -3528,6 +3528,45 @@ def test_sqlite_preparation_rejects_stale_acknowledgement(tmp_path: Path) -> Non
     engine.dispose()
 
 
+def test_sqlite_preparation_bounds_database_lock_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_root = tmp_path / "store"
+    store_root.mkdir()
+    database_path = store_root / "store.sqlite3"
+    engine = create_engine(f"sqlite+pysqlite:///{database_path}")
+    config = Config()
+    config.set_main_option(
+        "script_location",
+        str(Path(store_migration.__file__).with_name("migrations")),
+    )
+    with engine.connect() as connection:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "0002_artifact_byte_size_bigint")
+        connection.commit()
+    identity = store_migration._database_identity(engine, store_root)  # pyright: ignore[reportPrivateUsage]
+    blocker = create_engine(f"sqlite+pysqlite:///{database_path}").connect()
+    blocker.exec_driver_sql("BEGIN EXCLUSIVE")
+    monkeypatch.setattr(store_migration, "_MAINTENANCE_TIMEOUT_SECONDS", 0.1)
+    started = time.monotonic()
+    try:
+        with pytest.raises(DBAPIError, match="database is locked"):
+            store_migration.maintenance_prepare_database(
+                engine,
+                store_root,
+                store_migration.MaintenanceAcknowledgement(
+                    identity, "0002_artifact_byte_size_bigint"
+                ),
+            )
+        assert time.monotonic() - started < 1.0
+    finally:
+        blocker.rollback()
+        blocker.close()
+    with engine.connect() as connection:
+        assert store_migration._revision(connection) == "0002_artifact_byte_size_bigint"  # pyright: ignore[reportPrivateUsage]
+    engine.dispose()
+
+
 @pytest.mark.requires_postgres
 def test_postgres_acknowledged_0002_preparation_and_rollback_preserve_rows() -> None:
     with _isolated_postgres_url() as database_url:
