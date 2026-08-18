@@ -3567,6 +3567,60 @@ def test_sqlite_preparation_bounds_database_lock_wait(
     engine.dispose()
 
 
+def test_postgres_preparation_invalidates_unknown_advisory_lock_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedResult:
+        def scalar_one(self) -> bool:
+            raise RuntimeError("advisory lock result was lost")
+
+    class FakeConnection:
+        invalidated = False
+
+        def exec_driver_sql(self, statement: str, _parameters: object) -> FailedResult:
+            assert "pg_try_advisory_lock" in statement
+            return FailedResult()
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+    class FakeWatchdog:
+        expired = threading.Event()
+
+        def __init__(self, _connection: object, _deadline: float) -> None:
+            pass
+
+        def cancel(self) -> None:
+            pass
+
+    connection = FakeConnection()
+
+    @contextmanager
+    def fake_connect(_engine: object, _deadline: float):
+        yield connection
+
+    def verify_cleanup(
+        cleanup_connection: FakeConnection, acquired: bool, _deadline: float
+    ) -> None:
+        assert cleanup_connection.invalidated
+        assert not acquired
+
+    monkeypatch.setattr(store_migration, "_bounded_postgres_connect", fake_connect)
+    monkeypatch.setattr(store_migration, "_MaintenanceWatchdog", FakeWatchdog)
+    monkeypatch.setattr(
+        store_migration, "_cleanup_postgres_maintenance", verify_cleanup
+    )
+
+    with pytest.raises(RuntimeError, match="advisory lock result was lost"):
+        store_migration._maintenance_prepare_postgres(  # pyright: ignore[reportPrivateUsage]
+            cast(Any, object()),
+            "0002_artifact_byte_size_bigint",
+            "0003_evidence_claim_leases",
+            time.monotonic() + 5,
+        )
+    assert connection.invalidated
+
+
 @pytest.mark.requires_postgres
 def test_postgres_acknowledged_0002_preparation_and_rollback_preserve_rows() -> None:
     with _isolated_postgres_url() as database_url:

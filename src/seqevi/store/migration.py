@@ -417,6 +417,9 @@ def _maintenance_prepare_postgres(
                         ).scalar_one()
                     )
                     connection.commit()
+                except BaseException:
+                    connection.invalidate()
+                    raise
                 finally:
                     lock_watchdog.cancel()
                 if lock_watchdog.expired.is_set():
