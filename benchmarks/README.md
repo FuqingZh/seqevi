@@ -79,10 +79,12 @@ watchdog, bounded TERM/KILL cleanup, and independent stdout/stderr paths. The
 benchmark-only `acceptance_annotation.py` bridge propagates watchdog TERM into
 the in-process CLI so the unchanged inner adapter `ToolRunner` also cleans its
 separate process group; completed failures remain stable for idempotent C2
-reaping. The
-Store endpoint and database must be fresh, isolated, and served by the exact
-candidate head; the two caller-owned FASTAs and named execution profile remain
-external:
+reaping. C2 invokes that frozen bridge by explicit file path under `python -P`;
+the child keeps `PYTHONPATH` limited to candidate `src`, and the bridge loads
+its sibling containment helper without relying on repository-root import
+state. The Store endpoint and database must be fresh, isolated, and served by
+the exact candidate head; the two caller-owned FASTAs and named execution
+profile remain external:
 
 ```bash
 PYTHONPATH=src:. pdm run python benchmarks/c2_acceptance.py \
