@@ -82,15 +82,18 @@ class _Process:
         self.return_code: int | None = None
         self.signals: list[signal.Signals] = []
         self.waited = False
+        self.cancellation_requested = False
 
     def poll(self) -> int | None:
         return self.return_code
 
     def send_signal(self, sent_signal: signal.Signals) -> None:
         self.signals.append(sent_signal)
+        self.cancellation_requested = True
         self.return_code = -int(sent_signal)
 
-    def wait(self) -> int:
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
         self.waited = True
         assert self.return_code is not None
         return self.return_code
@@ -101,11 +104,11 @@ class _InterruptingWaitProcess(_Process):
         super().__init__()
         self.wait_attempts = 0
 
-    def wait(self) -> int:
+    def wait(self, timeout: float | None = None) -> int:
         self.wait_attempts += 1
         if self.wait_attempts == 1:
             raise SystemExit(7)
-        return super().wait()
+        return super().wait(timeout)
 
 
 def test_c2_interrupt_terminates_and_reaps_every_initial_child(

@@ -34,6 +34,7 @@ from seqevi.sequence import read_fasta
 from seqevi.service.persistence import PostgresEvidencePersistence
 
 _HARNESS_PATH = Path(__file__).resolve()
+_CLEANUP_DEADLINE_SECONDS = 65.0
 _REQUIRED_THREADS = 64
 _REQUIRED_PROFILE = "eggnog-5.0.2"
 _FROZEN_INPUT_SHA256 = {
@@ -445,25 +446,53 @@ def _result(path: Path, return_code: int) -> dict[str, object]:
 def _stop_and_reap(
     processes: dict[str, ContainedAcceptanceProcess],
 ) -> BaseException | None:
+    def defer(current: BaseException | None, error: BaseException) -> BaseException:
+        if current is None:
+            return error
+        if error is not current:
+            current.add_note(
+                f"additional cleanup failure: {type(error).__name__}: {error}"
+            )
+        return current
+
     deferred: BaseException | None = None
     for process in processes.values():
-        try:
-            if process.poll() is None:
-                process.send_signal(signal.SIGINT)
-        except ProcessLookupError:
-            pass
-        except BaseException as error:
-            deferred = deferred or error
-    for process in processes.values():
-        for attempt in range(2):
+        deadline = time.monotonic() + _CLEANUP_DEADLINE_SECONDS
+        while True:
             try:
-                process.wait()
+                if process.poll() is not None or process.cancellation_requested:
+                    break
+                process.send_signal(signal.SIGINT)
+            except ProcessLookupError:
                 break
             except BaseException as error:
-                deferred = deferred or error
-                if attempt == 1:
+                deferred = defer(deferred, error)
+            if time.monotonic() >= deadline:
+                deferred = defer(
+                    deferred,
+                    TimeoutError("acceptance cancellation request deadline expired"),
+                )
+                break
+    for process in processes.values():
+        deadline = time.monotonic() + _CLEANUP_DEADLINE_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                deferred = defer(
+                    deferred,
+                    TimeoutError("acceptance cleanup wait deadline expired"),
+                )
+                break
+            try:
+                process.wait(timeout=remaining)
+                break
+            except BaseException as error:
+                deferred = defer(deferred, error)
+                if isinstance(error, TimeoutError):
                     break
-        deferred = deferred or getattr(process, "completed_error", None)
+        completed_error = getattr(process, "completed_error", None)
+        if completed_error is not None:
+            deferred = defer(deferred, completed_error)
     return deferred
 
 

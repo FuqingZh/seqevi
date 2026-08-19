@@ -214,18 +214,56 @@ def test_completed_cancellation_is_idempotent(tmp_path: Path) -> None:
 
 
 def test_initial_timeout_precedes_sibling_cleanup_cancellation(tmp_path: Path) -> None:
+    class InterruptingCleanupProcess:
+        def __init__(
+            self,
+            delegate,
+            trigger,
+        ) -> None:
+            self.delegate = delegate
+            self.trigger = trigger
+            self.poll_interrupted = False
+            self.send_attempts = 0
+
+        @property
+        def cancellation_requested(self) -> bool:
+            return self.delegate.cancellation_requested
+
+        @property
+        def completed_error(self):
+            return self.delegate.completed_error
+
+        def poll(self):
+            if self.trigger.completed_error is not None and not self.poll_interrupted:
+                self.poll_interrupted = True
+                raise KeyboardInterrupt("injected during sibling poll")
+            return self.delegate.poll()
+
+        def send_signal(self, sent_signal: signal.Signals) -> None:
+            self.send_attempts += 1
+            if self.send_attempts == 1:
+                raise KeyboardInterrupt("injected during sibling cancellation")
+            self.delegate.send_signal(sent_signal)
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.delegate.wait(timeout)
+
     timed_out = _start(
         tmp_path,
         "import time;time.sleep(30)",
-        watchdog_seconds=0.5,
+        watchdog_seconds=1.0,
     )
     sibling_root = tmp_path / "sibling"
     sibling_root.mkdir()
-    sibling = _start(
+    sibling_pid = sibling_root / "sibling.pid"
+    sibling_process = _start(
         sibling_root,
-        "import time;time.sleep(30)",
+        "import os,pathlib,time;"
+        f"pathlib.Path({str(sibling_pid)!r}).write_text(str(os.getpid()));"
+        "time.sleep(30)",
         watchdog_seconds=5.0,
     )
+    sibling = InterruptingCleanupProcess(sibling_process, timed_out)
     c2 = runpy.run_path("benchmarks/c2_acceptance.py")
 
     with pytest.raises(ToolTimeoutError) as raised:
@@ -233,13 +271,19 @@ def test_initial_timeout_precedes_sibling_cleanup_cancellation(tmp_path: Path) -
 
     assert raised.value is timed_out.completed_error
     assert isinstance(sibling.completed_error, ToolCancelledError)
-    assert raised.value.__cause__ is sibling.completed_error
+    assert isinstance(raised.value.__cause__, KeyboardInterrupt)
     assert any(
-        "sibling cleanup also failed: ToolCancelledError" in note
+        "sibling cleanup also failed: KeyboardInterrupt" in note
         for note in raised.value.__notes__
     )
+    assert sibling.poll_interrupted is True
+    assert sibling.send_attempts == 2
+    assert sibling.cancellation_requested is True
     assert timed_out.poll() is not None
     assert sibling.poll() is not None
+    leader = int(sibling_pid.read_text())
+    assert not _is_live(leader)
+    assert _live_group_members(leader) == []
 
 
 def test_watchdog_unwinds_nested_toolrunner_group_and_descendant(

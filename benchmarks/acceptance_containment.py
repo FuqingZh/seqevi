@@ -68,6 +68,12 @@ class ContainedAcceptanceProcess:
             raise ValueError("acceptance handle supports cancellation signals only")
         self._cancel.set()
 
+    @property
+    def cancellation_requested(self) -> bool:
+        """Report whether cleanup has durably requested cancellation."""
+
+        return self._cancel.is_set()
+
     def wait(self, timeout: float | None = None) -> int:
         if not self._done.wait(timeout):
             raise TimeoutError("acceptance containment worker did not finish")
