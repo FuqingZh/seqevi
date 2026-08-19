@@ -254,15 +254,18 @@ def test_c2_annotation_child_uses_safe_candidate_execution(
     source_root = module["_candidate_source_root"]()
     observed: dict[str, object] = {}
 
-    class Process:
-        pass
+    process = object()
 
-    def popen(command: tuple[str, ...], **kwargs: object) -> Process:
-        observed.update(command=command, **kwargs)
-        return Process()
+    def start_contained_annotation(**kwargs: object) -> object:
+        observed.update(kwargs)
+        return process
 
-    monkeypatch.setattr(subprocess, "Popen", popen)
-    module["_run_command"](
+    monkeypatch.setitem(
+        module["_run_command"].__globals__,
+        "start_contained_annotation",
+        start_contained_annotation,
+    )
+    returned = module["_run_command"](
         fasta=tmp_path / "input.fasta",
         output=tmp_path / "result.duckdb",
         profile="eggnog-5.0.2",
@@ -274,9 +277,18 @@ def test_c2_annotation_child_uses_safe_candidate_execution(
         candidate_source_root=source_root,
     )
 
-    assert cast(tuple[str, ...], observed["command"])[1:3] == ("-P", "-m")
-    assert observed["cwd"] == source_root.parent
-    assert cast(dict[str, str], observed["env"])["PYTHONPATH"] == str(source_root)
+    arguments = cast(tuple[str, ...], observed["arguments"])
+    assert returned is process
+    assert arguments[1:3] == ("-P", "-m")
+    assert arguments[arguments.index("--timeout-seconds") + 1] == "21600.0"
+    assert observed["working_dir"] == source_root.parent
+    assert cast(dict[str, str], observed["environment"])["PYTHONPATH"] == str(
+        source_root
+    )
+    timeouts = cast(Any, observed["timeouts"])
+    assert timeouts.internal_seconds == 21_600
+    assert timeouts.watchdog_seconds == 21_660
+    assert timeouts.termination_grace_seconds == 30
 
 
 def test_pressure_listener_includes_final_cleanup_deletes() -> None:

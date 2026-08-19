@@ -25,6 +25,11 @@ import psycopg
 from psycopg import sql
 import seqevi.service.persistence as persistence_module
 
+from benchmarks.acceptance_containment import (
+    AcceptanceTimeouts,
+    ContainedAcceptanceProcess,
+    start_contained_annotation,
+)
 from seqevi.sequence import read_fasta
 from seqevi.service.persistence import PostgresEvidencePersistence
 
@@ -50,6 +55,9 @@ _FROZEN_RESULT_IDENTITY = {
     ),
 }
 _OPEN_RECEIPT_RETENTION_SECONDS = 120.0
+_ANNOTATION_TIMEOUT_SECONDS = 21_600.0
+_EXTERNAL_WATCHDOG_SECONDS = 21_660.0
+_TERMINATION_GRACE_SECONDS = 30.0
 _ACTIVE_STORE_PROCESS: subprocess.Popen[bytes] | None = None
 
 
@@ -390,7 +398,7 @@ def _run_command(
     stderr_path: Path,
     environment: Mapping[str, str],
     candidate_source_root: Path,
-) -> subprocess.Popen[bytes]:
+) -> ContainedAcceptanceProcess:
     command = (
         sys.executable,
         "-P",
@@ -407,24 +415,22 @@ def _run_command(
         store,
         "--threads",
         str(threads),
+        "--timeout-seconds",
+        str(_ANNOTATION_TIMEOUT_SECONDS),
         "--json",
     )
-    stdout = stdout_path.open("wb")
-    stderr = stderr_path.open("wb")
-    try:
-        process = subprocess.Popen(  # noqa: S603
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
-            env=dict(environment),
-            cwd=candidate_source_root.parent,
-        )
-    finally:
-        stdout.close()
-        stderr.close()
-    return process
+    return start_contained_annotation(
+        arguments=command,
+        working_dir=candidate_source_root.parent,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        environment=environment,
+        timeouts=AcceptanceTimeouts(
+            internal_seconds=_ANNOTATION_TIMEOUT_SECONDS,
+            watchdog_seconds=_EXTERNAL_WATCHDOG_SECONDS,
+            termination_grace_seconds=_TERMINATION_GRACE_SECONDS,
+        ),
+    )
 
 
 def _result(path: Path, return_code: int) -> dict[str, object]:
@@ -438,7 +444,7 @@ def _result(path: Path, return_code: int) -> dict[str, object]:
 
 
 def _stop_and_reap(
-    processes: dict[str, subprocess.Popen[bytes]],
+    processes: dict[str, ContainedAcceptanceProcess],
 ) -> BaseException | None:
     deferred: BaseException | None = None
     for process in processes.values():
@@ -464,7 +470,7 @@ def _stop_and_reap(
 
 
 def _wait_initial(
-    processes: dict[str, subprocess.Popen[bytes]],
+    processes: dict[str, ContainedAcceptanceProcess],
     child_finished: Callable[[str], None] | None = None,
 ) -> dict[str, int]:
     return_codes: dict[str, int] = {}
@@ -941,6 +947,11 @@ def _main() -> None:
         "python": platform.python_version(),
         "profile": args.profile,
         "threads_per_process": args.threads,
+        "annotation_containment": {
+            "internal_timeout_seconds": _ANNOTATION_TIMEOUT_SECONDS,
+            "external_watchdog_seconds": _EXTERNAL_WATCHDOG_SECONDS,
+            "termination_grace_seconds": _TERMINATION_GRACE_SECONDS,
+        },
         "annotation_child_environment": _child_environment_record(child_environment),
         "annotation_candidate_import": candidate_import,
         "store_service": store_service,

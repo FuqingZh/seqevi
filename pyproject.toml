@@ -89,7 +89,7 @@ venv = ".venv"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 addopts = ["-ra", "--import-mode=importlib", "--randomly-seed=42"]
 strict_config = true
 strict_markers = true
