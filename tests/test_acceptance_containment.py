@@ -213,6 +213,35 @@ def test_completed_cancellation_is_idempotent(tmp_path: Path) -> None:
     assert isinstance(process.completed_error, ToolCancelledError)
 
 
+def test_initial_timeout_precedes_sibling_cleanup_cancellation(tmp_path: Path) -> None:
+    timed_out = _start(
+        tmp_path,
+        "import time;time.sleep(30)",
+        watchdog_seconds=0.5,
+    )
+    sibling_root = tmp_path / "sibling"
+    sibling_root.mkdir()
+    sibling = _start(
+        sibling_root,
+        "import time;time.sleep(30)",
+        watchdog_seconds=5.0,
+    )
+    c2 = runpy.run_path("benchmarks/c2_acceptance.py")
+
+    with pytest.raises(ToolTimeoutError) as raised:
+        c2["_wait_initial"]({"timed-out": timed_out, "sibling": sibling})
+
+    assert raised.value is timed_out.completed_error
+    assert isinstance(sibling.completed_error, ToolCancelledError)
+    assert raised.value.__cause__ is sibling.completed_error
+    assert any(
+        "sibling cleanup also failed: ToolCancelledError" in note
+        for note in raised.value.__notes__
+    )
+    assert timed_out.poll() is not None
+    assert sibling.poll() is not None
+
+
 def test_watchdog_unwinds_nested_toolrunner_group_and_descendant(
     tmp_path: Path,
 ) -> None:

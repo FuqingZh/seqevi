@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -467,6 +467,24 @@ def _stop_and_reap(
     return deferred
 
 
+def _raise_child_failure(
+    name: str,
+    return_code: int,
+    completed_error: BaseException | None,
+    cleanup_error: BaseException | None,
+) -> NoReturn:
+    primary = completed_error or RuntimeError(
+        f"initial annotation {name} exited {return_code}"
+    )
+    if cleanup_error is not None and cleanup_error is not primary:
+        primary.add_note(
+            "sibling cleanup also failed: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        raise primary from cleanup_error
+    raise primary
+
+
 def _wait_initial(
     processes: dict[str, ContainedAcceptanceProcess],
     child_finished: Callable[[str], None] | None = None,
@@ -486,10 +504,9 @@ def _wait_initial(
                     child_finished(name)
                 if return_code != 0 or completed_error is not None:
                     cleanup_error = _stop_and_reap(pending)
-                    if cleanup_error is not None:
-                        raise cleanup_error
-                    if completed_error is not None:
-                        raise completed_error
+                    _raise_child_failure(
+                        name, return_code, completed_error, cleanup_error
+                    )
             if pending:
                 time.sleep(0.1)
     except BaseException:
