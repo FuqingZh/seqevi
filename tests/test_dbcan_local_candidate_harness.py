@@ -18,7 +18,7 @@ def test_local_candidate_replaces_only_the_oci_launch_image(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = load_kit_manifest("dbcan-cazyme")
-    local_id = "sha256:" + "b" * 64
+    local_id = cast(str, _harness()["ACCEPTED_DBCAN_LOCAL_CANDIDATE_ID"])
     calls: list[tuple[str, ...]] = []
 
     def fake_docker(
@@ -61,6 +61,9 @@ def test_local_candidate_rejects_mutable_or_unavailable_identity(
     with pytest.raises(ValueError, match="immutable sha256 image ID"):
         with boundary("seqevi-dbcan:local"):
             pass
+    with pytest.raises(ValueError, match="accepted dbCAN image ID"):
+        with boundary("sha256:" + "c" * 64):
+            pass
 
     def missing_image(
         _docker: str,
@@ -74,7 +77,8 @@ def test_local_candidate_rejects_mutable_or_unavailable_identity(
 
     monkeypatch.setattr(oci, "_docker_call", missing_image)
     manifest = load_kit_manifest("dbcan-cazyme")
-    with boundary("sha256:" + "c" * 64):
+    accepted_id = cast(str, _harness()["ACCEPTED_DBCAN_LOCAL_CANDIDATE_ID"])
+    with boundary(accepted_id):
         with pytest.raises(ValueError, match="not inspectable"):
             oci._ensure_image("/usr/bin/docker", manifest, manifest.image)
 
@@ -89,6 +93,7 @@ def test_local_candidate_rejects_public_identity_drift(
     )
     manifest = load_kit_manifest("dbcan-cazyme")
     boundary = _harness()["local_candidate_boundary"]
-    with boundary("sha256:" + "d" * 64):
+    accepted_id = cast(str, _harness()["ACCEPTED_DBCAN_LOCAL_CANDIDATE_ID"])
+    with boundary(accepted_id):
         with pytest.raises(ValueError, match="differs from bundled kit"):
             oci._ensure_image("/usr/bin/docker", manifest, "sha256:" + "e" * 64)

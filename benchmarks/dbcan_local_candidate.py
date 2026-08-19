@@ -21,6 +21,9 @@ from seqevi.execution_profile import ExecutionProfile
 
 
 _IMMUTABLE_LOCAL_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
+ACCEPTED_DBCAN_LOCAL_CANDIDATE_ID = (
+    "sha256:75b74528663f7b3bc06a48292c13a488447c5f32581fc461abdc242bf9321e13"
+)
 
 
 @contextmanager
@@ -29,6 +32,8 @@ def local_candidate_boundary(local_image_id: str) -> Iterator[None]:
 
     if _IMMUTABLE_LOCAL_IMAGE_ID.fullmatch(local_image_id) is None:
         raise ValueError("local candidate must be an immutable sha256 image ID")
+    if local_image_id != ACCEPTED_DBCAN_LOCAL_CANDIDATE_ID:
+        raise ValueError("local candidate does not match the accepted dbCAN image ID")
 
     original_ensure_image = oci._ensure_image
     original_docker_call = oci._docker_call
