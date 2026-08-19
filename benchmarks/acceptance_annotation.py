@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
-from benchmarks.acceptance_containment import install_watchdog_signal_bridge
+import runpy
+from collections.abc import Callable
+from pathlib import Path
+from typing import cast
+
 from seqevi.cli import main as seqevi_main
+
+
+def _install_watchdog_signal_bridge() -> None:
+    """Load the sibling helper without adding the repository root to sys.path."""
+
+    helper = runpy.run_path(str(Path(__file__).with_name("acceptance_containment.py")))
+    install = cast(Callable[[], None], helper["install_watchdog_signal_bridge"])
+    install()
 
 
 def main() -> None:
     """Bridge watchdog TERM into annotate cleanup, then run the ordinary CLI."""
 
-    install_watchdog_signal_bridge()
+    _install_watchdog_signal_bridge()
     seqevi_main()
 
 

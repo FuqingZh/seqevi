@@ -402,8 +402,7 @@ def _run_command(
     command = (
         sys.executable,
         "-P",
-        "-m",
-        "benchmarks.acceptance_annotation",
+        str(_HARNESS_PATH.with_name("acceptance_annotation.py")),
         "annotate",
         "--fasta",
         str(fasta),

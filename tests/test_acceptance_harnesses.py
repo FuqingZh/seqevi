@@ -6,6 +6,7 @@ import math
 import runpy
 import signal
 import subprocess
+import sys
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
@@ -279,8 +280,11 @@ def test_c2_annotation_child_uses_safe_candidate_execution(
 
     arguments = cast(tuple[str, ...], observed["arguments"])
     assert returned is process
-    assert arguments[1:3] == ("-P", "-m")
-    assert arguments[3] == "benchmarks.acceptance_annotation"
+    assert arguments[1] == "-P"
+    assert (
+        Path(arguments[2]).resolve()
+        == Path("benchmarks/acceptance_annotation.py").resolve()
+    )
     assert arguments[arguments.index("--timeout-seconds") + 1] == "21600.0"
     assert observed["working_dir"] == source_root.parent
     assert cast(dict[str, str], observed["environment"])["PYTHONPATH"] == str(
@@ -290,6 +294,27 @@ def test_c2_annotation_child_uses_safe_candidate_execution(
     assert timeouts.internal_seconds == 21_600
     assert timeouts.watchdog_seconds == 21_660
     assert timeouts.termination_grace_seconds == 30
+
+
+def test_c2_annotation_child_entry_starts_with_isolated_candidate_path() -> None:
+    module = _c2()
+    source_root = module["_candidate_source_root"]()
+    environment = module["_candidate_child_environment"](source_root)
+    entry = Path("benchmarks/acceptance_annotation.py").resolve()
+
+    completed = subprocess.run(
+        [sys.executable, "-P", str(entry), "--help"],
+        cwd=source_root.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert environment["PYTHONPATH"] == str(source_root.resolve())
+    assert completed.returncode == 0, completed.stderr
+    assert "annotate" in completed.stdout
 
 
 def test_pressure_listener_includes_final_cleanup_deletes() -> None:
