@@ -43,11 +43,12 @@ managed setup for them is later feature work.
 > records the released SeqEvi 0.3.1 service/client, fenced schema readback,
 > all-present frozen-set inventory, zero-compute target replay, and unchanged
 > Store/CAS state. It keeps the accepted fresh-Store C2 mechanism run distinct
-> from target execution. Global cache seeding remains incomplete; dbCAN D1-D2
-> are accepted and the next step is the natural all-missing D4 sizing gate
+> from target execution. Global cache seeding remains incomplete; the dbCAN
+> scoped gate is closed through D5 with D4/D3 accepted and corpus expansion
+> explicitly inventoried, unseeded outside the D4 set, and closed
 > under the approved [dbCAN target-Store execution
 > plan](implementation-plan/20260819-v1.0-dbcan-target-store-execution-plan.md).
-> InterPro resumes only after dbCAN closeout. Current managed-v2 dispatch has
+> InterPro read-only Preflight is next. Current managed-v2 dispatch has
 > no claim-before-OCI path, so its D5 same-key managed gate is explicitly
 > unavailable rather than represented as passing.
 
@@ -57,10 +58,10 @@ managed setup for them is later feature work.
 | --- | --- | --- |
 | result consumption | single-file DuckDB and native Python relation; real local/shared runtime acceptance passed | [result contract v1.1](architecture/20260804-v1.1-result-consumption-contract.md), [acceptance](benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md) |
 | eggNOG and InterPro/Pfam | official-runtime parity accepted; generic external-tool cancellation, complete ordinary process-group cleanup, fresh PostgreSQL pressure, and the separate ClaimSession two-process C2 accepted | [ClaimSession cancellation and C2 acceptance](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [adapter contract v1.2](architecture/20260814-v1.2-adapter-contract.md), [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
-| dbCAN CAZyme | official dbCAN 5.2.9 direct/local parity, incremental reuse and shared Store replay accepted; target-Store D1-D2 and the published-0.3.1-revision local-candidate identity are accepted, with the natural all-missing 2,729-key D4 sizing gate next; D5 remains unavailable on current claim-after-OCI dispatch | [D2 acceptance](benchmarks/20260819-v1.0-dbcan-d2-local-candidate-acceptance.md), [target-Store execution plan](implementation-plan/20260819-v1.0-dbcan-target-store-execution-plan.md), [runtime evidence](benchmarks/20260804-v1.0-dbcan-runtime-validation.md), [adapter plan](implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md) |
+| dbCAN CAZyme | scoped target-Store D1-D4 accepted; D4 correctness/rates and D3 replays passed, D5 is unavailable, and the bounded corpus manifest leaves nine files unseeded/not executed because expansion headroom is unavailable | [closeout](benchmarks/20260819-v1.0-dbcan-target-store-closeout.md), [bounded corpus manifest](benchmarks/20260819-v1.0-dbcan-bounded-corpus-manifest.md), [D4 acceptance](benchmarks/20260819-v1.0-dbcan-d4-target-store-sizing-acceptance.md), [D3 acceptance](benchmarks/20260819-v1.0-dbcan-d3-target-store-replay-acceptance.md), [execution plan](implementation-plan/20260819-v1.0-dbcan-target-store-execution-plan.md) |
 | execution profiles | v1 host profiles remain compatible; managed v2.2 setup and OCI execution are implemented and accepted | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md), [managed profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
 | managed onboarding | managed dbCAN was introduced in 0.2.0 and is preserved in current 0.3.1; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
-| shared Store cache seeding | eggNOG target-Store closeout and dbCAN D1-D2 accepted; global seeding incomplete; dbCAN D4 all-missing sizing is next, D3 remains blocked behind it, and InterPro follows dbCAN closeout | [dbCAN D2 acceptance](benchmarks/20260819-v1.0-dbcan-d2-local-candidate-acceptance.md), [dbCAN target-Store plan](implementation-plan/20260819-v1.0-dbcan-target-store-execution-plan.md), [eggNOG closeout benchmark](benchmarks/20260818-v1.0-eggnog-target-store-closeout.md), [master cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
+| shared Store cache seeding | eggNOG lane and scoped dbCAN gate closed; dbCAN corpus expansion and global seeding remain incomplete; InterPro read-only Preflight is next | [dbCAN closeout](benchmarks/20260819-v1.0-dbcan-target-store-closeout.md), [eggNOG closeout benchmark](benchmarks/20260818-v1.0-eggnog-target-store-closeout.md), [master cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
 | historical evidence claim leases | accepted per-EvidenceKey duplicate-suppression predecessor, superseded by ClaimSession coordination | [historical evidence contract v1.2](architecture/20260810-v1.2-sequence-evidence-contract.md), [historical claim-lease plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md), [current evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md) |
 | evidence claim coordination | ClaimSession coordination with bounded internal protocol edges, actively cancellable per-session HTTP transport, bounded PostgreSQL maintenance acquisition, and generic external-tool cancellation accepted | [evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md), [storage architecture v1.6](architecture/20260814-v1.6-storage-deployment-architecture.md), [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [maintenance runbook v1.2](operations/20260818-v1.2-claim-session-store-maintenance.md) |
 | shared Store claim contention hardening | ClaimSession and issue #37 cancellation accepted: cold two-process C2 at `9d417da`, plus fresh-database-guarded PostgreSQL 17 pressure at `7edc5e7` | [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [delivery rebaseline addendum and settled boundaries](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md), [ClaimSession technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md) |
@@ -114,6 +115,10 @@ managed setup for them is later feature work.
 44. [eggNOG target-Store closeout benchmark](benchmarks/20260818-v1.0-eggnog-target-store-closeout.md)
 45. [dbCAN target-Store execution plan](implementation-plan/20260819-v1.0-dbcan-target-store-execution-plan.md)
 46. [dbCAN D2 local-candidate acceptance](benchmarks/20260819-v1.0-dbcan-d2-local-candidate-acceptance.md)
+47. [dbCAN D4 target-Store sizing acceptance](benchmarks/20260819-v1.0-dbcan-d4-target-store-sizing-acceptance.md)
+48. [dbCAN D3 target-Store replay acceptance](benchmarks/20260819-v1.0-dbcan-d3-target-store-replay-acceptance.md)
+49. [dbCAN target-Store closeout](benchmarks/20260819-v1.0-dbcan-target-store-closeout.md)
+50. [dbCAN bounded corpus disposition manifest](benchmarks/20260819-v1.0-dbcan-bounded-corpus-manifest.md)
 
 ## Managed Boundary Contracts
 
