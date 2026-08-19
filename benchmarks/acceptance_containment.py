@@ -44,6 +44,7 @@ class ContainedAcceptanceProcess:
     _done: Event = field(default_factory=Event, init=False)
     _result: ToolRunResult | None = field(default=None, init=False)
     _error: BaseException | None = field(default=None, init=False)
+    _return_code: int | None = field(default=None, init=False)
     _thread: Thread = field(init=False)
 
     def __post_init__(self) -> None:
@@ -60,7 +61,7 @@ class ContainedAcceptanceProcess:
     def poll(self) -> int | None:
         if not self._done.is_set():
             return None
-        return self._completed_return_code()
+        return self._terminal_return_code()
 
     def send_signal(self, sent_signal: signal.Signals) -> None:
         if sent_signal not in {signal.SIGINT, signal.SIGTERM}:
@@ -71,7 +72,15 @@ class ContainedAcceptanceProcess:
         if not self._done.wait(timeout):
             raise TimeoutError("acceptance containment worker did not finish")
         self._thread.join()
-        return self._completed_return_code()
+        return self._terminal_return_code()
+
+    @property
+    def completed_error(self) -> BaseException | None:
+        """Return the stable terminal failure without re-raising it."""
+
+        if not self._done.is_set():
+            return None
+        return self._error
 
     def _run(self) -> None:
         try:
@@ -85,14 +94,26 @@ class ContainedAcceptanceProcess:
         except BaseException as error:
             self._error = error
         finally:
+            if self._result is not None:
+                self._return_code = self._result.return_code
+            elif self._error is not None:
+                error_result = getattr(self._error, "result", None)
+                self._return_code = getattr(error_result, "return_code", -1)
             self._done.set()
 
-    def _completed_return_code(self) -> int:
-        if self._error is not None:
-            raise self._error
-        if self._result is None:
+    def _terminal_return_code(self) -> int:
+        if self._return_code is None:
             raise RuntimeError("acceptance containment finished without a result")
-        return self._result.return_code
+        return self._return_code
+
+
+def install_watchdog_signal_bridge() -> None:
+    """Turn outer watchdog TERM into stack unwinding through inner ToolRunner."""
+
+    def interrupt(_signal: int, _frame: object) -> None:
+        raise KeyboardInterrupt("acceptance watchdog requested annotation cleanup")
+
+    signal.signal(signal.SIGTERM, interrupt)
 
 
 def start_contained_annotation(

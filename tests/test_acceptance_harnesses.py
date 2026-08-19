@@ -280,6 +280,7 @@ def test_c2_annotation_child_uses_safe_candidate_execution(
     arguments = cast(tuple[str, ...], observed["arguments"])
     assert returned is process
     assert arguments[1:3] == ("-P", "-m")
+    assert arguments[3] == "benchmarks.acceptance_annotation"
     assert arguments[arguments.index("--timeout-seconds") + 1] == "21600.0"
     assert observed["working_dir"] == source_root.parent
     assert cast(dict[str, str], observed["environment"])["PYTHONPATH"] == str(

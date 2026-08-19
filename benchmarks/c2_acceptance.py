@@ -403,7 +403,7 @@ def _run_command(
         sys.executable,
         "-P",
         "-m",
-        "seqevi",
+        "benchmarks.acceptance_annotation",
         "annotate",
         "--fasta",
         str(fasta),
@@ -448,24 +448,23 @@ def _stop_and_reap(
 ) -> BaseException | None:
     deferred: BaseException | None = None
     for process in processes.values():
-        signalled = False
-        while not signalled:
-            try:
-                if process.poll() is not None:
-                    break
+        try:
+            if process.poll() is None:
                 process.send_signal(signal.SIGINT)
-                signalled = True
-            except ProcessLookupError:
-                signalled = True
-            except BaseException as error:
-                deferred = deferred or error
+        except ProcessLookupError:
+            pass
+        except BaseException as error:
+            deferred = deferred or error
     for process in processes.values():
-        while True:
+        for attempt in range(2):
             try:
                 process.wait()
                 break
             except BaseException as error:
                 deferred = deferred or error
+                if attempt == 1:
+                    break
+        deferred = deferred or getattr(process, "completed_error", None)
     return deferred
 
 
@@ -483,12 +482,15 @@ def _wait_initial(
                     continue
                 return_codes[name] = return_code
                 del pending[name]
+                completed_error = getattr(process, "completed_error", None)
                 if child_finished is not None:
                     child_finished(name)
-                if return_code != 0:
+                if return_code != 0 or completed_error is not None:
                     cleanup_error = _stop_and_reap(pending)
                     if cleanup_error is not None:
                         raise cleanup_error
+                    if completed_error is not None:
+                        raise completed_error
             if pending:
                 time.sleep(0.1)
     except BaseException:
@@ -907,6 +909,8 @@ def _main() -> None:
         except BaseException:
             _stop_and_reap({name: process})
             raise
+        if process.completed_error is not None:
+            raise process.completed_error
         _verify_candidate_state(source_head, f"after replay {name} child lifecycle")
         replay_results[name] = _result(root / "stdout.json", return_code)
         _validate_frozen_result(name, replay_results[name])
