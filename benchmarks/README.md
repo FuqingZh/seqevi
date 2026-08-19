@@ -73,9 +73,12 @@ PYTHONPATH=src:. pdm run python benchmarks/claim_session_pressure.py \
 `c2_acceptance.py` owns the frozen real two-process C2 launch and independent
 replays. It verifies the exact input identity set, artifact references,
 coordination cleanup, cache-only replays, and that no matching external tool
-remains. The Store endpoint and database must be fresh, isolated, and served by
-the exact candidate head; the two caller-owned FASTAs and named execution
-profile remain external:
+remains. Annotation children use `acceptance_containment.py`: each command has
+a finite internal `--timeout-seconds`, a longer finite ToolRunner-owned
+watchdog, bounded TERM/KILL cleanup, and independent stdout/stderr paths. The
+Store endpoint and database must be fresh, isolated, and served by the exact
+candidate head; the two caller-owned FASTAs and named execution profile remain
+external:
 
 ```bash
 PYTHONPATH=src:. pdm run python benchmarks/c2_acceptance.py \
