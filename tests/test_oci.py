@@ -257,6 +257,63 @@ def test_managed_annotation_failure_removes_container_and_keeps_output_absent(
     assert any(call[:2] == ("rm", "--force") for call in calls)
 
 
+def test_managed_annotation_attach_timeout_force_removes_exact_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _resource_value, profile, fasta, output = _inputs(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    live_containers: set[str] = set()
+
+    def fake_run(
+        command: list[str],
+        *,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+        timeout: float | None,
+    ) -> subprocess.CompletedProcess[str]:
+        assert check is False
+        assert capture_output is True
+        assert text is True
+        arguments = tuple(command[1:])
+        calls.append(arguments)
+        if arguments[:2] == ("image", "inspect"):
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if arguments[0] == "create":
+            container_name = arguments[arguments.index("--name") + 1]
+            live_containers.add(container_name)
+            return subprocess.CompletedProcess(command, 0, "container", "")
+        if arguments[:2] == ("start", "--attach"):
+            assert arguments[2] in live_containers
+            assert timeout is not None
+            raise subprocess.TimeoutExpired(command, timeout)
+        if arguments[:2] == ("rm", "--force"):
+            assert arguments[2] in live_containers
+            live_containers.remove(arguments[2])
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(oci.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(oci, "load_kit_manifest", lambda _name: manifest)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(AnnotationError, match="timed out while trying to run"):
+        oci.run_oci_annotation(
+            fasta=fasta,
+            output=output,
+            profile=profile,
+            store=tmp_path / "store",
+            threads=1,
+            timeout_seconds=0.01,
+        )
+
+    create = next(call for call in calls if call[0] == "create")
+    container_name = create[create.index("--name") + 1]
+    assert calls[-1] == ("rm", "--force", container_name)
+    assert not live_containers
+    assert not output.exists()
+
+
 def test_managed_shared_store_rejects_embedded_credentials() -> None:
     with pytest.raises(AnnotationError, match="must not embed credentials"):
         oci._resolve_store("https://user:secret@example.org/store?token=x")
