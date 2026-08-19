@@ -126,17 +126,24 @@ def test_leader_exit_before_descendant_still_empties_owned_boundary(
     leader_pid = tmp_path / "leader.pid"
     child_pid = tmp_path / "child.pid"
     child_term = tmp_path / "child.term"
+    child_ready = tmp_path / "child.ready"
     child_code = (
         "import pathlib,signal,time;"
         f"marker=pathlib.Path({str(child_term)!r});"
         "signal.signal(signal.SIGTERM,lambda *_:marker.write_text('term'));"
+        f"pathlib.Path({str(child_ready)!r}).write_text('ready');"
         "time.sleep(30)"
     )
     code = (
-        "import os,pathlib,subprocess,sys;"
+        "import os,pathlib,subprocess,sys,time;"
         f"child=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
         f"pathlib.Path({str(leader_pid)!r}).write_text(str(os.getpid()));"
-        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))"
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid));"
+        "deadline=time.monotonic()+2.0;"
+        f"ready=pathlib.Path({str(child_ready)!r});"
+        'exec("while not ready.exists():\\n'
+        " if time.monotonic() >= deadline: raise TimeoutError('child not ready')\\n"
+        ' time.sleep(0.01)")'
     )
 
     process = _start(tmp_path, code, watchdog_seconds=2.0)
