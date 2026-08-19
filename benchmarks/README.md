@@ -76,6 +76,10 @@ coordination cleanup, cache-only replays, and that no matching external tool
 remains. Annotation children use `acceptance_containment.py`: each command has
 a finite internal `--timeout-seconds`, a longer finite ToolRunner-owned
 watchdog, bounded TERM/KILL cleanup, and independent stdout/stderr paths. The
+benchmark-only `acceptance_annotation.py` bridge propagates watchdog TERM into
+the in-process CLI so the unchanged inner adapter `ToolRunner` also cleans its
+separate process group; completed failures remain stable for idempotent C2
+reaping. The
 Store endpoint and database must be fresh, isolated, and served by the exact
 candidate head; the two caller-owned FASTAs and named execution profile remain
 external:
