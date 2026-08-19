@@ -81,6 +81,9 @@ the in-process CLI so the unchanged inner adapter `ToolRunner` also cleans its
 separate process group; completed failures remain stable for idempotent C2
 reaping. If one initial child fails, its error remains primary while any
 sibling-cancellation error is retained as attached cleanup diagnostics. C2
+retries an asynchronously interrupted cancellation until the child is terminal
+or its cancellation event is set, then applies a 65-second maximum cleanup wait
+per child instead of falling through to the annotation watchdog. C2
 invokes that frozen bridge by explicit file path under `python -P`;
 the child keeps `PYTHONPATH` limited to candidate `src`, and the bridge loads
 its sibling containment helper without relying on repository-root import
