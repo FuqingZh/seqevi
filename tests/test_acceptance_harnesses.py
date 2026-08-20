@@ -140,6 +140,48 @@ def test_c2_cleanup_defers_base_exception_until_child_is_reaped() -> None:
     assert child.wait_attempts == 2
 
 
+def test_c2_failed_child_runs_bounded_sibling_cleanup_once() -> None:
+    module = _c2()
+    triggering_error = RuntimeError("triggering child failed")
+
+    class FailedProcess(_Process):
+        def __init__(self) -> None:
+            super().__init__()
+            self.return_code = 23
+            self.completed_error = triggering_error
+
+    class DeadlineSibling(_Process):
+        def __init__(self) -> None:
+            super().__init__()
+            self.wait_attempts = 0
+            self.completed_error = None
+
+        def poll(self) -> int | None:
+            return None
+
+        def send_signal(self, sent_signal: signal.Signals) -> None:
+            self.signals.append(sent_signal)
+            self.cancellation_requested = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_attempts += 1
+            assert timeout is not None
+            raise TimeoutError("sibling remained live through cleanup deadline")
+
+    sibling = DeadlineSibling()
+
+    with pytest.raises(RuntimeError) as raised:
+        module["_wait_initial"](
+            {"failed": FailedProcess(), "deadline-sibling": sibling}
+        )
+
+    assert raised.value is triggering_error
+    assert isinstance(raised.value.__cause__, TimeoutError)
+    assert sibling.signals == [signal.SIGINT]
+    assert sibling.cancellation_requested is True
+    assert sibling.wait_attempts == 1
+
+
 def test_c2_frozen_status_validation_rejects_changed_composition() -> None:
     validate = _c2()["_validate_frozen_result"]
     with pytest.raises(RuntimeError, match="frozen hit/no-hit"):

@@ -533,13 +533,14 @@ def _wait_initial(
                     child_finished(name)
                 if return_code != 0 or completed_error is not None:
                     cleanup_error = _stop_and_reap(pending)
+                    pending.clear()
                     _raise_child_failure(
                         name, return_code, completed_error, cleanup_error
                     )
             if pending:
                 time.sleep(0.1)
     except BaseException:
-        _stop_and_reap(processes)
+        _stop_and_reap(pending)
         raise
     return return_codes
 
