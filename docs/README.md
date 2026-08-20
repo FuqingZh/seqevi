@@ -48,7 +48,8 @@ managed setup for them is later feature work.
 > explicitly inventoried, unseeded outside the D4 set, and closed
 > under the approved [dbCAN target-Store execution
 > plan](implementation-plan/20260819-v1.0-dbcan-target-store-execution-plan.md).
-> InterPro read-only Preflight is next. Current managed-v2 dispatch has
+> The [containment harness prerequisite](benchmarks/20260819-v1.0-interpro-preflight-containment-harness-acceptance.md)
+> is accepted; InterPro read-only Preflight is next. Current managed-v2 dispatch has
 > no claim-before-OCI path, so its D5 same-key managed gate is explicitly
 > unavailable rather than represented as passing.
 
@@ -57,7 +58,7 @@ managed setup for them is later feature work.
 | Surface | Current state | Contract or plan |
 | --- | --- | --- |
 | result consumption | single-file DuckDB and native Python relation; real local/shared runtime acceptance passed | [result contract v1.1](architecture/20260804-v1.1-result-consumption-contract.md), [acceptance](benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md) |
-| eggNOG and InterPro/Pfam | official-runtime parity accepted; generic external-tool cancellation, complete ordinary process-group cleanup, fresh PostgreSQL pressure, and the separate ClaimSession two-process C2 accepted | [ClaimSession cancellation and C2 acceptance](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [adapter contract v1.2](architecture/20260814-v1.2-adapter-contract.md), [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
+| eggNOG and InterPro/Pfam | official-runtime parity accepted; generic ToolRunner cleanup plus the acceptance-only internal-timeout/external-watchdog containment prerequisite passed before InterPro Preflight | [containment harness acceptance](benchmarks/20260819-v1.0-interpro-preflight-containment-harness-acceptance.md), [ClaimSession cancellation and C2 acceptance](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [adapter contract v1.2](architecture/20260814-v1.2-adapter-contract.md), [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
 | dbCAN CAZyme | scoped target-Store D1-D4 accepted; D4 correctness/rates and D3 replays passed, D5 is unavailable, and the bounded corpus manifest leaves nine files unseeded/not executed because expansion headroom is unavailable | [closeout](benchmarks/20260819-v1.0-dbcan-target-store-closeout.md), [bounded corpus manifest](benchmarks/20260819-v1.0-dbcan-bounded-corpus-manifest.md), [D4 acceptance](benchmarks/20260819-v1.0-dbcan-d4-target-store-sizing-acceptance.md), [D3 acceptance](benchmarks/20260819-v1.0-dbcan-d3-target-store-replay-acceptance.md), [execution plan](implementation-plan/20260819-v1.0-dbcan-target-store-execution-plan.md) |
 | execution profiles | v1 host profiles remain compatible; managed v2.2 setup and OCI execution are implemented and accepted | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md), [managed profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
 | managed onboarding | managed dbCAN was introduced in 0.2.0 and is preserved in current 0.3.1; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
@@ -119,6 +120,7 @@ managed setup for them is later feature work.
 48. [dbCAN D3 target-Store replay acceptance](benchmarks/20260819-v1.0-dbcan-d3-target-store-replay-acceptance.md)
 49. [dbCAN target-Store closeout](benchmarks/20260819-v1.0-dbcan-target-store-closeout.md)
 50. [dbCAN bounded corpus disposition manifest](benchmarks/20260819-v1.0-dbcan-bounded-corpus-manifest.md)
+51. [InterPro Preflight containment harness acceptance](benchmarks/20260819-v1.0-interpro-preflight-containment-harness-acceptance.md)
 
 ## Managed Boundary Contracts
 

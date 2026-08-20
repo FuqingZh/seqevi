@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -25,10 +25,16 @@ import psycopg
 from psycopg import sql
 import seqevi.service.persistence as persistence_module
 
+from benchmarks.acceptance_containment import (
+    AcceptanceTimeouts,
+    ContainedAcceptanceProcess,
+    start_contained_annotation,
+)
 from seqevi.sequence import read_fasta
 from seqevi.service.persistence import PostgresEvidencePersistence
 
 _HARNESS_PATH = Path(__file__).resolve()
+_CLEANUP_DEADLINE_SECONDS = 65.0
 _REQUIRED_THREADS = 64
 _REQUIRED_PROFILE = "eggnog-5.0.2"
 _FROZEN_INPUT_SHA256 = {
@@ -50,6 +56,9 @@ _FROZEN_RESULT_IDENTITY = {
     ),
 }
 _OPEN_RECEIPT_RETENTION_SECONDS = 120.0
+_ANNOTATION_TIMEOUT_SECONDS = 21_600.0
+_EXTERNAL_WATCHDOG_SECONDS = 21_660.0
+_TERMINATION_GRACE_SECONDS = 30.0
 _ACTIVE_STORE_PROCESS: subprocess.Popen[bytes] | None = None
 
 
@@ -390,12 +399,11 @@ def _run_command(
     stderr_path: Path,
     environment: Mapping[str, str],
     candidate_source_root: Path,
-) -> subprocess.Popen[bytes]:
+) -> ContainedAcceptanceProcess:
     command = (
         sys.executable,
         "-P",
-        "-m",
-        "seqevi",
+        str(_HARNESS_PATH.with_name("acceptance_annotation.py")),
         "annotate",
         "--fasta",
         str(fasta),
@@ -407,24 +415,22 @@ def _run_command(
         store,
         "--threads",
         str(threads),
+        "--timeout-seconds",
+        str(_ANNOTATION_TIMEOUT_SECONDS),
         "--json",
     )
-    stdout = stdout_path.open("wb")
-    stderr = stderr_path.open("wb")
-    try:
-        process = subprocess.Popen(  # noqa: S603
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
-            env=dict(environment),
-            cwd=candidate_source_root.parent,
-        )
-    finally:
-        stdout.close()
-        stderr.close()
-    return process
+    return start_contained_annotation(
+        arguments=command,
+        working_dir=candidate_source_root.parent,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        environment=environment,
+        timeouts=AcceptanceTimeouts(
+            internal_seconds=_ANNOTATION_TIMEOUT_SECONDS,
+            watchdog_seconds=_EXTERNAL_WATCHDOG_SECONDS,
+            termination_grace_seconds=_TERMINATION_GRACE_SECONDS,
+        ),
+    )
 
 
 def _result(path: Path, return_code: int) -> dict[str, object]:
@@ -438,33 +444,78 @@ def _result(path: Path, return_code: int) -> dict[str, object]:
 
 
 def _stop_and_reap(
-    processes: dict[str, subprocess.Popen[bytes]],
+    processes: dict[str, ContainedAcceptanceProcess],
 ) -> BaseException | None:
+    def defer(current: BaseException | None, error: BaseException) -> BaseException:
+        if current is None:
+            return error
+        if error is not current:
+            current.add_note(
+                f"additional cleanup failure: {type(error).__name__}: {error}"
+            )
+        return current
+
     deferred: BaseException | None = None
     for process in processes.values():
-        signalled = False
-        while not signalled:
-            try:
-                if process.poll() is not None:
-                    break
-                process.send_signal(signal.SIGINT)
-                signalled = True
-            except ProcessLookupError:
-                signalled = True
-            except BaseException as error:
-                deferred = deferred or error
-    for process in processes.values():
+        deadline = time.monotonic() + _CLEANUP_DEADLINE_SECONDS
         while True:
             try:
-                process.wait()
+                if process.poll() is not None or process.cancellation_requested:
+                    break
+                process.send_signal(signal.SIGINT)
+            except ProcessLookupError:
                 break
             except BaseException as error:
-                deferred = deferred or error
+                deferred = defer(deferred, error)
+            if time.monotonic() >= deadline:
+                deferred = defer(
+                    deferred,
+                    TimeoutError("acceptance cancellation request deadline expired"),
+                )
+                break
+    for process in processes.values():
+        deadline = time.monotonic() + _CLEANUP_DEADLINE_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                deferred = defer(
+                    deferred,
+                    TimeoutError("acceptance cleanup wait deadline expired"),
+                )
+                break
+            try:
+                process.wait(timeout=remaining)
+                break
+            except BaseException as error:
+                deferred = defer(deferred, error)
+                if isinstance(error, TimeoutError):
+                    break
+        completed_error = getattr(process, "completed_error", None)
+        if completed_error is not None:
+            deferred = defer(deferred, completed_error)
     return deferred
 
 
+def _raise_child_failure(
+    name: str,
+    return_code: int,
+    completed_error: BaseException | None,
+    cleanup_error: BaseException | None,
+) -> NoReturn:
+    primary = completed_error or RuntimeError(
+        f"initial annotation {name} exited {return_code}"
+    )
+    if cleanup_error is not None and cleanup_error is not primary:
+        primary.add_note(
+            "sibling cleanup also failed: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        raise primary from cleanup_error
+    raise primary
+
+
 def _wait_initial(
-    processes: dict[str, subprocess.Popen[bytes]],
+    processes: dict[str, ContainedAcceptanceProcess],
     child_finished: Callable[[str], None] | None = None,
 ) -> dict[str, int]:
     return_codes: dict[str, int] = {}
@@ -477,16 +528,19 @@ def _wait_initial(
                     continue
                 return_codes[name] = return_code
                 del pending[name]
+                completed_error = getattr(process, "completed_error", None)
                 if child_finished is not None:
                     child_finished(name)
-                if return_code != 0:
+                if return_code != 0 or completed_error is not None:
                     cleanup_error = _stop_and_reap(pending)
-                    if cleanup_error is not None:
-                        raise cleanup_error
+                    pending.clear()
+                    _raise_child_failure(
+                        name, return_code, completed_error, cleanup_error
+                    )
             if pending:
                 time.sleep(0.1)
     except BaseException:
-        _stop_and_reap(processes)
+        _stop_and_reap(pending)
         raise
     return return_codes
 
@@ -901,6 +955,8 @@ def _main() -> None:
         except BaseException:
             _stop_and_reap({name: process})
             raise
+        if process.completed_error is not None:
+            raise process.completed_error
         _verify_candidate_state(source_head, f"after replay {name} child lifecycle")
         replay_results[name] = _result(root / "stdout.json", return_code)
         _validate_frozen_result(name, replay_results[name])
@@ -941,6 +997,11 @@ def _main() -> None:
         "python": platform.python_version(),
         "profile": args.profile,
         "threads_per_process": args.threads,
+        "annotation_containment": {
+            "internal_timeout_seconds": _ANNOTATION_TIMEOUT_SECONDS,
+            "external_watchdog_seconds": _EXTERNAL_WATCHDOG_SECONDS,
+            "termination_grace_seconds": _TERMINATION_GRACE_SECONDS,
+        },
         "annotation_child_environment": _child_environment_record(child_environment),
         "annotation_candidate_import": candidate_import,
         "store_service": store_service,

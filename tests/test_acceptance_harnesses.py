@@ -6,6 +6,7 @@ import math
 import runpy
 import signal
 import subprocess
+import sys
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
@@ -81,15 +82,18 @@ class _Process:
         self.return_code: int | None = None
         self.signals: list[signal.Signals] = []
         self.waited = False
+        self.cancellation_requested = False
 
     def poll(self) -> int | None:
         return self.return_code
 
     def send_signal(self, sent_signal: signal.Signals) -> None:
         self.signals.append(sent_signal)
+        self.cancellation_requested = True
         self.return_code = -int(sent_signal)
 
-    def wait(self) -> int:
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
         self.waited = True
         assert self.return_code is not None
         return self.return_code
@@ -100,11 +104,11 @@ class _InterruptingWaitProcess(_Process):
         super().__init__()
         self.wait_attempts = 0
 
-    def wait(self) -> int:
+    def wait(self, timeout: float | None = None) -> int:
         self.wait_attempts += 1
         if self.wait_attempts == 1:
             raise SystemExit(7)
-        return super().wait()
+        return super().wait(timeout)
 
 
 def test_c2_interrupt_terminates_and_reaps_every_initial_child(
@@ -134,6 +138,48 @@ def test_c2_cleanup_defers_base_exception_until_child_is_reaped() -> None:
     assert isinstance(deferred, SystemExit)
     assert child.waited is True
     assert child.wait_attempts == 2
+
+
+def test_c2_failed_child_runs_bounded_sibling_cleanup_once() -> None:
+    module = _c2()
+    triggering_error = RuntimeError("triggering child failed")
+
+    class FailedProcess(_Process):
+        def __init__(self) -> None:
+            super().__init__()
+            self.return_code = 23
+            self.completed_error = triggering_error
+
+    class DeadlineSibling(_Process):
+        def __init__(self) -> None:
+            super().__init__()
+            self.wait_attempts = 0
+            self.completed_error = None
+
+        def poll(self) -> int | None:
+            return None
+
+        def send_signal(self, sent_signal: signal.Signals) -> None:
+            self.signals.append(sent_signal)
+            self.cancellation_requested = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_attempts += 1
+            assert timeout is not None
+            raise TimeoutError("sibling remained live through cleanup deadline")
+
+    sibling = DeadlineSibling()
+
+    with pytest.raises(RuntimeError) as raised:
+        module["_wait_initial"](
+            {"failed": FailedProcess(), "deadline-sibling": sibling}
+        )
+
+    assert raised.value is triggering_error
+    assert isinstance(raised.value.__cause__, TimeoutError)
+    assert sibling.signals == [signal.SIGINT]
+    assert sibling.cancellation_requested is True
+    assert sibling.wait_attempts == 1
 
 
 def test_c2_frozen_status_validation_rejects_changed_composition() -> None:
@@ -254,15 +300,18 @@ def test_c2_annotation_child_uses_safe_candidate_execution(
     source_root = module["_candidate_source_root"]()
     observed: dict[str, object] = {}
 
-    class Process:
-        pass
+    process = object()
 
-    def popen(command: tuple[str, ...], **kwargs: object) -> Process:
-        observed.update(command=command, **kwargs)
-        return Process()
+    def start_contained_annotation(**kwargs: object) -> object:
+        observed.update(kwargs)
+        return process
 
-    monkeypatch.setattr(subprocess, "Popen", popen)
-    module["_run_command"](
+    monkeypatch.setitem(
+        module["_run_command"].__globals__,
+        "start_contained_annotation",
+        start_contained_annotation,
+    )
+    returned = module["_run_command"](
         fasta=tmp_path / "input.fasta",
         output=tmp_path / "result.duckdb",
         profile="eggnog-5.0.2",
@@ -274,9 +323,43 @@ def test_c2_annotation_child_uses_safe_candidate_execution(
         candidate_source_root=source_root,
     )
 
-    assert cast(tuple[str, ...], observed["command"])[1:3] == ("-P", "-m")
-    assert observed["cwd"] == source_root.parent
-    assert cast(dict[str, str], observed["env"])["PYTHONPATH"] == str(source_root)
+    arguments = cast(tuple[str, ...], observed["arguments"])
+    assert returned is process
+    assert arguments[1] == "-P"
+    assert (
+        Path(arguments[2]).resolve()
+        == Path("benchmarks/acceptance_annotation.py").resolve()
+    )
+    assert arguments[arguments.index("--timeout-seconds") + 1] == "21600.0"
+    assert observed["working_dir"] == source_root.parent
+    assert cast(dict[str, str], observed["environment"])["PYTHONPATH"] == str(
+        source_root
+    )
+    timeouts = cast(Any, observed["timeouts"])
+    assert timeouts.internal_seconds == 21_600
+    assert timeouts.watchdog_seconds == 21_660
+    assert timeouts.termination_grace_seconds == 30
+
+
+def test_c2_annotation_child_entry_starts_with_isolated_candidate_path() -> None:
+    module = _c2()
+    source_root = module["_candidate_source_root"]()
+    environment = module["_candidate_child_environment"](source_root)
+    entry = Path("benchmarks/acceptance_annotation.py").resolve()
+
+    completed = subprocess.run(
+        [sys.executable, "-P", str(entry), "--help"],
+        cwd=source_root.parent,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert environment["PYTHONPATH"] == str(source_root.resolve())
+    assert completed.returncode == 0, completed.stderr
+    assert "annotate" in completed.stdout
 
 
 def test_pressure_listener_includes_final_cleanup_deletes() -> None:
