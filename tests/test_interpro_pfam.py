@@ -97,6 +97,10 @@ if expected_environment.is_file():
     if os.environ.get("SEQEVI_TEST_RUNTIME_ENV") != expected:
         raise SystemExit(13)
 
+expected_path = Path(__file__).parent / "expected-path.txt"
+if expected_path.is_file() and os.environ.get("PATH") != expected_path.read_text():
+    raise SystemExit(14)
+
 if "--version" in sys.argv:
     print("InterProScan version {version}")
     raise SystemExit(0)
@@ -496,6 +500,43 @@ def test_interpro_pfam_applies_environment_to_probe_and_execution(
         )
 
     assert summary.computed == 2
+
+
+def test_interpro_pfam_freezes_inherited_path_for_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    selected_java = _write_jdk(tmp_path / "selected-java", marker=b"selected")
+    later_java = _write_jdk(tmp_path / "later-java", marker=b"later")
+    selected_path = str(selected_java.parent)
+    monkeypatch.setenv("PATH", selected_path)
+    adapter = InterProPfamAdapter(executable=executable, database=database)
+
+    (executable.parent / "expected-path.txt").write_text(
+        selected_path, encoding="utf-8"
+    )
+    monkeypatch.setenv("PATH", str(later_java.parent))
+    with LocalStore.open(tmp_path / "store") as store:
+        summary = run_annotation(
+            fasta_path=_write_input(tmp_path / "proteins.fasta"),
+            output_dir=tmp_path / "output",
+            adapter=adapter,
+            store=store,
+            threads=1,
+        )
+
+    assert summary.computed == 2
+
+
+def test_interpro_pfam_rejects_relative_runtime_path(tmp_path: Path) -> None:
+    executable, database = _write_runtime(tmp_path)
+
+    with pytest.raises(AdapterError, match="non-empty absolute paths"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": f"{tmp_path}:relative-bin"},
+        )
 
 
 def test_interpro_pfam_parameters_reject_alternate_scientific_contract() -> None:

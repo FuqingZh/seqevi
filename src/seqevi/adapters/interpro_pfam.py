@@ -102,6 +102,18 @@ class InterProPfamAdapter:
         self.database = database.resolve()
         self.parameters = parameters or InterProPfamParameters()
         self.environment = dict(environment or {})
+        if "PATH" not in self.environment:
+            inherited_path = os.environ.get("PATH")
+            if inherited_path is None:
+                raise AdapterError(
+                    "InterProScan runtime has no inherited or profile PATH"
+                )
+            self.environment["PATH"] = inherited_path
+        path_entries = self.environment["PATH"].split(os.pathsep)
+        if any(not entry or not Path(entry).is_absolute() for entry in path_entries):
+            raise AdapterError(
+                "InterProScan runtime PATH entries must be non-empty absolute paths"
+            )
         self.install_dir = self.executable.parent
         self.properties_path = self.install_dir / "interproscan.properties"
         self.jar_path = self.install_dir / "interproscan-5.jar"
