@@ -388,6 +388,23 @@ def test_interpro_pfam_runtime_digest_rejects_internal_jdk_symlink(
         )
 
 
+def test_interpro_pfam_runtime_digest_rejects_symlinked_jdk_root(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    java_home = java.parent.parent
+    (java_home / "conf").rename(java_home / "conf-real")
+    (java_home / "conf").symlink_to("conf-real", target_is_directory=True)
+
+    with pytest.raises(AdapterError, match="directory is missing or a symbolic link"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
+
+
 def test_interpro_pfam_runtime_digest_fails_on_jdk_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

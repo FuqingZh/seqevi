@@ -438,9 +438,10 @@ def _jdk_runtime_components(
         raise error
 
     for root in roots:
-        if not root.is_dir():
+        if root.is_symlink() or not root.is_dir():
             raise AdapterError(
-                f"selected JAVA_HOME runtime directory is missing: {root}"
+                "selected JAVA_HOME runtime directory is missing or a symbolic "
+                f"link: {root}"
             )
         root_file_count = 0
         for directory, directory_names, file_names in os.walk(
