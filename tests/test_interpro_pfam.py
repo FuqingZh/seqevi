@@ -590,7 +590,7 @@ def test_interpro_pfam_run_date_is_excluded_from_scientific_payload(
         ("bad-md5", "MD5 does not match"),
         ("wrong-analysis", "not a Pfam match"),
         ("bad-date", "invalid run date"),
-        ("unexpected-go", "outside the interpro-pfam/1 contract"),
+        ("unexpected-go", "outside the interpro-pfam/2 contract"),
         ("duplicate", "duplicate match"),
     ],
 )

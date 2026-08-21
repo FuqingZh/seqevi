@@ -793,7 +793,7 @@ def _parse_tsv_row(
     if go_annotations != "-" or pathway_annotations != "-":
         raise AdapterError(
             f"InterProScan TSV line {line_number} contains GO or pathway annotations "
-            "outside the interpro-pfam/1 contract"
+            "outside the interpro-pfam/2 contract"
         )
 
     return {
