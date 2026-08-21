@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import stat
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 from polars.testing import assert_frame_equal
 from typer.testing import CliRunner
 
+import seqevi.adapters.interpro_pfam as interpro_pfam_module
 from seqevi.adapters import (
     ADAPTER_CONTRACT_VERSION,
     INTERPRO_PFAM_EVIDENCE_SCHEMA,
@@ -18,12 +20,32 @@ from seqevi.annotate import run_annotation
 from seqevi.cli import app
 from seqevi.errors import AdapterError, AnnotationError, ResourceLockError
 from seqevi.evidence import EvidenceQuery
+from seqevi.runtime_identity import RuntimeComponent
 from seqevi.sequence import read_fasta, unique_identities
 from seqevi.store import LocalStore
 
 from .support import read_result_table
 
 runner = CliRunner()
+
+
+def _write_jdk(root: Path, *, marker: bytes = b"v1") -> Path:
+    java_home = root / "jdk"
+    for relative in ("bin", "conf", "lib"):
+        (java_home / relative).mkdir(parents=True)
+    java = java_home / "bin" / "java"
+    java.write_bytes(b"fixture-java-" + marker)
+    java.chmod(java.stat().st_mode | stat.S_IXUSR)
+    (java_home / "conf" / "security.properties").write_bytes(b"security-" + marker)
+    (java_home / "lib" / "modules").write_bytes(b"modules-" + marker)
+    (java_home / "release").write_bytes(b"JAVA_VERSION=17-" + marker)
+    return java
+
+
+@pytest.fixture(autouse=True)
+def _fixture_java(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    java = _write_jdk(tmp_path / "fixture-java")
+    monkeypatch.setenv("PATH", str(java.parent))
 
 
 def _write_runtime(
@@ -259,12 +281,8 @@ def test_interpro_pfam_contract_probes_exact_runtime_and_resource(
 
 def test_interpro_pfam_runtime_digest_includes_selected_java(tmp_path: Path) -> None:
     executable, database = _write_runtime(tmp_path)
-    java_dir = tmp_path / "jdk" / "bin"
-    java_dir.mkdir(parents=True)
-    java = java_dir / "java"
-    java.write_bytes(b"fixture-java-v1")
-    java.chmod(java.stat().st_mode | stat.S_IXUSR)
-    environment = {"PATH": str(java_dir)}
+    java = _write_jdk(tmp_path / "selected-java")
+    environment = {"PATH": str(java.parent)}
 
     first = InterProPfamAdapter(
         executable=executable,
@@ -280,6 +298,128 @@ def test_interpro_pfam_runtime_digest_includes_selected_java(tmp_path: Path) -> 
     )
 
     assert second.contract.tool_runtime_digest != first.contract.tool_runtime_digest
+
+
+@pytest.mark.parametrize(
+    ("relative", "replacement"),
+    (("lib/modules", b"changed-modules"), ("conf/security.properties", b"changed")),
+)
+def test_interpro_pfam_runtime_digest_covers_jdk_runtime_tree(
+    tmp_path: Path, relative: str, replacement: bytes
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    environment = {"PATH": str(java.parent)}
+    first = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+
+    (java.parent.parent / relative).write_bytes(replacement)
+    second = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+
+    assert second.contract.tool_runtime_digest != first.contract.tool_runtime_digest
+
+
+def test_interpro_pfam_runtime_digest_is_independent_of_jdk_path(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    first_java = _write_jdk(tmp_path / "first", marker=b"same")
+    second_java = _write_jdk(tmp_path / "second", marker=b"same")
+
+    first = InterProPfamAdapter(
+        executable=executable,
+        database=database,
+        environment={"PATH": str(first_java.parent)},
+    )
+    second = InterProPfamAdapter(
+        executable=executable,
+        database=database,
+        environment={"PATH": str(second_java.parent)},
+    )
+
+    assert second.contract.tool_runtime_digest == first.contract.tool_runtime_digest
+
+
+def test_interpro_pfam_runtime_digest_fails_on_incomplete_jdk(tmp_path: Path) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    (java.parent.parent / "lib" / "modules").unlink()
+    (java.parent.parent / "lib").rmdir()
+
+    with pytest.raises(AdapterError, match="runtime directory is missing"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
+
+
+def test_interpro_pfam_runtime_digest_requires_java_11_modules(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    (java.parent.parent / "lib" / "native.so").write_bytes(b"native")
+    (java.parent.parent / "lib" / "modules").unlink()
+
+    with pytest.raises(AdapterError, match=r"Java 11\+.*lib/modules"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
+
+
+def test_interpro_pfam_runtime_digest_rejects_internal_jdk_symlink(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    (java.parent.parent / "conf" / "linked.conf").symlink_to("security.properties")
+
+    with pytest.raises(AdapterError, match="contains a symbolic link"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
+
+
+def test_interpro_pfam_runtime_digest_fails_on_jdk_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    modules = java.parent.parent / "lib" / "modules"
+    original = interpro_pfam_module.calculate_runtime_digest
+
+    def calculate_then_drift(
+        *,
+        runtime_name: str,
+        versions: Mapping[str, str],
+        components: tuple[RuntimeComponent, ...],
+    ) -> str:
+        digest = original(
+            runtime_name=runtime_name,
+            versions=versions,
+            components=components,
+        )
+        modules.write_bytes(b"drifted-after-hash")
+        return digest
+
+    monkeypatch.setattr(
+        interpro_pfam_module, "calculate_runtime_digest", calculate_then_drift
+    )
+
+    with pytest.raises(AdapterError, match="JAVA_HOME changed while hashing"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
 
 
 def test_interpro_pfam_applies_environment_to_probe_and_execution(

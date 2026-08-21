@@ -28,7 +28,7 @@ from seqevi.sequence import SequenceIdentity
 
 from .base import AdapterBatchResult, AdapterContract, AdapterSequenceResult
 
-ADAPTER_CONTRACT_VERSION = "interpro-pfam/1"
+ADAPTER_CONTRACT_VERSION = "interpro-pfam/2"
 
 INTERPRO_PFAM_EVIDENCE_SCHEMA: Mapping[str, pl.DataType] = {
     "SequenceID": pl.String(),
@@ -77,7 +77,7 @@ class InterProPfamParameters:
         )
         if values != ("Pfam", "TSV", True, False, False, "protein"):
             raise ValueError(
-                "interpro-pfam/1 uses one fixed direct-scan scientific contract"
+                "interpro-pfam/2 uses one fixed direct-scan scientific contract"
             )
 
     def as_semantic_parameters(self) -> dict[str, object]:
@@ -376,6 +376,12 @@ def _calculate_runtime_digest(
     )
     if java is None:
         raise AdapterError("InterProScan runtime has no Java executable")
+    java_path = Path(java).resolve()
+    if java_path.name != "java" or java_path.parent.name != "bin":
+        raise AdapterError(
+            f"resolved Java executable must be JAVA_HOME/bin/java: {java_path}"
+        )
+    java_home = java_path.parent.parent
     normalized_properties = {
         **properties,
         "data.directory": "${data.directory}",
@@ -388,25 +394,137 @@ def _calculate_runtime_digest(
             separators=(",", ":"),
         ).encode("utf-8")
     )
-    components = (
-        RuntimeComponent("launcher", executable),
-        RuntimeComponent("java", Path(java).resolve()),
-        RuntimeComponent("interproscan-5.jar", jar_path),
-        *(
-            RuntimeComponent(
-                f"hmmer/{path.relative_to(hmmer_dir).as_posix()}",
-                path,
+    try:
+        jdk_components, jdk_snapshot = _jdk_runtime_components(java_home)
+        components = (
+            RuntimeComponent("launcher", executable),
+            RuntimeComponent("interproscan-5.jar", jar_path),
+            *jdk_components,
+            *(
+                RuntimeComponent(
+                    f"hmmer/{path.relative_to(hmmer_dir).as_posix()}",
+                    path,
+                )
+                for path in hmmer_files
+            ),
+        )
+        digest = calculate_runtime_digest(
+            runtime_name="interproscan-pfam",
+            versions={
+                "interproscan": version,
+                "properties": f"sha256:{properties_digest}",
+            },
+            components=components,
+        )
+        _, after_snapshot = _jdk_runtime_components(java_home)
+    except (OSError, UnicodeError) as error:
+        raise AdapterError(
+            f"cannot read selected JAVA_HOME runtime: {error}"
+        ) from error
+    if after_snapshot != jdk_snapshot:
+        raise AdapterError("selected JAVA_HOME changed while hashing")
+    return digest
+
+
+def _jdk_runtime_components(
+    java_home: Path,
+) -> tuple[tuple[RuntimeComponent, ...], tuple[tuple[object, ...], ...]]:
+    release_path = java_home / "release"
+    roots = (java_home / "bin", java_home / "conf", java_home / "lib")
+    entries: list[tuple[str, Path]] = [("jdk/release", release_path)]
+    snapshot: list[tuple[object, ...]] = []
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    for root in roots:
+        if not root.is_dir():
+            raise AdapterError(
+                f"selected JAVA_HOME runtime directory is missing: {root}"
             )
-            for path in hmmer_files
-        ),
+        root_file_count = 0
+        for directory, directory_names, file_names in os.walk(
+            root, followlinks=False, onerror=fail
+        ):
+            directory_path = Path(directory)
+            relative_directory = directory_path.relative_to(java_home).as_posix()
+            directory_stat = directory_path.stat(follow_symlinks=False)
+            snapshot.append(
+                (
+                    relative_directory,
+                    "directory",
+                    directory_stat.st_dev,
+                    directory_stat.st_ino,
+                    directory_stat.st_size,
+                    directory_stat.st_mtime_ns,
+                    directory_stat.st_ctime_ns,
+                )
+            )
+            for name in sorted((*directory_names, *file_names)):
+                path = directory_path / name
+                if path.is_symlink():
+                    raise AdapterError(
+                        f"selected JAVA_HOME runtime contains a symbolic link: {path}"
+                    )
+            for name in sorted(file_names):
+                path = directory_path / name
+                relative = path.relative_to(java_home).as_posix()
+                file_stat = path.stat(follow_symlinks=False)
+                if not path.is_file():
+                    raise AdapterError(
+                        "selected JAVA_HOME runtime entry is not a regular file: "
+                        f"{path}"
+                    )
+                snapshot.append(
+                    (
+                        relative,
+                        "file",
+                        file_stat.st_dev,
+                        file_stat.st_ino,
+                        file_stat.st_size,
+                        file_stat.st_mtime_ns,
+                        file_stat.st_ctime_ns,
+                    )
+                )
+                entries.append((f"jdk/{relative}", path))
+                root_file_count += 1
+        if root_file_count == 0:
+            raise AdapterError(
+                f"selected JAVA_HOME runtime directory has no regular files: {root}"
+            )
+
+    if not release_path.is_file() or release_path.is_symlink():
+        raise AdapterError(
+            f"selected JAVA_HOME release file is missing or invalid: {release_path}"
+        )
+    release_stat = release_path.stat(follow_symlinks=False)
+    release_text = release_path.read_text(encoding="utf-8")
+    version_match = re.search(r'^JAVA_VERSION="?(\d+)', release_text, re.MULTILINE)
+    if version_match is None:
+        raise AdapterError(
+            f"selected JAVA_HOME release file has no JAVA_VERSION: {release_path}"
+        )
+    if int(version_match.group(1)) >= 11:
+        modules_path = java_home / "lib" / "modules"
+        if not modules_path.is_file() or modules_path.is_symlink():
+            raise AdapterError(
+                "selected Java 11+ runtime has no regular lib/modules image: "
+                f"{modules_path}"
+            )
+    snapshot.append(
+        (
+            "release",
+            "file",
+            release_stat.st_dev,
+            release_stat.st_ino,
+            release_stat.st_size,
+            release_stat.st_mtime_ns,
+            release_stat.st_ctime_ns,
+        )
     )
-    return calculate_runtime_digest(
-        runtime_name="interproscan-pfam",
-        versions={
-            "interproscan": version,
-            "properties": f"sha256:{properties_digest}",
-        },
-        components=components,
+    return (
+        tuple(RuntimeComponent(name, path) for name, path in sorted(entries)),
+        tuple(sorted(snapshot)),
     )
 
 
