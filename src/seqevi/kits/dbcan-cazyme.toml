@@ -1,5 +1,6 @@
 schema_version = 1
 kit_id = "dbcan-cazyme-5.2.9-db-2026.05.05"
+seqevi_version = "0.3.1"
 adapter = "dbcan-cazyme"
 platform = "linux/amd64"
 dbcan_version = "5.2.9"

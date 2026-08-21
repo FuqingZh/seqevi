@@ -32,6 +32,7 @@ def test_dbcan_kit_manifest_is_hash_and_digest_locked() -> None:
     manifest = load_kit_manifest("dbcan-cazyme")
 
     assert manifest.kit_id == "dbcan-cazyme-5.2.9-db-2026.05.05"
+    assert manifest.seqevi_version == "0.3.1"
     assert manifest.adapter.value == "dbcan-cazyme"
     assert manifest.platform == "linux/amd64"
     assert manifest.image.endswith(
@@ -69,6 +70,10 @@ def test_manifest_parser_rejects_unknown_and_mutable_inputs() -> None:
     )
     valid["image"] = "ghcr.io/fuqingzh/seqevi-dbcan:latest"
     with pytest.raises(SetupError, match="immutable sha256"):
+        parse_kit_manifest(valid)
+    valid["image"] = load_kit_manifest("dbcan-cazyme").image
+    valid["seqevi_version"] = "0.3"
+    with pytest.raises(SetupError, match="seqevi_version must be X.Y.Z"):
         parse_kit_manifest(valid)
 
 
@@ -220,6 +225,7 @@ def _fixture_manifest() -> KitManifest:
     return KitManifest(
         schema_version=1,
         kit_id="dbcan-cazyme-test",
+        seqevi_version="0.3.1",
         adapter=AdapterName.DBCAN_CAZYME,
         platform="linux/amd64",
         dbcan_version="5.2.9",
