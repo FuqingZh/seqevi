@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import stat
 import sys
 from collections.abc import Mapping
@@ -27,6 +28,7 @@ from seqevi.store import LocalStore
 from .support import read_result_table
 
 runner = CliRunner()
+JAVA_OPTION_VARIABLES = ("JDK_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS")
 
 
 def _write_jdk(root: Path, *, marker: bytes = b"v1") -> Path:
@@ -88,6 +90,7 @@ def _fixture_script(version: str) -> str:
 import argparse
 import hashlib
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -100,6 +103,18 @@ if expected_environment.is_file():
 expected_path = Path(__file__).parent / "expected-path.txt"
 if expected_path.is_file() and os.environ.get("PATH") != expected_path.read_text():
     raise SystemExit(14)
+
+expected_java = Path(__file__).parent / "expected-java.txt"
+if expected_java.is_file():
+    selected_java = shutil.which("java")
+    if selected_java is None or Path(selected_java).resolve() != Path(expected_java.read_text()):
+        raise SystemExit(15)
+
+expected_java_options = Path(__file__).parent / "expected-java-options.txt"
+if expected_java_options.is_file():
+    option_names = ("JDK_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS")
+    if any(os.environ.get(name) != "" for name in option_names):
+        raise SystemExit(16)
 
 if "--version" in sys.argv:
     print("InterProScan version {version}")
@@ -511,10 +526,9 @@ def test_interpro_pfam_freezes_inherited_path_for_execution(
     selected_path = str(selected_java.parent)
     monkeypatch.setenv("PATH", selected_path)
     adapter = InterProPfamAdapter(executable=executable, database=database)
+    frozen_path = os.pathsep.join((str(selected_java.parent.resolve()), selected_path))
 
-    (executable.parent / "expected-path.txt").write_text(
-        selected_path, encoding="utf-8"
-    )
+    (executable.parent / "expected-path.txt").write_text(frozen_path, encoding="utf-8")
     monkeypatch.setenv("PATH", str(later_java.parent))
     with LocalStore.open(tmp_path / "store") as store:
         summary = run_annotation(
@@ -526,6 +540,86 @@ def test_interpro_pfam_freezes_inherited_path_for_execution(
         )
 
     assert summary.computed == 2
+
+
+def test_interpro_pfam_freezes_resolved_java_alias_for_execution(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    selected_java = _write_jdk(tmp_path / "selected-java", marker=b"selected")
+    later_java = _write_jdk(tmp_path / "later-java", marker=b"later")
+    alias_bin = tmp_path / "alias-bin"
+    alias_bin.mkdir()
+    alias = alias_bin / "java"
+    alias.symlink_to(selected_java)
+    adapter = InterProPfamAdapter(
+        executable=executable,
+        database=database,
+        environment={"PATH": str(alias_bin)},
+    )
+
+    alias.unlink()
+    alias.symlink_to(later_java)
+    (executable.parent / "expected-java.txt").write_text(
+        str(selected_java.resolve()), encoding="utf-8"
+    )
+    with LocalStore.open(tmp_path / "store") as store:
+        summary = run_annotation(
+            fasta_path=_write_input(tmp_path / "proteins.fasta"),
+            output_dir=tmp_path / "output",
+            adapter=adapter,
+            store=store,
+            threads=1,
+        )
+
+    assert summary.computed == 2
+
+
+@pytest.mark.parametrize("name", JAVA_OPTION_VARIABLES)
+@pytest.mark.parametrize("source", ("inherited", "profile"))
+def test_interpro_pfam_rejects_java_option_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    source: str,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    environment: dict[str, str] = {}
+    if source == "inherited":
+        monkeypatch.setenv(name, "-javaagent:untracked.jar")
+    else:
+        environment[name] = "-javaagent:untracked.jar"
+
+    with pytest.raises(AdapterError, match=f"non-empty {name}"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment=environment,
+        )
+
+
+def test_interpro_pfam_masks_java_options_after_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    adapter = InterProPfamAdapter(executable=executable, database=database)
+    (executable.parent / "expected-java-options.txt").write_text(
+        "empty", encoding="utf-8"
+    )
+    for name in JAVA_OPTION_VARIABLES:
+        monkeypatch.setenv(name, "-javaagent:late.jar")
+
+    with LocalStore.open(tmp_path / "store") as store:
+        summary = run_annotation(
+            fasta_path=_write_input(tmp_path / "proteins.fasta"),
+            output_dir=tmp_path / "output",
+            adapter=adapter,
+            store=store,
+            threads=1,
+        )
+
+    assert summary.computed == 2
+    assert all(adapter.environment[name] == "" for name in JAVA_OPTION_VARIABLES)
 
 
 def test_interpro_pfam_rejects_relative_runtime_path(tmp_path: Path) -> None:
