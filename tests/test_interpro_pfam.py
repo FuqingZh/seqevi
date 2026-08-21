@@ -343,6 +343,39 @@ def test_interpro_pfam_runtime_digest_is_independent_of_jdk_path(
     assert second.contract.tool_runtime_digest == first.contract.tool_runtime_digest
 
 
+def test_interpro_pfam_runtime_digest_tracks_launcher_path_not_java_home(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    path_java = _write_jdk(tmp_path / "path-jdk", marker=b"path")
+    home_java = _write_jdk(tmp_path / "home-jdk", marker=b"home")
+    environment = {
+        "JAVA_HOME": str(home_java.parent.parent),
+        "PATH": str(path_java.parent),
+    }
+    first = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+
+    (home_java.parent.parent / "lib" / "modules").write_bytes(b"unused-change")
+    unused_changed = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+    (path_java.parent.parent / "lib" / "modules").write_bytes(b"executed-change")
+    executed_changed = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+
+    assert (
+        unused_changed.contract.tool_runtime_digest
+        == first.contract.tool_runtime_digest
+    )
+    assert (
+        executed_changed.contract.tool_runtime_digest
+        != unused_changed.contract.tool_runtime_digest
+    )
+
+
 def test_interpro_pfam_runtime_digest_fails_on_incomplete_jdk(tmp_path: Path) -> None:
     executable, database = _write_runtime(tmp_path)
     java = _write_jdk(tmp_path / "selected-java")

@@ -370,10 +370,10 @@ def _calculate_runtime_digest(
     if not hmmer_files:
         raise AdapterError(f"InterProScan HMMER directory is empty: {hmmer_dir}")
 
-    java = shutil.which(
-        "java",
-        path=environment.get("PATH", os.environ.get("PATH")),
-    )
+    # The supported InterProScan launcher selects `type -p java`; JAVA_HOME is
+    # not consulted. Mirror its effective PATH after applying the profile overlay.
+    effective_path = environment.get("PATH", os.environ.get("PATH"))
+    java = shutil.which("java", path=effective_path)
     if java is None:
         raise AdapterError("InterProScan runtime has no Java executable")
     java_path = Path(java).resolve()
