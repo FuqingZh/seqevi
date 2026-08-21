@@ -21,6 +21,7 @@ def _manifest(files: tuple[tuple[str, str, bytes], ...]) -> KitManifest:
     return KitManifest(
         schema_version=1,
         kit_id="dbcan-cazyme-test",
+        seqevi_version="0.3.1",
         adapter=AdapterName.DBCAN_CAZYME,
         platform="linux/amd64",
         dbcan_version="5.2.9",
@@ -93,7 +94,7 @@ def _inputs(tmp_path: Path) -> tuple[KitManifest, Path, ExecutionProfile, Path, 
     return manifest, resource, profile, fasta, tmp_path / "result.duckdb"
 
 
-def _write_result(path: Path, resource_id: str) -> None:
+def _write_result(path: Path, resource_id: str, seqevi_version: str) -> None:
     with duckdb.connect(str(path)) as connection:
         connection.execute("CREATE SCHEMA _seqevi")
         connection.execute(
@@ -109,7 +110,7 @@ def _write_result(path: Path, resource_id: str) -> None:
             [
                 "seqevi-duckdb/1",
                 "dbcan-cazyme/5",
-                __version__,
+                seqevi_version,
                 "dbcan-cazyme",
                 "dbcan-cazyme/1",
                 "dbCAN",
@@ -151,7 +152,11 @@ def test_managed_annotation_mounts_are_narrow_and_ephemeral(
             )
             source = output_mount.split("source=", 1)[1].split(",target=", 1)[0]
             staged = Path(source) / "result.duckdb"
-            _write_result(staged, oci._resource_id_from_lock(resource, manifest))
+            _write_result(
+                staged,
+                oci._resource_id_from_lock(resource, manifest),
+                manifest.seqevi_version,
+            )
             return subprocess.CompletedProcess(
                 arguments,
                 0,
@@ -196,6 +201,7 @@ def test_managed_annotation_mounts_are_narrow_and_ephemeral(
         timeout_seconds=None,
     )
 
+    assert manifest.seqevi_version != __version__
     assert output.is_file()
     assert result.summary.output_dir == output
     assert result.summary.metrics.existing_finalizations == 0

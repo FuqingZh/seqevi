@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import os
 import stat
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 from polars.testing import assert_frame_equal
 from typer.testing import CliRunner
 
+import seqevi.adapters.interpro_pfam as interpro_pfam_module
 from seqevi.adapters import (
     ADAPTER_CONTRACT_VERSION,
     INTERPRO_PFAM_EVIDENCE_SCHEMA,
@@ -18,12 +21,33 @@ from seqevi.annotate import run_annotation
 from seqevi.cli import app
 from seqevi.errors import AdapterError, AnnotationError, ResourceLockError
 from seqevi.evidence import EvidenceQuery
+from seqevi.runtime_identity import RuntimeComponent
 from seqevi.sequence import read_fasta, unique_identities
 from seqevi.store import LocalStore
 
 from .support import read_result_table
 
 runner = CliRunner()
+JAVA_OPTION_VARIABLES = ("JDK_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS")
+
+
+def _write_jdk(root: Path, *, marker: bytes = b"v1") -> Path:
+    java_home = root / "jdk"
+    for relative in ("bin", "conf", "lib"):
+        (java_home / relative).mkdir(parents=True)
+    java = java_home / "bin" / "java"
+    java.write_bytes(b"fixture-java-" + marker)
+    java.chmod(java.stat().st_mode | stat.S_IXUSR)
+    (java_home / "conf" / "security.properties").write_bytes(b"security-" + marker)
+    (java_home / "lib" / "modules").write_bytes(b"modules-" + marker)
+    (java_home / "release").write_bytes(b"JAVA_VERSION=17-" + marker)
+    return java
+
+
+@pytest.fixture(autouse=True)
+def _fixture_java(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    java = _write_jdk(tmp_path / "fixture-java")
+    monkeypatch.setenv("PATH", str(java.parent))
 
 
 def _write_runtime(
@@ -66,6 +90,7 @@ def _fixture_script(version: str) -> str:
 import argparse
 import hashlib
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -74,6 +99,22 @@ if expected_environment.is_file():
     expected = expected_environment.read_text().strip()
     if os.environ.get("SEQEVI_TEST_RUNTIME_ENV") != expected:
         raise SystemExit(13)
+
+expected_path = Path(__file__).parent / "expected-path.txt"
+if expected_path.is_file() and os.environ.get("PATH") != expected_path.read_text():
+    raise SystemExit(14)
+
+expected_java = Path(__file__).parent / "expected-java.txt"
+if expected_java.is_file():
+    selected_java = shutil.which("java")
+    if selected_java is None or Path(selected_java).resolve() != Path(expected_java.read_text()):
+        raise SystemExit(15)
+
+expected_java_options = Path(__file__).parent / "expected-java-options.txt"
+if expected_java_options.is_file():
+    option_names = ("JDK_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS")
+    if any(os.environ.get(name) != "" for name in option_names):
+        raise SystemExit(16)
 
 if "--version" in sys.argv:
     print("InterProScan version {version}")
@@ -259,12 +300,8 @@ def test_interpro_pfam_contract_probes_exact_runtime_and_resource(
 
 def test_interpro_pfam_runtime_digest_includes_selected_java(tmp_path: Path) -> None:
     executable, database = _write_runtime(tmp_path)
-    java_dir = tmp_path / "jdk" / "bin"
-    java_dir.mkdir(parents=True)
-    java = java_dir / "java"
-    java.write_bytes(b"fixture-java-v1")
-    java.chmod(java.stat().st_mode | stat.S_IXUSR)
-    environment = {"PATH": str(java_dir)}
+    java = _write_jdk(tmp_path / "selected-java")
+    environment = {"PATH": str(java.parent)}
 
     first = InterProPfamAdapter(
         executable=executable,
@@ -280,6 +317,178 @@ def test_interpro_pfam_runtime_digest_includes_selected_java(tmp_path: Path) -> 
     )
 
     assert second.contract.tool_runtime_digest != first.contract.tool_runtime_digest
+
+
+@pytest.mark.parametrize(
+    ("relative", "replacement"),
+    (("lib/modules", b"changed-modules"), ("conf/security.properties", b"changed")),
+)
+def test_interpro_pfam_runtime_digest_covers_jdk_runtime_tree(
+    tmp_path: Path, relative: str, replacement: bytes
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    environment = {"PATH": str(java.parent)}
+    first = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+
+    (java.parent.parent / relative).write_bytes(replacement)
+    second = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+
+    assert second.contract.tool_runtime_digest != first.contract.tool_runtime_digest
+
+
+def test_interpro_pfam_runtime_digest_is_independent_of_jdk_path(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    first_java = _write_jdk(tmp_path / "first", marker=b"same")
+    second_java = _write_jdk(tmp_path / "second", marker=b"same")
+
+    first = InterProPfamAdapter(
+        executable=executable,
+        database=database,
+        environment={"PATH": str(first_java.parent)},
+    )
+    second = InterProPfamAdapter(
+        executable=executable,
+        database=database,
+        environment={"PATH": str(second_java.parent)},
+    )
+
+    assert second.contract.tool_runtime_digest == first.contract.tool_runtime_digest
+
+
+def test_interpro_pfam_runtime_digest_tracks_launcher_path_not_java_home(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    path_java = _write_jdk(tmp_path / "path-jdk", marker=b"path")
+    home_java = _write_jdk(tmp_path / "home-jdk", marker=b"home")
+    environment = {
+        "JAVA_HOME": str(home_java.parent.parent),
+        "PATH": str(path_java.parent),
+    }
+    first = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+
+    (home_java.parent.parent / "lib" / "modules").write_bytes(b"unused-change")
+    unused_changed = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+    (path_java.parent.parent / "lib" / "modules").write_bytes(b"executed-change")
+    executed_changed = InterProPfamAdapter(
+        executable=executable, database=database, environment=environment
+    )
+
+    assert (
+        unused_changed.contract.tool_runtime_digest
+        == first.contract.tool_runtime_digest
+    )
+    assert (
+        executed_changed.contract.tool_runtime_digest
+        != unused_changed.contract.tool_runtime_digest
+    )
+
+
+def test_interpro_pfam_runtime_digest_fails_on_incomplete_jdk(tmp_path: Path) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    (java.parent.parent / "lib" / "modules").unlink()
+    (java.parent.parent / "lib").rmdir()
+
+    with pytest.raises(AdapterError, match="runtime directory is missing"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
+
+
+def test_interpro_pfam_runtime_digest_requires_java_11_modules(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    (java.parent.parent / "lib" / "native.so").write_bytes(b"native")
+    (java.parent.parent / "lib" / "modules").unlink()
+
+    with pytest.raises(AdapterError, match=r"Java 11\+.*lib/modules"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
+
+
+def test_interpro_pfam_runtime_digest_rejects_internal_jdk_symlink(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    (java.parent.parent / "conf" / "linked.conf").symlink_to("security.properties")
+
+    with pytest.raises(AdapterError, match="contains a symbolic link"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
+
+
+def test_interpro_pfam_runtime_digest_rejects_symlinked_jdk_root(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    java_home = java.parent.parent
+    (java_home / "conf").rename(java_home / "conf-real")
+    (java_home / "conf").symlink_to("conf-real", target_is_directory=True)
+
+    with pytest.raises(AdapterError, match="directory is missing or a symbolic link"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
+
+
+def test_interpro_pfam_runtime_digest_fails_on_jdk_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    java = _write_jdk(tmp_path / "selected-java")
+    modules = java.parent.parent / "lib" / "modules"
+    original = interpro_pfam_module.calculate_runtime_digest
+
+    def calculate_then_drift(
+        *,
+        runtime_name: str,
+        versions: Mapping[str, str],
+        components: tuple[RuntimeComponent, ...],
+    ) -> str:
+        digest = original(
+            runtime_name=runtime_name,
+            versions=versions,
+            components=components,
+        )
+        modules.write_bytes(b"drifted-after-hash")
+        return digest
+
+    monkeypatch.setattr(
+        interpro_pfam_module, "calculate_runtime_digest", calculate_then_drift
+    )
+
+    with pytest.raises(AdapterError, match="JAVA_HOME changed while hashing"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": str(java.parent)},
+        )
 
 
 def test_interpro_pfam_applies_environment_to_probe_and_execution(
@@ -306,6 +515,122 @@ def test_interpro_pfam_applies_environment_to_probe_and_execution(
         )
 
     assert summary.computed == 2
+
+
+def test_interpro_pfam_freezes_inherited_path_for_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    selected_java = _write_jdk(tmp_path / "selected-java", marker=b"selected")
+    later_java = _write_jdk(tmp_path / "later-java", marker=b"later")
+    selected_path = str(selected_java.parent)
+    monkeypatch.setenv("PATH", selected_path)
+    adapter = InterProPfamAdapter(executable=executable, database=database)
+    frozen_path = os.pathsep.join((str(selected_java.parent.resolve()), selected_path))
+
+    (executable.parent / "expected-path.txt").write_text(frozen_path, encoding="utf-8")
+    monkeypatch.setenv("PATH", str(later_java.parent))
+    with LocalStore.open(tmp_path / "store") as store:
+        summary = run_annotation(
+            fasta_path=_write_input(tmp_path / "proteins.fasta"),
+            output_dir=tmp_path / "output",
+            adapter=adapter,
+            store=store,
+            threads=1,
+        )
+
+    assert summary.computed == 2
+
+
+def test_interpro_pfam_freezes_resolved_java_alias_for_execution(
+    tmp_path: Path,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    selected_java = _write_jdk(tmp_path / "selected-java", marker=b"selected")
+    later_java = _write_jdk(tmp_path / "later-java", marker=b"later")
+    alias_bin = tmp_path / "alias-bin"
+    alias_bin.mkdir()
+    alias = alias_bin / "java"
+    alias.symlink_to(selected_java)
+    adapter = InterProPfamAdapter(
+        executable=executable,
+        database=database,
+        environment={"PATH": str(alias_bin)},
+    )
+
+    alias.unlink()
+    alias.symlink_to(later_java)
+    (executable.parent / "expected-java.txt").write_text(
+        str(selected_java.resolve()), encoding="utf-8"
+    )
+    with LocalStore.open(tmp_path / "store") as store:
+        summary = run_annotation(
+            fasta_path=_write_input(tmp_path / "proteins.fasta"),
+            output_dir=tmp_path / "output",
+            adapter=adapter,
+            store=store,
+            threads=1,
+        )
+
+    assert summary.computed == 2
+
+
+@pytest.mark.parametrize("name", JAVA_OPTION_VARIABLES)
+@pytest.mark.parametrize("source", ("inherited", "profile"))
+def test_interpro_pfam_rejects_java_option_injection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    source: str,
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    environment: dict[str, str] = {}
+    if source == "inherited":
+        monkeypatch.setenv(name, "-javaagent:untracked.jar")
+    else:
+        environment[name] = "-javaagent:untracked.jar"
+
+    with pytest.raises(AdapterError, match=f"non-empty {name}"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment=environment,
+        )
+
+
+def test_interpro_pfam_masks_java_options_after_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable, database = _write_runtime(tmp_path)
+    adapter = InterProPfamAdapter(executable=executable, database=database)
+    (executable.parent / "expected-java-options.txt").write_text(
+        "empty", encoding="utf-8"
+    )
+    for name in JAVA_OPTION_VARIABLES:
+        monkeypatch.setenv(name, "-javaagent:late.jar")
+
+    with LocalStore.open(tmp_path / "store") as store:
+        summary = run_annotation(
+            fasta_path=_write_input(tmp_path / "proteins.fasta"),
+            output_dir=tmp_path / "output",
+            adapter=adapter,
+            store=store,
+            threads=1,
+        )
+
+    assert summary.computed == 2
+    assert all(adapter.environment[name] == "" for name in JAVA_OPTION_VARIABLES)
+
+
+def test_interpro_pfam_rejects_relative_runtime_path(tmp_path: Path) -> None:
+    executable, database = _write_runtime(tmp_path)
+
+    with pytest.raises(AdapterError, match="non-empty absolute paths"):
+        InterProPfamAdapter(
+            executable=executable,
+            database=database,
+            environment={"PATH": f"{tmp_path}:relative-bin"},
+        )
 
 
 def test_interpro_pfam_parameters_reject_alternate_scientific_contract() -> None:
@@ -450,7 +775,7 @@ def test_interpro_pfam_run_date_is_excluded_from_scientific_payload(
         ("bad-md5", "MD5 does not match"),
         ("wrong-analysis", "not a Pfam match"),
         ("bad-date", "invalid run date"),
-        ("unexpected-go", "outside the interpro-pfam/1 contract"),
+        ("unexpected-go", "outside the interpro-pfam/2 contract"),
         ("duplicate", "duplicate match"),
     ],
 )

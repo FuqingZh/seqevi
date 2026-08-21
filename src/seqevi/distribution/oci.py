@@ -15,7 +15,6 @@ from urllib.parse import urlsplit
 
 import duckdb
 
-from seqevi import __version__
 from seqevi.annotate import AnnotationMetrics, AnnotationSummary
 from seqevi.errors import AnnotationError
 from seqevi.evidence import sha256_digest
@@ -354,7 +353,7 @@ def _validate_result(
         metadata = dict(zip(columns, row, strict=True))
     checks = {
         "ResultFormatVersion": RESULT_FORMAT_VERSION,
-        "SeqEviVersion": __version__,
+        "SeqEviVersion": manifest.seqevi_version,
         "Adapter": profile.adapter.value,
         "AdapterContractVersion": "dbcan-cazyme/1",
         "UpstreamTool": "dbCAN",

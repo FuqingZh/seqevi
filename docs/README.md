@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-08-19
+> Last updated: 2026-08-21
 
 SeqEvi has implemented the v1 local and shared Store paths. The current tree
 also contains the DuckDB result surface, fixture-backed contracts for the three
@@ -25,9 +25,9 @@ onboarding is being delivered as a separate vertical slice: runtime-image
 publication, strict planning, resource verification, smoke, atomic profile
 publication and the application-boundary OCI dispatcher are current; real
 managed-v2 scientific parity and later-process replay are accepted. Managed
-dbCAN was introduced in SeqEvi 0.2.0 and is preserved in current 0.3.1. eggNOG
-and InterPro/Pfam continue to use their supported explicit or profile runtimes;
-managed setup for them is later feature work.
+dbCAN was introduced in SeqEvi 0.2.0 and is preserved in the 0.3.2 candidate.
+eggNOG and InterPro/Pfam continue to use their supported explicit or profile
+runtimes; managed setup for them is later feature work.
 
 > **ClaimSession delivery is closed:** generic external-tool cancellation,
 > ClaimSession authority-loss handling, PostgreSQL pressure, and the eggNOG
@@ -49,20 +49,22 @@ managed setup for them is later feature work.
 > under the approved [dbCAN target-Store execution
 > plan](implementation-plan/20260819-v1.0-dbcan-target-store-execution-plan.md).
 > The [containment harness prerequisite](benchmarks/20260819-v1.0-interpro-preflight-containment-harness-acceptance.md)
-> is accepted; InterPro read-only Preflight is next. Current managed-v2 dispatch has
-> no claim-before-OCI path, so its D5 same-key managed gate is explicitly
-> unavailable rather than represented as passing.
+> is accepted. InterPro contract-v2 candidate review and release are next;
+> read-only Preflight and sanity remain paused until a published v2 release
+> identity is available. Current managed-v2 dispatch has no claim-before-OCI
+> path, so its D5 same-key managed gate is explicitly unavailable rather than
+> represented as passing.
 
 ## Capability Status
 
 | Surface | Current state | Contract or plan |
 | --- | --- | --- |
 | result consumption | single-file DuckDB and native Python relation; real local/shared runtime acceptance passed | [result contract v1.1](architecture/20260804-v1.1-result-consumption-contract.md), [acceptance](benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md) |
-| eggNOG and InterPro/Pfam | official-runtime parity accepted; generic ToolRunner cleanup plus the acceptance-only internal-timeout/external-watchdog containment prerequisite passed before InterPro Preflight | [containment harness acceptance](benchmarks/20260819-v1.0-interpro-preflight-containment-harness-acceptance.md), [ClaimSession cancellation and C2 acceptance](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [adapter contract v1.2](architecture/20260814-v1.2-adapter-contract.md), [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
+| eggNOG and InterPro/Pfam | official-runtime parity accepted; generic ToolRunner cleanup plus the acceptance-only internal-timeout/external-watchdog containment prerequisite passed before InterPro Preflight; candidate 0.3.2 adds `interpro-pfam/2` with the selected JDK result-producing runtime image in path-independent identity while preserving v1 evidence read compatibility | [containment harness acceptance](benchmarks/20260819-v1.0-interpro-preflight-containment-harness-acceptance.md), [ClaimSession cancellation and C2 acceptance](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [adapter contract v1.3](architecture/20260821-v1.3-adapter-contract.md), [runtime evidence](benchmarks/20260721-v1.0-eggnog-runtime-validation.md), [InterPro v1 evidence](benchmarks/20260723-v1.0-interproscan-runtime-validation.md) |
 | dbCAN CAZyme | scoped target-Store D1-D4 accepted; D4 correctness/rates and D3 replays passed, D5 is unavailable, and the bounded corpus manifest leaves nine files unseeded/not executed because expansion headroom is unavailable | [closeout](benchmarks/20260819-v1.0-dbcan-target-store-closeout.md), [bounded corpus manifest](benchmarks/20260819-v1.0-dbcan-bounded-corpus-manifest.md), [D4 acceptance](benchmarks/20260819-v1.0-dbcan-d4-target-store-sizing-acceptance.md), [D3 acceptance](benchmarks/20260819-v1.0-dbcan-d3-target-store-replay-acceptance.md), [execution plan](implementation-plan/20260819-v1.0-dbcan-target-store-execution-plan.md) |
 | execution profiles | v1 host profiles remain compatible; managed v2.2 setup and OCI execution are implemented and accepted | [profile v1 contract](architecture/20260724-v1.0-execution-profile-contract.md), [managed profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
-| managed onboarding | managed dbCAN was introduced in 0.2.0 and is preserved in current 0.3.1; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
-| shared Store cache seeding | eggNOG lane and scoped dbCAN gate closed; dbCAN corpus expansion and global seeding remain incomplete; InterPro read-only Preflight is next | [dbCAN closeout](benchmarks/20260819-v1.0-dbcan-target-store-closeout.md), [eggNOG closeout benchmark](benchmarks/20260818-v1.0-eggnog-target-store-closeout.md), [master cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
+| managed onboarding | managed dbCAN was introduced in 0.2.0 and is preserved in the 0.3.2 candidate; Slice B setup, Slice C delegation and the release-equivalent scientific candidate gate passed; the original Slice D run remains incomplete, with its site repeat pull deferred as a transport check | [managed roadmap v1.1](implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md), [Slice D record](benchmarks/20260806-v1.4-dbcan-public-release-gate.md), [candidate gate record](benchmarks/20260806-v1.3-dbcan-managed-candidate-gate.md), [publication record](benchmarks/20260805-v1.1-dbcan-runtime-image-publication.md) |
+| shared Store cache seeding | eggNOG lane and scoped dbCAN gate closed; dbCAN corpus expansion and global seeding remain incomplete; InterPro waits for contract-v2 candidate review and a published v2 release identity before Preflight or sanity resumes | [dbCAN closeout](benchmarks/20260819-v1.0-dbcan-target-store-closeout.md), [eggNOG closeout benchmark](benchmarks/20260818-v1.0-eggnog-target-store-closeout.md), [master cache-seeding plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
 | historical evidence claim leases | accepted per-EvidenceKey duplicate-suppression predecessor, superseded by ClaimSession coordination | [historical evidence contract v1.2](architecture/20260810-v1.2-sequence-evidence-contract.md), [historical claim-lease plan](implementation-plan/20260810-v1.0-evidence-claim-lease-implementation-plan.md), [current evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md) |
 | evidence claim coordination | ClaimSession coordination with bounded internal protocol edges, actively cancellable per-session HTTP transport, bounded PostgreSQL maintenance acquisition, and generic external-tool cancellation accepted | [evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md), [storage architecture v1.6](architecture/20260814-v1.6-storage-deployment-architecture.md), [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [maintenance runbook v1.2](operations/20260818-v1.2-claim-session-store-maintenance.md) |
 | shared Store claim contention hardening | ClaimSession and issue #37 cancellation accepted: cold two-process C2 at `9d417da`, plus fresh-database-guarded PostgreSQL 17 pressure at `7edc5e7` | [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [delivery rebaseline addendum and settled boundaries](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md), [ClaimSession technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md) |
@@ -72,7 +74,7 @@ managed setup for them is later feature work.
 
 1. [Architecture overview](architecture/20260720-v1.0-seqevi-architecture.md)
 2. [Sequence and evidence contract](architecture/20260814-v1.6-sequence-evidence-contract.md)
-3. [Adapter contract](architecture/20260814-v1.2-adapter-contract.md)
+3. [Adapter contract](architecture/20260821-v1.3-adapter-contract.md)
 4. [Result consumption contract](architecture/20260804-v1.1-result-consumption-contract.md)
 5. [Execution profile contract](architecture/20260724-v1.0-execution-profile-contract.md)
 6. [Storage and deployment architecture](architecture/20260814-v1.6-storage-deployment-architecture.md)

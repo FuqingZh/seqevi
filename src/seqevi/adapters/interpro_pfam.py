@@ -28,7 +28,7 @@ from seqevi.sequence import SequenceIdentity
 
 from .base import AdapterBatchResult, AdapterContract, AdapterSequenceResult
 
-ADAPTER_CONTRACT_VERSION = "interpro-pfam/1"
+ADAPTER_CONTRACT_VERSION = "interpro-pfam/2"
 
 INTERPRO_PFAM_EVIDENCE_SCHEMA: Mapping[str, pl.DataType] = {
     "SequenceID": pl.String(),
@@ -53,6 +53,7 @@ _INTERPRO_ACCESSION_PATTERN = re.compile(r"IPR\d{6}\Z")
 _TSV_COLUMN_COUNT = 15
 _PROBE_TIMEOUT_SECONDS = 120.0
 _NORMALIZED_ROW_BATCH_SIZE = 1000
+_JAVA_OPTION_VARIABLES = ("JDK_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS")
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +78,7 @@ class InterProPfamParameters:
         )
         if values != ("Pfam", "TSV", True, False, False, "protein"):
             raise ValueError(
-                "interpro-pfam/1 uses one fixed direct-scan scientific contract"
+                "interpro-pfam/2 uses one fixed direct-scan scientific contract"
             )
 
     def as_semantic_parameters(self) -> dict[str, object]:
@@ -102,6 +103,29 @@ class InterProPfamAdapter:
         self.database = database.resolve()
         self.parameters = parameters or InterProPfamParameters()
         self.environment = dict(environment or {})
+        if "PATH" not in self.environment:
+            inherited_path = os.environ.get("PATH")
+            if inherited_path is None:
+                raise AdapterError(
+                    "InterProScan runtime has no inherited or profile PATH"
+                )
+            self.environment["PATH"] = inherited_path
+        path_entries = self.environment["PATH"].split(os.pathsep)
+        if any(not entry or not Path(entry).is_absolute() for entry in path_entries):
+            raise AdapterError(
+                "InterProScan runtime PATH entries must be non-empty absolute paths"
+            )
+        for name in _JAVA_OPTION_VARIABLES:
+            effective_value = self.environment.get(name, os.environ.get(name, ""))
+            if effective_value:
+                raise AdapterError(
+                    f"InterProScan runtime does not allow non-empty {name}"
+                )
+            self.environment[name] = ""
+        java_path, java_home = _resolve_selected_java(self.environment)
+        self.environment["PATH"] = os.pathsep.join(
+            (str(java_path.parent), self.environment["PATH"])
+        )
         self.install_dir = self.executable.parent
         self.properties_path = self.install_dir / "interproscan.properties"
         self.jar_path = self.install_dir / "interproscan-5.jar"
@@ -122,7 +146,7 @@ class InterProPfamAdapter:
             jar_path=self.jar_path,
             properties=self.properties,
             version=self.interproscan_version,
-            environment=self.environment,
+            java_home=java_home,
         )
         resource_id = _calculate_resource_id(
             database=self.database,
@@ -352,7 +376,7 @@ def _calculate_runtime_digest(
     jar_path: Path,
     properties: Mapping[str, str],
     version: str,
-    environment: Mapping[str, str],
+    java_home: Path,
 ) -> str:
     bin_dir = _resolve_install_path(
         install_dir,
@@ -370,12 +394,6 @@ def _calculate_runtime_digest(
     if not hmmer_files:
         raise AdapterError(f"InterProScan HMMER directory is empty: {hmmer_dir}")
 
-    java = shutil.which(
-        "java",
-        path=environment.get("PATH", os.environ.get("PATH")),
-    )
-    if java is None:
-        raise AdapterError("InterProScan runtime has no Java executable")
     normalized_properties = {
         **properties,
         "data.directory": "${data.directory}",
@@ -388,25 +406,152 @@ def _calculate_runtime_digest(
             separators=(",", ":"),
         ).encode("utf-8")
     )
-    components = (
-        RuntimeComponent("launcher", executable),
-        RuntimeComponent("java", Path(java).resolve()),
-        RuntimeComponent("interproscan-5.jar", jar_path),
-        *(
-            RuntimeComponent(
-                f"hmmer/{path.relative_to(hmmer_dir).as_posix()}",
-                path,
+    try:
+        jdk_components, jdk_snapshot = _jdk_runtime_components(java_home)
+        components = (
+            RuntimeComponent("launcher", executable),
+            RuntimeComponent("interproscan-5.jar", jar_path),
+            *jdk_components,
+            *(
+                RuntimeComponent(
+                    f"hmmer/{path.relative_to(hmmer_dir).as_posix()}",
+                    path,
+                )
+                for path in hmmer_files
+            ),
+        )
+        digest = calculate_runtime_digest(
+            runtime_name="interproscan-pfam",
+            versions={
+                "interproscan": version,
+                "properties": f"sha256:{properties_digest}",
+            },
+            components=components,
+        )
+        _, after_snapshot = _jdk_runtime_components(java_home)
+    except (OSError, UnicodeError) as error:
+        raise AdapterError(
+            f"cannot read selected JAVA_HOME runtime: {error}"
+        ) from error
+    if after_snapshot != jdk_snapshot:
+        raise AdapterError("selected JAVA_HOME changed while hashing")
+    return digest
+
+
+def _resolve_selected_java(environment: Mapping[str, str]) -> tuple[Path, Path]:
+    """Resolve the launcher's frozen PATH selection and its JDK layout."""
+
+    selected = shutil.which("java", path=environment["PATH"])
+    if selected is None:
+        raise AdapterError("InterProScan runtime has no Java executable")
+    java_path = Path(selected).resolve()
+    if java_path.name != "java" or java_path.parent.name != "bin":
+        raise AdapterError(
+            f"resolved Java executable must be JAVA_HOME/bin/java: {java_path}"
+        )
+    return java_path, java_path.parent.parent
+
+
+def _jdk_runtime_components(
+    java_home: Path,
+) -> tuple[tuple[RuntimeComponent, ...], tuple[tuple[object, ...], ...]]:
+    release_path = java_home / "release"
+    roots = (java_home / "bin", java_home / "conf", java_home / "lib")
+    entries: list[tuple[str, Path]] = [("jdk/release", release_path)]
+    snapshot: list[tuple[object, ...]] = []
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    for root in roots:
+        if root.is_symlink() or not root.is_dir():
+            raise AdapterError(
+                "selected JAVA_HOME runtime directory is missing or a symbolic "
+                f"link: {root}"
             )
-            for path in hmmer_files
-        ),
+        root_file_count = 0
+        for directory, directory_names, file_names in os.walk(
+            root, followlinks=False, onerror=fail
+        ):
+            directory_path = Path(directory)
+            relative_directory = directory_path.relative_to(java_home).as_posix()
+            directory_stat = directory_path.stat(follow_symlinks=False)
+            snapshot.append(
+                (
+                    relative_directory,
+                    "directory",
+                    directory_stat.st_dev,
+                    directory_stat.st_ino,
+                    directory_stat.st_size,
+                    directory_stat.st_mtime_ns,
+                    directory_stat.st_ctime_ns,
+                )
+            )
+            for name in sorted((*directory_names, *file_names)):
+                path = directory_path / name
+                if path.is_symlink():
+                    raise AdapterError(
+                        f"selected JAVA_HOME runtime contains a symbolic link: {path}"
+                    )
+            for name in sorted(file_names):
+                path = directory_path / name
+                relative = path.relative_to(java_home).as_posix()
+                file_stat = path.stat(follow_symlinks=False)
+                if not path.is_file():
+                    raise AdapterError(
+                        "selected JAVA_HOME runtime entry is not a regular file: "
+                        f"{path}"
+                    )
+                snapshot.append(
+                    (
+                        relative,
+                        "file",
+                        file_stat.st_dev,
+                        file_stat.st_ino,
+                        file_stat.st_size,
+                        file_stat.st_mtime_ns,
+                        file_stat.st_ctime_ns,
+                    )
+                )
+                entries.append((f"jdk/{relative}", path))
+                root_file_count += 1
+        if root_file_count == 0:
+            raise AdapterError(
+                f"selected JAVA_HOME runtime directory has no regular files: {root}"
+            )
+
+    if not release_path.is_file() or release_path.is_symlink():
+        raise AdapterError(
+            f"selected JAVA_HOME release file is missing or invalid: {release_path}"
+        )
+    release_stat = release_path.stat(follow_symlinks=False)
+    release_text = release_path.read_text(encoding="utf-8")
+    version_match = re.search(r'^JAVA_VERSION="?(\d+)', release_text, re.MULTILINE)
+    if version_match is None:
+        raise AdapterError(
+            f"selected JAVA_HOME release file has no JAVA_VERSION: {release_path}"
+        )
+    if int(version_match.group(1)) >= 11:
+        modules_path = java_home / "lib" / "modules"
+        if not modules_path.is_file() or modules_path.is_symlink():
+            raise AdapterError(
+                "selected Java 11+ runtime has no regular lib/modules image: "
+                f"{modules_path}"
+            )
+    snapshot.append(
+        (
+            "release",
+            "file",
+            release_stat.st_dev,
+            release_stat.st_ino,
+            release_stat.st_size,
+            release_stat.st_mtime_ns,
+            release_stat.st_ctime_ns,
+        )
     )
-    return calculate_runtime_digest(
-        runtime_name="interproscan-pfam",
-        versions={
-            "interproscan": version,
-            "properties": f"sha256:{properties_digest}",
-        },
-        components=components,
+    return (
+        tuple(RuntimeComponent(name, path) for name, path in sorted(entries)),
+        tuple(sorted(snapshot)),
     )
 
 
@@ -675,7 +820,7 @@ def _parse_tsv_row(
     if go_annotations != "-" or pathway_annotations != "-":
         raise AdapterError(
             f"InterProScan TSV line {line_number} contains GO or pathway annotations "
-            "outside the interpro-pfam/1 contract"
+            "outside the interpro-pfam/2 contract"
         )
 
     return {

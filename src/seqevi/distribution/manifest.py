@@ -14,6 +14,9 @@ from seqevi.errors import SetupError
 
 _SCHEMA_VERSION = 1
 _KIT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_SEQEVI_VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
+)
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _OCI_IMAGE = re.compile(
     r"[a-z0-9][a-z0-9./_-]*(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}\Z"
@@ -21,6 +24,7 @@ _OCI_IMAGE = re.compile(
 _ROOT_KEYS = {
     "schema_version",
     "kit_id",
+    "seqevi_version",
     "adapter",
     "platform",
     "dbcan_version",
@@ -54,6 +58,7 @@ class KitManifest:
 
     schema_version: int
     kit_id: str
+    seqevi_version: str
     adapter: AdapterName
     platform: str
     dbcan_version: str
@@ -105,6 +110,9 @@ def parse_kit_manifest(
     kit_id = _string(document["kit_id"], "kit_id")
     if _KIT_ID.fullmatch(kit_id) is None:
         raise SetupError("managed kit manifest kit_id contains unsafe characters")
+    seqevi_version = _string(document["seqevi_version"], "seqevi_version")
+    if _SEQEVI_VERSION.fullmatch(seqevi_version) is None:
+        raise SetupError("managed kit manifest seqevi_version must be X.Y.Z")
     adapter_text = _string(document["adapter"], "adapter")
     try:
         adapter = AdapterName(adapter_text)
@@ -166,6 +174,7 @@ def parse_kit_manifest(
     return KitManifest(
         schema_version=schema_version,
         kit_id=kit_id,
+        seqevi_version=seqevi_version,
         adapter=adapter,
         platform=platform,
         dbcan_version=dbcan_version,
