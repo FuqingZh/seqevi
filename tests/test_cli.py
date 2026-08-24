@@ -25,7 +25,7 @@ def test_cli_reports_version() -> None:
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "0.3.2"
+    assert result.stdout.strip() == "0.3.3"
 
 
 def test_cli_without_command_describes_current_surface() -> None:
