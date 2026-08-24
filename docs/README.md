@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-08-21
+> Last updated: 2026-08-24
 
 SeqEvi has implemented the v1 local and shared Store paths. The current tree
 also contains the DuckDB result surface, fixture-backed contracts for the three
@@ -28,6 +28,12 @@ managed-v2 scientific parity and later-process replay are accepted. Managed
 dbCAN was introduced in SeqEvi 0.2.0 and is preserved in released 0.3.2.
 eggNOG and InterPro/Pfam continue to use their supported explicit or profile
 runtimes; managed setup for them is later feature work.
+
+The approved, not-yet-implemented [minimal annotation progress observability
+plan](implementation-plan/20260824-v1.0-minimal-progress-observability-implementation-plan.md)
+adds only truthful SeqEvi-owned phase and liveness presentation. It preserves
+upstream logs, scientific contracts, batching, Store behavior and the existing
+single-document `--json` boundary.
 
 > **ClaimSession delivery is closed:** generic external-tool cancellation,
 > ClaimSession authority-loss handling, PostgreSQL pressure, and the eggNOG
@@ -70,6 +76,7 @@ runtimes; managed setup for them is later feature work.
 | evidence claim coordination | ClaimSession coordination with bounded internal protocol edges, actively cancellable per-session HTTP transport, bounded PostgreSQL maintenance acquisition, and generic external-tool cancellation accepted | [evidence contract v1.6](architecture/20260814-v1.6-sequence-evidence-contract.md), [storage architecture v1.6](architecture/20260814-v1.6-storage-deployment-architecture.md), [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [maintenance runbook v1.2](operations/20260818-v1.2-claim-session-store-maintenance.md) |
 | shared Store claim contention hardening | ClaimSession and issue #37 cancellation accepted: cold two-process C2 at `9d417da`, plus fresh-database-guarded PostgreSQL 17 pressure at `7edc5e7` | [acceptance evidence](benchmarks/20260814-v1.0-claim-session-cancellation-acceptance.md), [delivery rebaseline addendum and settled boundaries](implementation-plan/20260813-v1.1-claim-session-delivery-rebaseline-addendum.md), [ClaimSession technical plan](implementation-plan/20260812-v1.0-claim-session-and-tool-cancellation-implementation-plan.md) |
 | PostgreSQL maintenance acquisition deadlines | implemented and validated; two independent fixed budgets include pool checkout and physical connect | [implementation plan](implementation-plan/20260814-v1.0-postgresql-maintenance-acquisition-deadline-plan.md) |
+| annotation progress observability | minimal CLI phase/liveness plan approved; implementation not started | [implementation plan](implementation-plan/20260824-v1.0-minimal-progress-observability-implementation-plan.md) |
 
 ## Start Here
 
@@ -126,6 +133,7 @@ runtimes; managed setup for them is later feature work.
 51. [InterPro Preflight containment harness acceptance](benchmarks/20260819-v1.0-interpro-preflight-containment-harness-acceptance.md)
 52. [InterPro target-Store successor implementation plan](implementation-plan/20260820-v1.0-interpro-target-store-successor-implementation-plan.md)
 53. [Historical InterPro target-Store read-only Preflight](benchmarks/20260820-v1.0-interpro-target-store-preflight.md)
+54. [Minimal annotation progress observability implementation plan](implementation-plan/20260824-v1.0-minimal-progress-observability-implementation-plan.md)
 
 ## Managed Boundary Contracts
 
