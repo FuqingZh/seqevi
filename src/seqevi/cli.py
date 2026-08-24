@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import sys
 import threading
@@ -13,6 +14,12 @@ from pathlib import Path
 from typing import Annotated, NoReturn, TextIO
 
 import typer
+from rich.console import Console, Group, RenderableType
+from rich.live import Live
+from rich.progress_bar import ProgressBar
+from rich.spinner import Spinner
+from rich.table import Table
+from rich.text import Text
 
 from . import __version__
 from .adapters import (
@@ -31,11 +38,12 @@ from .execution_profile import (
     profile_example,
     redacted_effective_configuration,
 )
-from .progress import ProgressEvent, ProgressState
+from .progress import ProgressEvent
 from .resource_lock import resource_lock_path
 
 _LOGGER = logging.getLogger(__name__)
-_PROGRESS_REFRESH_SECONDS = 1.0
+_PROGRESS_REFRESH_SECONDS = 0.25
+_FULL_PROGRESS_MIN_WIDTH = 80
 
 app = typer.Typer(
     name="seqevi",
@@ -72,7 +80,7 @@ def _resolve_executable(value: str) -> Path:
 
 
 class _ProgressRenderer:
-    """Render the latest private progress event on one transient stderr line."""
+    """Render one invocation in a transient Rich live region."""
 
     def __init__(
         self,
@@ -80,81 +88,141 @@ class _ProgressRenderer:
         stream: TextIO,
         refresh_seconds: float = _PROGRESS_REFRESH_SECONDS,
         monotonic: Callable[[], float] = time.monotonic,
+        width: int | None = None,
     ) -> None:
-        self._stream = stream
-        self._refresh_seconds = refresh_seconds
+        if refresh_seconds <= 0:
+            raise ValueError("progress refresh interval must be positive")
         self._monotonic = monotonic
+        self._started_at = monotonic()
         self._lock = threading.Lock()
-        self._stop = threading.Event()
         self._latest: ProgressEvent | None = None
-        self._phase_started = monotonic()
-        self._line_visible = False
-        self._thread: threading.Thread | None = None
+        self._started = False
+        self._closed = False
+        self._spinner = Spinner("dots", style="cyan")
+        self._console = Console(
+            file=stream,
+            stderr=True,
+            force_terminal=True,
+            force_interactive=True,
+            highlight=False,
+            width=width,
+        )
+        self._live = Live(
+            console=self._console,
+            get_renderable=self._render,
+            refresh_per_second=1.0 / refresh_seconds,
+            transient=True,
+            redirect_stdout=False,
+            redirect_stderr=False,
+        )
 
     def __call__(self, event: ProgressEvent) -> None:
-        now = self._monotonic()
         with self._lock:
-            if (
-                self._latest is None
-                or self._latest.phase is not event.phase
-                or event.state is ProgressState.STARTED
-            ):
-                self._phase_started = now
+            if self._closed:
+                return
             self._latest = event
-            self._write_locked(now)
-            if self._thread is None:
-                self._thread = threading.Thread(
-                    target=self._refresh,
-                    name="seqevi-progress",
-                    daemon=True,
-                )
-                self._thread.start()
+            should_start = not self._started
+            self._started = True
+        if should_start:
+            self._live.start(refresh=True)
+        else:
+            self._live.refresh()
 
     def close(self) -> None:
-        """Stop the timer and remove the transient line before final output."""
+        """Stop refreshing and clear the transient region before final output."""
 
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join()
         with self._lock:
-            if self._line_visible:
-                self._stream.write("\r\x1b[K")
-                self._stream.flush()
-                self._line_visible = False
+            if self._closed:
+                return
+            self._closed = True
+            started = self._started
+        if started:
+            self._live.stop()
 
-    def _refresh(self) -> None:
-        try:
-            while not self._stop.wait(self._refresh_seconds):
-                with self._lock:
-                    self._write_locked(self._monotonic())
-        except Exception:
-            _LOGGER.exception("annotation progress renderer refresh failed")
-
-    def _write_locked(self, now: float) -> None:
-        if self._latest is None:
-            return
-        elapsed = (
-            self._latest.elapsed_seconds
-            if self._latest.elapsed_seconds is not None
-            else max(0.0, now - self._phase_started)
+    def _render(self) -> RenderableType:
+        with self._lock:
+            event = self._latest
+        if event is None:
+            return Text("")
+        return _render_progress_event(
+            event,
+            elapsed_seconds=max(0.0, self._monotonic() - self._started_at),
+            width=self._console.width,
+            spinner=self._spinner,
         )
-        text = _render_progress_event(self._latest, elapsed_seconds=elapsed)
-        self._stream.write(f"\r{text}\x1b[K")
-        self._stream.flush()
-        self._line_visible = True
 
 
-def _render_progress_event(event: ProgressEvent, *, elapsed_seconds: float) -> str:
-    parts = [f"[seqevi] {event.message}"]
-    if event.completed is not None:
-        assert event.total is not None
-        assert event.unit is not None
-        fraction = f"{event.completed:,}/{event.total:,} {event.unit.value}"
-        percentage = 100.0 if event.total == 0 else event.completed / event.total * 100
-        parts.append(f"{fraction} ({percentage:.0f}%)")
-    if event.state is not ProgressState.COMPLETED:
-        parts.append(_format_elapsed(elapsed_seconds))
-    return " · ".join(parts)
+def _render_progress_event(
+    event: ProgressEvent,
+    *,
+    elapsed_seconds: float,
+    width: int,
+    spinner: Spinner | None = None,
+) -> RenderableType:
+    """Build a full or compact Rich view from one semantic event."""
+
+    active_spinner = spinner or Spinner("dots", style="cyan")
+    elapsed = f"{_format_elapsed(elapsed_seconds)} elapsed"
+    ready = event.evidence_ready
+    show_ratio = ready is not None and ready.completed < ready.total
+
+    if width < _FULL_PROGRESS_MIN_WIDTH:
+        compact = Table.grid(expand=True, padding=(0, 1))
+        compact.add_column(width=1)
+        compact.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        if show_ratio:
+            assert ready is not None
+            compact.add_column(justify="right", no_wrap=True)
+            compact.add_column(justify="right", no_wrap=True)
+        compact.add_column(justify="right", no_wrap=True)
+        row: list[RenderableType] = [
+            active_spinner,
+            Text(event.message),
+        ]
+        if show_ratio:
+            assert ready is not None
+            row.extend(
+                (
+                    Text(f"{ready.completed:,}/{ready.total:,}"),
+                    Text(f"{_percentage(ready.completed, ready.total):.0f}%"),
+                )
+            )
+        row.append(Text(elapsed, style="dim"))
+        compact.add_row(*row)
+        return compact
+
+    header = Table.grid(expand=True, padding=(0, 1))
+    header.add_column(width=1)
+    header.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    header.add_column(justify="right", no_wrap=True)
+    message = event.message
+    if event.batch is not None:
+        message = f"{message} · {event.batch.size:,} sequences"
+    header.add_row(
+        active_spinner,
+        Text(message),
+        Text(elapsed, style="dim"),
+    )
+    if not show_ratio:
+        return header
+
+    assert ready is not None
+    progress = Table.grid(expand=True, padding=(0, 1))
+    progress.add_column(no_wrap=True)
+    progress.add_column(ratio=1)
+    progress.add_column(justify="right", no_wrap=True)
+    progress.add_column(justify="right", no_wrap=True)
+    progress.add_row(
+        Text("Unique sequences", style="dim"),
+        ProgressBar(total=ready.total, completed=ready.completed),
+        Text(f"{ready.completed:,}/{ready.total:,}"),
+        Text(f"{_percentage(ready.completed, ready.total):.0f}%"),
+    )
+    return Group(header, progress)
+
+
+def _percentage(completed: int, total: int) -> float:
+    return 100.0 if total == 0 else completed / total * 100
 
 
 def _format_elapsed(elapsed_seconds: float) -> str:
@@ -169,7 +237,7 @@ def _format_elapsed(elapsed_seconds: float) -> str:
 
 
 def _stderr_is_interactive() -> bool:
-    return sys.stderr.isatty()
+    return sys.stderr.isatty() and os.environ.get("TERM", "").lower() != "dumb"
 
 
 def _close_progress_renderer(renderer: _ProgressRenderer | None) -> None:
@@ -298,10 +366,10 @@ def annotate_command(
     progress: Annotated[
         bool,
         typer.Option(
-            "--progress",
-            help="Show interactive SeqEvi phase and liveness progress on stderr.",
+            "--progress/--no-progress",
+            help="Show dynamic annotation progress on capable interactive stderr.",
         ),
-    ] = False,
+    ] = True,
     json_output: Annotated[
         bool,
         typer.Option(
@@ -312,6 +380,7 @@ def annotate_command(
 ) -> None:
     """Reuse exact evidence and publish one immutable DuckDB result."""
 
+    invocation_started = time.monotonic()
     renderer = (
         _ProgressRenderer(stream=sys.stderr)
         if progress and not json_output and _stderr_is_interactive()
@@ -387,7 +456,8 @@ def annotate_command(
         return
 
     typer.echo(
-        f"Annotated {summary.unique_sequences} unique sequences "
+        f"✓ Annotated {summary.unique_sequences} unique sequences "
+        f"in {_format_elapsed(time.monotonic() - invocation_started)} "
         f"({summary.cache_hits} cached, {summary.computed} computed); "
         f"output: {summary.output_dir}"
     )

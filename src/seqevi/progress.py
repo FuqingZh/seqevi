@@ -40,38 +40,49 @@ class ProgressUnit(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class WorkProgress:
+    """One exact cumulative measure owned by SeqEvi."""
+
+    completed: int
+    total: int
+    unit: ProgressUnit
+
+    def __post_init__(self) -> None:
+        if self.completed < 0 or self.total < 0:
+            raise ValueError("progress counts cannot be negative")
+        if self.completed > self.total:
+            raise ValueError("completed progress cannot exceed total")
+
+
+@dataclass(frozen=True, slots=True)
+class BatchProgress:
+    """Exact metadata for one internally owned adapter batch."""
+
+    number: int
+    size: int
+
+    def __post_init__(self) -> None:
+        if self.number < 1:
+            raise ValueError("batch number must be positive")
+        if self.size < 1:
+            raise ValueError("batch size must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class ProgressEvent:
     """Immutable private progress observation for terminal presentation.
 
     Notes:
-        Counts are accepted only as a complete, typed ratio. This prevents a
-        presenter from inferring a denominator or work unit from free text.
+        ``evidence_ready`` is cumulative terminal evidence, not phase-local
+        activity. Tool batches remain indeterminate even when their size is
+        known.
     """
 
     phase: ProgressPhase
     state: ProgressState
     message: str
-    completed: int | None = None
-    total: int | None = None
-    unit: ProgressUnit | None = None
-    elapsed_seconds: float | None = None
-
-    def __post_init__(self) -> None:
-        has_completed = self.completed is not None
-        has_total = self.total is not None
-        if has_completed != has_total:
-            raise ValueError("progress counts require both completed and total")
-        if has_completed != (self.unit is not None):
-            raise ValueError("progress counts require exactly one typed unit")
-        if has_completed:
-            assert self.completed is not None
-            assert self.total is not None
-            if self.completed < 0 or self.total < 0:
-                raise ValueError("progress counts cannot be negative")
-            if self.completed > self.total:
-                raise ValueError("completed progress cannot exceed total")
-        if self.elapsed_seconds is not None and self.elapsed_seconds < 0:
-            raise ValueError("elapsed progress time cannot be negative")
+    evidence_ready: WorkProgress | None = None
+    batch: BatchProgress | None = None
 
 
 ProgressSink = Callable[[ProgressEvent], None]

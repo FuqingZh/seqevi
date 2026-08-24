@@ -116,6 +116,7 @@ def test_annotate_help_uses_concrete_external_input_names() -> None:
     assert "--output" in help_text
     assert "--threads" in help_text
     assert "--progress" in help_text
+    assert "--no-progress" in help_text
     assert "--runtime" not in help_text
     assert "--database" not in help_text
     assert "--profile" in help_text
@@ -182,18 +183,20 @@ def test_annotate_cli_runs_injected_adapter(
     )
 
     assert result.exit_code == 0, result.output
-    assert "1 unique sequences (0 cached, 1 computed)" in result.stdout
+    assert "Annotated 1 unique sequences" in result.stdout
+    assert "(0 cached, 1 computed)" in result.stdout
     assert "[seqevi]" not in result.stderr
     assert output.is_file()
 
 
-def test_annotate_cli_progress_is_explicit_interactive_stderr(
+def test_annotate_cli_progress_is_automatic_on_interactive_stderr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fasta = tmp_path / "proteins.fasta"
     fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
     executable = write_fixture_tool(tmp_path / "fixture-tool")
     database = write_fixture_database(tmp_path / "database")
+    monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setattr(seqevi.cli, "_stderr_is_interactive", lambda: True)
     monkeypatch.setattr(
         seqevi.cli,
@@ -208,7 +211,6 @@ def test_annotate_cli_progress_is_explicit_interactive_stderr(
         app,
         [
             "annotate",
-            "--progress",
             "--adapter",
             "interpro-pfam",
             "--fasta",
@@ -226,7 +228,10 @@ def test_annotate_cli_progress_is_explicit_interactive_stderr(
 
     assert result.exit_code == 0, result.output
     assert "Annotated 1 unique sequences" in result.stdout
-    assert "[seqevi]" in result.stderr
+    progress_text = Text.from_ansi(result.stderr).plain
+    assert "FASTA ready" in progress_text
+    assert "1/1" not in progress_text
+    assert "Annotation complete" in progress_text
 
     monkeypatch.setattr(seqevi.cli, "_stderr_is_interactive", lambda: False)
     redirected = runner.invoke(
@@ -249,7 +254,57 @@ def test_annotate_cli_progress_is_explicit_interactive_stderr(
         ],
     )
     assert redirected.exit_code == 0, redirected.output
-    assert "[seqevi]" not in redirected.stderr
+    assert redirected.stderr == ""
+
+
+def test_annotate_cli_no_progress_and_dumb_terminal_are_quiet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    executable = write_fixture_tool(tmp_path / "fixture-tool")
+    database = write_fixture_database(tmp_path / "database")
+    monkeypatch.setattr(seqevi.cli, "_stderr_is_interactive", lambda: True)
+    monkeypatch.setattr(
+        seqevi.cli,
+        "create_adapter",
+        lambda configuration: FixtureAdapter(
+            executable=configuration.executable,
+            database=configuration.database,
+        ),
+    )
+
+    disabled = runner.invoke(
+        app,
+        [
+            "annotate",
+            "--no-progress",
+            "--adapter",
+            "interpro-pfam",
+            "--fasta",
+            str(fasta),
+            "--store",
+            str(tmp_path / "disabled-store"),
+            "--output",
+            str(tmp_path / "disabled.duckdb"),
+            "--executable",
+            str(executable),
+            "--resource",
+            str(database),
+        ],
+    )
+    assert disabled.exit_code == 0, disabled.output
+    assert disabled.stderr == ""
+
+    monkeypatch.undo()
+
+    class InteractiveStderr:
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(seqevi.cli.sys, "stderr", InteractiveStderr())
+    monkeypatch.setenv("TERM", "dumb")
+    assert seqevi.cli._stderr_is_interactive() is False
 
 
 def test_annotate_cli_loads_explicit_execution_profile(

@@ -29,6 +29,8 @@ from .progress import (
     ProgressPhase,
     ProgressSink,
     ProgressState,
+    ProgressUnit,
+    WorkProgress,
     emit_progress,
 )
 from .result import RESULT_FORMAT_VERSION, scan_annotations as _scan_annotations
@@ -176,7 +178,7 @@ def _run_annotation_application(
         ProgressEvent(
             ProgressPhase.ANNOTATION,
             ProgressState.STARTED,
-            "starting annotation",
+            "Starting annotation",
         ),
     )
     inputs = resolve_annotation_inputs(
@@ -195,7 +197,7 @@ def _run_annotation_application(
             ProgressEvent(
                 ProgressPhase.ANNOTATION,
                 ProgressState.RUNNING,
-                "managed annotation running",
+                "Running managed annotation",
             ),
         )
         managed = run_oci_annotation(
@@ -211,7 +213,7 @@ def _run_annotation_application(
             ProgressEvent(
                 ProgressPhase.FINALIZATION,
                 ProgressState.STARTED,
-                "validating result",
+                "Validating result",
             ),
         )
         invocation = AnnotationInvocation(
@@ -225,7 +227,7 @@ def _run_annotation_application(
             ProgressEvent(
                 ProgressPhase.COMPLETED,
                 ProgressState.COMPLETED,
-                "annotation completed",
+                "Annotation complete",
             ),
         )
         return invocation
@@ -258,7 +260,12 @@ def _run_annotation_application(
             ProgressEvent(
                 ProgressPhase.FINALIZATION,
                 ProgressState.STARTED,
-                "closing Store and validating result",
+                "Validating result",
+                evidence_ready=WorkProgress(
+                    completed=summary.unique_sequences,
+                    total=summary.unique_sequences,
+                    unit=ProgressUnit.SEQUENCES,
+                ),
             ),
         )
     invocation = AnnotationInvocation(
@@ -272,7 +279,12 @@ def _run_annotation_application(
         ProgressEvent(
             ProgressPhase.COMPLETED,
             ProgressState.COMPLETED,
-            "annotation completed",
+            "Annotation complete",
+            evidence_ready=WorkProgress(
+                completed=summary.unique_sequences,
+                total=summary.unique_sequences,
+                unit=ProgressUnit.SEQUENCES,
+            ),
         ),
     )
     return invocation
