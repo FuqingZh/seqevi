@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import sys
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, NoReturn
+from typing import Annotated, NoReturn, TextIO
 
 import typer
 
@@ -27,7 +31,11 @@ from .execution_profile import (
     profile_example,
     redacted_effective_configuration,
 )
+from .progress import ProgressEvent, ProgressState
 from .resource_lock import resource_lock_path
+
+_LOGGER = logging.getLogger(__name__)
+_PROGRESS_REFRESH_SECONDS = 1.0
 
 app = typer.Typer(
     name="seqevi",
@@ -61,6 +69,116 @@ def _resolve_executable(value: str) -> Path:
     if resolved is None:
         raise typer.BadParameter(f"Executable not found or not executable: {value}")
     return Path(resolved).resolve()
+
+
+class _ProgressRenderer:
+    """Render the latest private progress event on one transient stderr line."""
+
+    def __init__(
+        self,
+        *,
+        stream: TextIO,
+        refresh_seconds: float = _PROGRESS_REFRESH_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._stream = stream
+        self._refresh_seconds = refresh_seconds
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._latest: ProgressEvent | None = None
+        self._phase_started = monotonic()
+        self._line_visible = False
+        self._thread: threading.Thread | None = None
+
+    def __call__(self, event: ProgressEvent) -> None:
+        now = self._monotonic()
+        with self._lock:
+            if (
+                self._latest is None
+                or self._latest.phase is not event.phase
+                or event.state is ProgressState.STARTED
+            ):
+                self._phase_started = now
+            self._latest = event
+            self._write_locked(now)
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._refresh,
+                    name="seqevi-progress",
+                    daemon=True,
+                )
+                self._thread.start()
+
+    def close(self) -> None:
+        """Stop the timer and remove the transient line before final output."""
+
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        with self._lock:
+            if self._line_visible:
+                self._stream.write("\r\x1b[K")
+                self._stream.flush()
+                self._line_visible = False
+
+    def _refresh(self) -> None:
+        try:
+            while not self._stop.wait(self._refresh_seconds):
+                with self._lock:
+                    self._write_locked(self._monotonic())
+        except Exception:
+            _LOGGER.exception("annotation progress renderer refresh failed")
+
+    def _write_locked(self, now: float) -> None:
+        if self._latest is None:
+            return
+        elapsed = (
+            self._latest.elapsed_seconds
+            if self._latest.elapsed_seconds is not None
+            else max(0.0, now - self._phase_started)
+        )
+        text = _render_progress_event(self._latest, elapsed_seconds=elapsed)
+        self._stream.write(f"\r{text}\x1b[K")
+        self._stream.flush()
+        self._line_visible = True
+
+
+def _render_progress_event(event: ProgressEvent, *, elapsed_seconds: float) -> str:
+    parts = [f"[seqevi] {event.message}"]
+    if event.completed is not None:
+        assert event.total is not None
+        assert event.unit is not None
+        fraction = f"{event.completed:,}/{event.total:,} {event.unit.value}"
+        percentage = 100.0 if event.total == 0 else event.completed / event.total * 100
+        parts.append(f"{fraction} ({percentage:.0f}%)")
+    if event.state is not ProgressState.COMPLETED:
+        parts.append(_format_elapsed(elapsed_seconds))
+    return " · ".join(parts)
+
+
+def _format_elapsed(elapsed_seconds: float) -> str:
+    seconds = int(max(0.0, elapsed_seconds))
+    hours, remainder = divmod(seconds, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _stderr_is_interactive() -> bool:
+    return sys.stderr.isatty()
+
+
+def _close_progress_renderer(renderer: _ProgressRenderer | None) -> None:
+    if renderer is None:
+        return
+    try:
+        renderer.close()
+    except Exception:
+        _LOGGER.exception("annotation progress renderer shutdown failed")
 
 
 @app.callback()
@@ -177,6 +295,13 @@ def annotate_command(
             help="Worker threads; overrides the profile default.",
         ),
     ] = None,
+    progress: Annotated[
+        bool,
+        typer.Option(
+            "--progress",
+            help="Show interactive SeqEvi phase and liveness progress on stderr.",
+        ),
+    ] = False,
     json_output: Annotated[
         bool,
         typer.Option(
@@ -187,6 +312,11 @@ def annotate_command(
 ) -> None:
     """Reuse exact evidence and publish one immutable DuckDB result."""
 
+    renderer = (
+        _ProgressRenderer(stream=sys.stderr)
+        if progress and not json_output and _stderr_is_interactive()
+        else None
+    )
     try:
         invocation = _run_annotation_application(
             fasta=fasta,
@@ -200,8 +330,11 @@ def annotate_command(
             threads=threads,
             timeout_seconds=timeout_seconds,
             adapter_factory=create_adapter,
+            progress_sink=renderer,
         )
     except (AnnotationError, FastaValidationError, StoreError) as error:
+        _close_progress_renderer(renderer)
+        renderer = None
         if json_output:
             typer.echo(
                 json.dumps(
@@ -218,6 +351,8 @@ def annotate_command(
         else:
             typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from error
+    finally:
+        _close_progress_renderer(renderer)
 
     summary = invocation.summary
     if json_output:

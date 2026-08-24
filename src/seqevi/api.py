@@ -24,6 +24,13 @@ from .execution_profile import (
     load_execution_profile,
     load_named_profile,
 )
+from .progress import (
+    ProgressEvent,
+    ProgressPhase,
+    ProgressSink,
+    ProgressState,
+    emit_progress,
+)
 from .result import RESULT_FORMAT_VERSION, scan_annotations as _scan_annotations
 from .store import open_evidence_store
 
@@ -162,7 +169,16 @@ def _run_annotation_application(
     threads: int | None,
     timeout_seconds: float | None,
     adapter_factory: Callable[[AdapterConfiguration], AnnotationAdapter] | None = None,
+    progress_sink: ProgressSink | None = None,
 ) -> AnnotationInvocation:
+    emit_progress(
+        progress_sink,
+        ProgressEvent(
+            ProgressPhase.ANNOTATION,
+            ProgressState.STARTED,
+            "starting annotation",
+        ),
+    )
     inputs = resolve_annotation_inputs(
         profile=profile,
         config=config,
@@ -174,6 +190,14 @@ def _run_annotation_application(
         timeout_seconds=timeout_seconds,
     )
     if inputs.profile is not None and inputs.profile.version == 2:
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.ANNOTATION,
+                ProgressState.RUNNING,
+                "managed annotation running",
+            ),
+        )
         managed = run_oci_annotation(
             fasta=fasta.expanduser().resolve(),
             output=output.expanduser().resolve(),
@@ -182,12 +206,29 @@ def _run_annotation_application(
             threads=inputs.threads,
             timeout_seconds=inputs.timeout_seconds,
         )
-        return AnnotationInvocation(
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.FINALIZATION,
+                ProgressState.STARTED,
+                "validating result",
+            ),
+        )
+        invocation = AnnotationInvocation(
             relation=_scan_annotations(managed.output),
             summary=managed.summary,
             adapter=managed.adapter,
             result_schema_id=managed.result_schema_id,
         )
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.COMPLETED,
+                ProgressState.COMPLETED,
+                "annotation completed",
+            ),
+        )
+        return invocation
     if inputs.executable is None:
         raise AnnotationError("local annotation requires an executable")
     factory = create_adapter if adapter_factory is None else adapter_factory
@@ -210,13 +251,31 @@ def _run_annotation_application(
             threads=inputs.threads,
             output_format="duckdb",
             result_metadata=metadata,
+            progress_sink=progress_sink,
         )
-    return AnnotationInvocation(
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.FINALIZATION,
+                ProgressState.STARTED,
+                "closing Store and validating result",
+            ),
+        )
+    invocation = AnnotationInvocation(
         relation=_scan_annotations(summary.output_dir),
         summary=summary,
         adapter=metadata["Adapter"],
         result_schema_id=metadata["ResultSchemaID"],
     )
+    emit_progress(
+        progress_sink,
+        ProgressEvent(
+            ProgressPhase.COMPLETED,
+            ProgressState.COMPLETED,
+            "annotation completed",
+        ),
+    )
+    return invocation
 
 
 def resolve_annotation_inputs(
