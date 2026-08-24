@@ -26,6 +26,14 @@ from .evidence import (
     EvidenceSource,
     EvidenceStatus,
 )
+from .progress import (
+    ProgressEvent,
+    ProgressPhase,
+    ProgressSink,
+    ProgressState,
+    ProgressUnit,
+    emit_progress,
+)
 from .result import RESULT_FORMAT_VERSION, materialize_result_database
 from .runner import ToolCancelledError, ToolCommand, ToolRunResult, ToolRunner
 from .sequence import (
@@ -134,6 +142,7 @@ def run_annotation(
     threads: int = 1,
     output_format: Literal["duckdb"] = "duckdb",
     result_metadata: Mapping[str, str] | None = None,
+    progress_sink: ProgressSink | None = None,
 ) -> AnnotationSummary:
     """Resolve exact evidence, compute misses, and publish one DuckDB result."""
 
@@ -148,11 +157,30 @@ def run_annotation(
 
     started = time.perf_counter()
     fasta_started = time.perf_counter()
+    emit_progress(
+        progress_sink,
+        ProgressEvent(
+            ProgressPhase.STAGING,
+            ProgressState.STARTED,
+            "staging FASTA",
+        ),
+    )
     fasta_stage_root = Path(
         tempfile.mkdtemp(prefix=".seqevi-fasta-", dir=output_dir.parent)
     )
     stage = stage_fasta(fasta_path, fasta_stage_root)
     fasta_staging_seconds = time.perf_counter() - fasta_started
+    emit_progress(
+        progress_sink,
+        ProgressEvent(
+            ProgressPhase.STAGING,
+            ProgressState.COMPLETED,
+            "FASTA staged",
+            completed=stage.unique_sequences,
+            total=stage.unique_sequences,
+            unit=ProgressUnit.SEQUENCES,
+        ),
+    )
     try:
         work_dir = Path(
             tempfile.mkdtemp(prefix=".seqevi-annotate-", dir=output_dir.parent)
@@ -201,6 +229,14 @@ def run_annotation(
                 claim_session.cancellation_signal if claim_session is not None else None
             ),
         )
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.STORE_LOOKUP,
+                ProgressState.STARTED,
+                "store lookup",
+            ),
+        )
 
         for identity_batch in batched(iter_staged_identities(stage), _STORE_BATCH_SIZE):
             queries = tuple(
@@ -238,6 +274,17 @@ def run_annotation(
                 cached = store.lookup_many(queries)
             store_lookup_seconds += time.perf_counter() - lookup_started
             lookup_batches += 1
+            emit_progress(
+                progress_sink,
+                ProgressEvent(
+                    ProgressPhase.STORE_LOOKUP,
+                    ProgressState.RUNNING,
+                    "store lookup",
+                    completed=len(keys_by_sequence_id),
+                    total=stage.unique_sequences,
+                    unit=ProgressUnit.SEQUENCES,
+                ),
+            )
             if claim_session is None:
                 for query in queries:
                     if query.key not in cached:
@@ -259,6 +306,7 @@ def run_annotation(
                     timeout_seconds=timeout_seconds,
                     threads=threads,
                     claim_session=claim_session,
+                    progress_sink=progress_sink,
                 )
                 commit_batches += batch_metrics.commit_batches
                 adapter_seconds += batch_metrics.adapter_seconds
@@ -281,6 +329,7 @@ def run_annotation(
                 timeout_seconds=timeout_seconds,
                 threads=threads,
                 claim_session=claim_session,
+                progress_sink=progress_sink,
             )
             commit_batches += batch_metrics.commit_batches
             adapter_seconds += batch_metrics.adapter_seconds
@@ -288,7 +337,16 @@ def run_annotation(
             existing_finalizations += batch_metrics.existing_finalizations
             computed_ids.difference_update(batch_metrics.peer_completed_sequence_ids)
 
+        waited_for_claim = bool(busy_queries)
         while busy_queries:
+            emit_progress(
+                progress_sink,
+                ProgressEvent(
+                    ProgressPhase.CLAIM_WAIT,
+                    ProgressState.RUNNING,
+                    "waiting for peer claims",
+                ),
+            )
             time.sleep(busy_retry_after or 1.0)
             next_retry_after: float | None = None
             next_busy = []
@@ -328,6 +386,7 @@ def run_annotation(
                     timeout_seconds=timeout_seconds,
                     threads=threads,
                     claim_session=claim_session,
+                    progress_sink=progress_sink,
                 )
                 commit_batches += batch_metrics.commit_batches
                 adapter_seconds += batch_metrics.adapter_seconds
@@ -339,8 +398,38 @@ def run_annotation(
             busy_queries = next_busy
             busy_retry_after = next_retry_after
 
+        if waited_for_claim:
+            emit_progress(
+                progress_sink,
+                ProgressEvent(
+                    ProgressPhase.CLAIM_WAIT,
+                    ProgressState.COMPLETED,
+                    "peer claims resolved",
+                ),
+            )
+
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.STORE_LOOKUP,
+                ProgressState.COMPLETED,
+                "store lookup completed",
+                completed=stage.unique_sequences,
+                total=stage.unique_sequences,
+                unit=ProgressUnit.SEQUENCES,
+            ),
+        )
+
         if claim_session is not None:
             claim_session.raise_if_lost()
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.STORE_FETCH,
+                ProgressState.STARTED,
+                "fetching evidence",
+            ),
+        )
         fetch_started = time.perf_counter()
         fetched_by_key = store.fetch_many(keys_by_sequence_id.values())
         store_fetch_seconds = time.perf_counter() - fetch_started
@@ -351,6 +440,17 @@ def run_annotation(
             raise AnnotationError(
                 f"Store did not expose {len(missing_keys)} terminal evidence records"
             )
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.STORE_FETCH,
+                ProgressState.COMPLETED,
+                "evidence fetched",
+                completed=len(fetched_by_key),
+                total=stage.unique_sequences,
+                unit=ProgressUnit.SEQUENCES,
+            ),
+        )
         fetched_by_sequence_id = {
             key.sequence_id: fetched for key, fetched in fetched_by_key.items()
         }
@@ -366,6 +466,14 @@ def run_annotation(
         statuses = [
             fetched.record.status for fetched in fetched_by_sequence_id.values()
         ]
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.PACKAGE,
+                ProgressState.STARTED,
+                "packaging result",
+            ),
+        )
         package_started = time.perf_counter()
         if output_format != "duckdb":
             raise AnnotationError(f"unsupported output format: {output_format}")
@@ -413,6 +521,17 @@ def run_annotation(
                 unlink_owned_output()
                 raise
         package_seconds = time.perf_counter() - package_started
+        emit_progress(
+            progress_sink,
+            ProgressEvent(
+                ProgressPhase.PACKAGE,
+                ProgressState.COMPLETED,
+                "result packaged",
+                completed=stage.unique_sequences,
+                total=stage.unique_sequences,
+                unit=ProgressUnit.SEQUENCES,
+            ),
+        )
     except BaseException as error:
         primary_failure = error
         if not isinstance(error, Exception):
@@ -538,6 +657,7 @@ def _run_annotation_batch(
     timeout_seconds: float | None,
     threads: int,
     claim_session: ClaimSession | None = None,
+    progress_sink: ProgressSink | None = None,
 ) -> _BatchMetrics:
     batch_dir = work_dir / f"batch-{batch_number:06d}"
     batch_dir.mkdir()
@@ -546,6 +666,15 @@ def _run_annotation_batch(
         claim_session.raise_if_lost()
     with misses_fasta.open("w", encoding="ascii", newline="\n") as handle:
         handle.writelines(iter_fasta_lines(identities))
+    tool_message = f"{_tool_display_name(adapter)} · tool batch {batch_number}"
+    emit_progress(
+        progress_sink,
+        ProgressEvent(
+            ProgressPhase.TOOL,
+            ProgressState.STARTED,
+            f"{tool_message} running",
+        ),
+    )
     adapter_started = time.perf_counter()
     try:
         batch = adapter.run_batch(
@@ -561,12 +690,31 @@ def _run_annotation_batch(
             claim_session.raise_if_lost()
         raise
     adapter_seconds = time.perf_counter() - adapter_started
+    emit_progress(
+        progress_sink,
+        ProgressEvent(
+            ProgressPhase.TOOL,
+            ProgressState.COMPLETED,
+            f"{tool_message} completed",
+            completed=len(identities),
+            total=len(identities),
+            unit=ProgressUnit.SEQUENCES,
+        ),
+    )
     if claim_session is not None:
         claim_session.raise_if_lost()
     commits = _build_commits(batch=batch, identities=identities, adapter=adapter)
     batches = 0
     peer_completed_sequence_ids: set[str] = set()
     existing_finalizations = 0
+    emit_progress(
+        progress_sink,
+        ProgressEvent(
+            ProgressPhase.STORE_COMMIT,
+            ProgressState.STARTED,
+            f"committing tool batch {batch_number}",
+        ),
+    )
     commit_started = time.perf_counter()
     for commit_batch in batched(commits, _STORE_BATCH_SIZE):
         if claim_session is None:
@@ -585,6 +733,17 @@ def _run_annotation_batch(
                 outcome is CommitOutcome.EXISTING for outcome in outcomes
             )
             batches += 1
+    emit_progress(
+        progress_sink,
+        ProgressEvent(
+            ProgressPhase.STORE_COMMIT,
+            ProgressState.COMPLETED,
+            f"tool batch {batch_number} committed",
+            completed=len(identities),
+            total=len(identities),
+            unit=ProgressUnit.SEQUENCES,
+        ),
+    )
     return _BatchMetrics(
         commit_batches=batches,
         adapter_seconds=adapter_seconds,
@@ -592,6 +751,14 @@ def _run_annotation_batch(
         peer_completed_sequence_ids=frozenset(peer_completed_sequence_ids),
         existing_finalizations=existing_finalizations,
     )
+
+
+def _tool_display_name(adapter: AnnotationAdapter) -> str:
+    return {
+        "eggnog": "eggNOG-mapper",
+        "interpro-pfam": "InterProScan/Pfam",
+        "dbcan-cazyme": "dbCAN",
+    }.get(adapter.contract.name, adapter.contract.name)
 
 
 def _build_commits(

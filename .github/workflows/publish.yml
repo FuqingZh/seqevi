@@ -28,7 +28,7 @@ jobs:
         run: |
           project_version="$(pdm show --version)"
           test "${GITHUB_REF_NAME}" = "v${project_version}"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: python-distributions
           path: dist/
@@ -42,7 +42,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v7
         with:
           name: python-distributions
           path: dist/
@@ -58,7 +58,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v7
         with:
           name: python-distributions
           path: dist/

@@ -138,9 +138,9 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/seqevi-wheel"
           cp dist/seqevi-${{ steps.dbcan-project.outputs.version }}-*.whl "${RUNNER_TEMP}/seqevi-wheel/"
           cp LICENSE "${RUNNER_TEMP}/seqevi-wheel/LICENSE"
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build Linux/amd64 runtime image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: containers/dbcan
           file: containers/dbcan/Dockerfile

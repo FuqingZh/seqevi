@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 import sqlalchemy
@@ -114,6 +115,7 @@ def test_annotate_help_uses_concrete_external_input_names() -> None:
     assert "--resource" in help_text
     assert "--output" in help_text
     assert "--threads" in help_text
+    assert "--progress" in help_text
     assert "--runtime" not in help_text
     assert "--database" not in help_text
     assert "--profile" in help_text
@@ -181,7 +183,73 @@ def test_annotate_cli_runs_injected_adapter(
 
     assert result.exit_code == 0, result.output
     assert "1 unique sequences (0 cached, 1 computed)" in result.stdout
+    assert "[seqevi]" not in result.stderr
     assert output.is_file()
+
+
+def test_annotate_cli_progress_is_explicit_interactive_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    executable = write_fixture_tool(tmp_path / "fixture-tool")
+    database = write_fixture_database(tmp_path / "database")
+    monkeypatch.setattr(seqevi.cli, "_stderr_is_interactive", lambda: True)
+    monkeypatch.setattr(
+        seqevi.cli,
+        "create_adapter",
+        lambda configuration: FixtureAdapter(
+            executable=configuration.executable,
+            database=configuration.database,
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "annotate",
+            "--progress",
+            "--adapter",
+            "interpro-pfam",
+            "--fasta",
+            str(fasta),
+            "--store",
+            str(tmp_path / "store"),
+            "--output",
+            str(tmp_path / "output.duckdb"),
+            "--executable",
+            str(executable),
+            "--resource",
+            str(database),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Annotated 1 unique sequences" in result.stdout
+    assert "[seqevi]" in result.stderr
+
+    monkeypatch.setattr(seqevi.cli, "_stderr_is_interactive", lambda: False)
+    redirected = runner.invoke(
+        app,
+        [
+            "annotate",
+            "--progress",
+            "--adapter",
+            "interpro-pfam",
+            "--fasta",
+            str(fasta),
+            "--store",
+            str(tmp_path / "store"),
+            "--output",
+            str(tmp_path / "redirected.duckdb"),
+            "--executable",
+            str(executable),
+            "--resource",
+            str(database),
+        ],
+    )
+    assert redirected.exit_code == 0, redirected.output
+    assert "[seqevi]" not in redirected.stderr
 
 
 def test_annotate_cli_loads_explicit_execution_profile(
@@ -253,11 +321,13 @@ def test_annotate_cli_json_reports_result_and_metrics(
             database=configuration.database,
         ),
     )
+    monkeypatch.setattr(seqevi.cli, "_stderr_is_interactive", lambda: True)
 
     result = runner.invoke(
         app,
         [
             "annotate",
+            "--progress",
             "--json",
             "--adapter",
             "interpro-pfam",
@@ -289,15 +359,20 @@ def test_annotate_cli_json_reports_result_and_metrics(
     }
     assert payload["metrics"]["existing_finalizations"] == 0
     assert payload["output"].endswith("output.duckdb")
+    assert result.stderr == ""
 
 
-def test_annotate_cli_json_reports_typed_error(tmp_path: Path) -> None:
+def test_annotate_cli_json_reports_typed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     fasta = tmp_path / "proteins.fasta"
     fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    monkeypatch.setattr(seqevi.cli, "_stderr_is_interactive", lambda: True)
     result = runner.invoke(
         app,
         [
             "annotate",
+            "--progress",
             "--json",
             "--fasta",
             str(fasta),
@@ -310,6 +385,45 @@ def test_annotate_cli_json_reports_typed_error(tmp_path: Path) -> None:
     assert result.exit_code == 1
     assert payload["status"] == "error"
     assert payload["error_type"] == "AnnotationError"
+
+
+def test_annotate_cli_stops_progress_after_untyped_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+
+    class RecordingRenderer:
+        closed = False
+
+        def __call__(self, _event: object) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    renderer = RecordingRenderer()
+    monkeypatch.setattr(seqevi.cli, "_stderr_is_interactive", lambda: True)
+    monkeypatch.setattr(seqevi.cli, "_ProgressRenderer", lambda **_kw: renderer)
+
+    def fail(**_kwargs: object) -> NoReturn:
+        raise RuntimeError("untyped failure")
+
+    monkeypatch.setattr(seqevi.cli, "_run_annotation_application", fail)
+    result = runner.invoke(
+        app,
+        [
+            "annotate",
+            "--progress",
+            "--fasta",
+            str(fasta),
+            "--output",
+            str(tmp_path / "output.duckdb"),
+        ],
+    )
+
+    assert isinstance(result.exception, RuntimeError)
+    assert renderer.closed
 
 
 def test_annotate_cli_rejects_mixed_profile_and_explicit_identity(
