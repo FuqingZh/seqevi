@@ -1,6 +1,6 @@
 [project]
 name = "seqevi"
-version = "0.3.2"
+version = "0.3.3"
 description = "Content-addressed, reusable protein sequence annotation evidence."
 authors = [
     {name = "Fuqing Zhang", email = "fu.qing.zhang.work@gmail.com"},
