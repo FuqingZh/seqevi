@@ -581,7 +581,7 @@ def _render_setup_plan(plan: SetupPlan) -> str:
     """Render the typed plan without progress output or secret material."""
 
     lines = [
-        "Setup plan (read-only; Slice A)",
+        "Setup plan (read-only)",
         f"status: {plan.status}",
         f"adapter: {plan.adapter}",
         f"kit_id: {plan.kit_id}",
@@ -606,7 +606,17 @@ def _render_setup_plan(plan: SetupPlan) -> str:
     lines.extend(
         (
             f"smoke: {plan.smoke_status} ({plan.smoke_reason})",
-            f"next_command: {plan.next_command or ('managed OCI annotation is Slice C' if plan.status == 'applied' else '(setup apply is available with --yes)')}",
+            "next_command: "
+            + (
+                plan.next_command
+                or (
+                    "seqevi annotate "
+                    f"--profile {plan.profile.name} "
+                    "--fasta FASTA --output RESULT.duckdb"
+                    if plan.status == "applied"
+                    else "(setup apply is available with --yes)"
+                )
+            ),
         )
     )
     if plan.issues:

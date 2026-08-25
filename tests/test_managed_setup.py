@@ -178,6 +178,24 @@ def test_setup_apply_rejects_blocked_resource_before_docker(tmp_path: Path) -> N
     assert "resource directory does not exist" in result.stdout
 
 
+def test_setup_human_plan_uses_product_language(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "setup",
+            "dbcan-cazyme",
+            "--resource",
+            str(tmp_path / "missing"),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Setup plan (read-only)" in result.stdout
+    assert "Slice A" not in result.stdout
+    assert "Slice C" not in result.stdout
+
+
 def test_setup_without_resource_fails_before_docker_inspection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
