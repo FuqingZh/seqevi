@@ -32,7 +32,8 @@ and `resource` points to the native annotation database root. Then validate it
 without launching the tool, and inspect the resolved named profile:
 
 ```bash
-seqevi profile validate --config ~/.config/seqevi/profiles/eggnog-local.toml
+seqevi profile validate \
+  --config "${XDG_CONFIG_HOME:-$HOME/.config}/seqevi/profiles/eggnog-local.toml"
 seqevi profile show eggnog-local
 ```
 
