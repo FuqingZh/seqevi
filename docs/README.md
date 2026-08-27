@@ -62,7 +62,7 @@ upgrade.
 
 | Work | Status | Authority |
 | --- | --- | --- |
-| 0.3.5 tree-review remediation | Unit 0 was delivered and merged in PR #71 after green exact-head CI and review with zero unresolved threads. The plan remains active for later units, which are separately pending and unauthorized | [corrected review](architecture/20260825-v1.0-seqevi-0.3.5-tree-review.md), [implementation plan](implementation-plan/20260825-v1.0-tree-review-remediation-implementation-plan.md) |
+| 0.3.5 tree-review remediation | Unit 0 was completed by the initial PR #71 delivery plus a follow-up closeout reconciling the remaining README publication wording. The plan remains active for later units, which are separately pending and unauthorized | [corrected review](architecture/20260825-v1.0-seqevi-0.3.5-tree-review.md), [implementation plan](implementation-plan/20260825-v1.0-tree-review-remediation-implementation-plan.md) |
 | InterPro target-Store | v2 identity/exact-key refresh remains next before sanity | [successor plan](implementation-plan/20260820-v1.0-interpro-target-store-successor-implementation-plan.md) |
 | global cache seeding | eggNOG and bounded dbCAN lanes have recorded closure; global expansion remains incomplete | [master plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
 
