@@ -10,30 +10,26 @@ single-file DuckDB result for the current FASTA.
 
 ## Status
 
-The target architecture and v1.1 result contracts are approved. The SeqEvi
-0.3.5 source tree uses strict protein sequence identity, the single-host
-SQLite/POSIX Store, the external tool runner, exact cache-miss orchestration,
-and atomic DuckDB result materialization.
+SeqEvi 0.3.5 implements strict protein sequence identity, local SQLite/POSIX
+and shared HTTP/PostgreSQL/POSIX Stores, exact cache-miss orchestration, Linux
+external-tool containment, and immutable single-file DuckDB results. Python
+3.12 or newer is required; direct adapter execution requires Linux.
 
 SeqEvi 0.3.5 provides managed setup for dbCAN only. The `eggnog` and
 `interpro-pfam` adapters remain supported through explicit runtimes and named
-host profiles; managed setup for them is later feature work. The
-[Slice D gate record](docs/benchmarks/20260806-v1.4-dbcan-public-release-gate.md)
-preserves the incomplete original public-user run and its subsequent acceptance
-decision. In particular, a repeat pull from that run's site is a deferred
-transport check rather than a 0.2.0 release blocker.
+host profiles; managed setup for them is later feature work.
 
-The `interpro-pfam` and eggNOG-mapper 2.x `eggnog` adapters are implemented with
-native-output validation and fixture parity coverage. The eggNOG adapter passes
-direct parity against eggNOG-mapper 2.1.13 and eggNOG DB 5.0.2. The InterPro
-adapter passes direct parity against InterProScan 5.77-108.0 with InterPro data
-108.0 and Pfam 38.1. The Phase 5 shared Store service, HTTP client, streamed
-POSIX artifacts, and PostgreSQL persistence are implemented and covered by
-local/shared plus provisioned PostgreSQL integration tests. Phase 6 resource
-locks avoid repeated hashing of large immutable database files and provide an
-explicit full-content verification command. Annotation now uses atomic FASTA
-staging, file-backed artifacts, bounded Store batches, adapter-native Parquet
-artifacts, and an operational thread setting.
+> **Known incomplete or unavailable work:** the original managed dbCAN public-
+> user Slice D run remains incomplete; managed dispatch has no claim-before-OCI
+> path, so D5 is unavailable; InterPro v2 target-Store refresh remains open;
+> and global cache seeding is incomplete. See the
+> [documentation index](docs/README.md) for the governing records. None of
+> these states is represented as a pass.
+
+The `eggnog`, `interpro-pfam`, and `dbcan-cazyme` adapters preserve their native
+schemas and have accepted direct-runtime parity evidence. Shared Store,
+resource-lock, batching, and result-publication details are routed from the
+[current system architecture](docs/architecture/20260825-v1.0-current-system-architecture.md).
 
 ## Why SeqEvi
 
@@ -99,8 +95,8 @@ seqevi setup dbcan-cazyme \
 `--dry-run` never mutates state. `--yes` pulls the immutable image only when
 needed, verifies the caller-owned four-file resource, creates `seqevi.lock`
 when the resource permits it, runs an ephemeral read-only smoke, and publishes
-the v2 profile atomically. It never downloads or copies the database. Slice C
-now dispatches a managed dbCAN annotation through an ephemeral Docker
+the v2 profile atomically. It never downloads or copies the database. A managed
+dbCAN annotation runs through an ephemeral Docker
 container with the same caller UID/GID, read-only FASTA/resource mounts and a
 local-Store `--network none` boundary:
 
@@ -217,31 +213,13 @@ schemas.
 
 ## Documentation
 
-Start with [the documentation index](docs/README.md).
+Start with the [documentation index](docs/README.md), the
+[current system architecture](docs/architecture/20260825-v1.0-current-system-architecture.md),
+or the [first-annotation guide](docs/how-to-guides/first-annotation.md).
 
-- [Architecture overview](docs/architecture/20260720-v1.0-seqevi-architecture.md)
-- [Sequence and evidence contract](docs/architecture/20260804-v1.1-sequence-evidence-contract.md)
-- [Adapter contract](docs/architecture/20260804-v1.1-adapter-contract.md)
-- [Result consumption contract](docs/architecture/20260804-v1.1-result-consumption-contract.md)
-- [Execution profile contract](docs/architecture/20260724-v1.0-execution-profile-contract.md)
-- [Storage and deployment architecture](docs/architecture/20260729-v1.1-storage-deployment-architecture.md)
-- [MVP implementation plan](docs/implementation-plan/20260720-v1.0-mvp-implementation-plan.md)
-- [Execution profile implementation plan](docs/implementation-plan/20260724-v1.0-execution-profile-implementation-plan.md)
-- [Validation strategy](docs/testing/20260720-v1.0-validation-strategy.md)
-- [Annotate runtime and bounded-memory plan](docs/implementation-plan/20260722-v1.0-annotate-bounded-memory-plan.md)
-- [Bounded-memory and operational performance](docs/benchmarks/20260722-v1.0-bounded-memory-performance.md)
-- [InterProScan Pfam runtime validation](docs/benchmarks/20260723-v1.0-interproscan-runtime-validation.md)
-- [dbCAN CAZyme adapter implementation plan](docs/implementation-plan/20260804-v1.0-dbcan-cazyme-adapter-implementation-plan.md)
-- [DuckDB result-consumption runtime acceptance](docs/benchmarks/20260805-v1.0-result-consumption-runtime-acceptance.md)
-- [dbCAN runtime image release review](docs/architecture/20260805-v1.1-dbcan-runtime-image-release-review.md)
-
-Accepted managed-boundary documents; Slice B setup and smoke plus Slice C OCI
-execution and real candidate acceptance are implemented, while v1 profiles
-remain compatible:
-
-- [Managed adapter onboarding roadmap v1.1](docs/implementation-plan/20260805-v1.1-managed-adapter-onboarding-implementation-plan.md)
-- [Managed-distribution architecture v1.2](docs/architecture/20260806-v1.2-managed-adapter-distribution-architecture.md)
-- [Execution profile v2.2 contract](docs/architecture/20260806-v2.2-execution-profile-contract.md)
+The index owns the current contract map, active work, incomplete evidence,
+operations, and historical navigation. Superseded architecture is retained in
+the [documentation archive](docs/archive/README.md), not mixed into onboarding.
 
 ## Python And Result Discovery
 
@@ -284,18 +262,17 @@ produce the new result file.
 
 ## External Tools
 
-Annotation runtimes and databases are supplied by the user. The current CLI has
-no `seqevi setup` command. SeqEvi v1 targets
+Annotation runtimes and databases are normally supplied by the user. SeqEvi
+targets
 [eggNOG-mapper](https://github.com/eggnogdb/eggnog-mapper) and
 [InterProScan](https://www.ebi.ac.uk/interpro/interproscan.html) with the Pfam
 application, and [dbCAN](https://github.com/bcb-unl/run_dbcan) for protein-level
-CAZyme annotation. A future managed path may publish a SeqEvi-maintained runtime
-image built from locked upstream inputs after runtime compliance review; it would
-not be an upstream-official image. Annotation databases remain separate and
-are never bundled in the wheel or runtime image. The proposed managed path
-uses a public, digest-pinned
-`ghcr.io/fuqingzh/seqevi-dbcan` runtime package; callers continue to provide the
-database path, and internal registry mirrors remain deployment policy.
+CAZyme annotation. Managed `seqevi setup` is implemented only for dbCAN using a
+public, digest-pinned `ghcr.io/fuqingzh/seqevi-dbcan` runtime image built from
+locked upstream inputs. It is SeqEvi-maintained, not an upstream-official dbCAN
+image. Callers still provide the database path; annotation databases are never
+bundled in the wheel or runtime image, and internal registry mirrors remain
+deployment policy.
 
 ## License
 

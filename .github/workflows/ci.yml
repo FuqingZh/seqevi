@@ -4,8 +4,51 @@ on:
   pull_request:
   push:
 
+permissions:
+  contents: read
+
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.scope.outputs.tests }}
+      distribution: ${{ steps.scope.outputs.distribution }}
+      dbcan: ${{ steps.scope.outputs.dbcan }}
+      scope: ${{ steps.scope.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            base_sha="${PR_BASE_SHA}"
+          else
+            base_sha="${PUSH_BEFORE_SHA}"
+          fi
+          if [[ -z "${base_sha}" || "${base_sha}" =~ ^0+$ ]]; then
+            base_sha="$(git hash-object -t tree /dev/null)"
+          fi
+          git diff --name-only -z "${base_sha}" "${GITHUB_SHA}" \
+            | python scripts/ci_change_scope.py --nul \
+            >> "${GITHUB_OUTPUT}"
+      - name: Summarize selected scope
+        run: |
+          echo "CI scope: ${{ steps.scope.outputs.scope }}" >> "${GITHUB_STEP_SUMMARY}"
+
+  documentation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: python scripts/check_markdown_links.py
+
   test:
+    needs: changes
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -31,20 +74,29 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+      - name: Record documentation-only validation
+        if: needs.changes.outputs.tests != 'true'
+        run: echo "Full Python gate not selected for this change scope."
       - uses: pdm-project/setup-pdm@v4
+        if: needs.changes.outputs.tests == 'true'
         with:
           version: 2.26.9
           python-version: ${{ matrix.python-version }}
           cache: true
-      - run: pdm install --frozen-lockfile -G dev -G server
+      - if: needs.changes.outputs.tests == 'true'
+        run: pdm install --frozen-lockfile -G dev -G server
       - name: Verify matrix interpreter
+        if: needs.changes.outputs.tests == 'true'
         env:
           EXPECTED_PYTHON_VERSION: ${{ matrix.python-version }}
         run: |
           test "$(pdm run python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "${EXPECTED_PYTHON_VERSION}"
-      - run: pdm run check
+      - if: needs.changes.outputs.tests == 'true'
+        run: pdm run check
 
   distribution-and-image:
+    needs: changes
+    if: needs.changes.outputs.distribution == 'true'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -121,6 +173,8 @@ jobs:
           done
 
   dbcan-runtime-image:
+    needs: changes
+    if: needs.changes.outputs.dbcan == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -162,3 +216,31 @@ jobs:
             'test -s /usr/share/seqevi/compliance/NOTICE && test -s /usr/share/seqevi/compliance/SOURCE-CORRESPONDENCE.md'
           docker run --rm --entrypoint sh seqevi-dbcan:ci -c \
             '! find / -xdev -type f \( -name CAZy.dmnd -o -name dbCAN.hmm -o -name dbCAN-sub.hmm -o -name fam-substrate-mapping.tsv \) -print -quit | grep .'
+
+  gate:
+    if: always()
+    needs: [changes, documentation, test, distribution-and-image, dbcan-runtime-image]
+    runs-on: ubuntu-latest
+    env:
+      CHANGE_RESULT: ${{ needs.changes.result }}
+      DOCUMENTATION_RESULT: ${{ needs.documentation.result }}
+      TEST_REQUIRED: ${{ needs.changes.outputs.tests }}
+      TEST_RESULT: ${{ needs.test.result }}
+      DISTRIBUTION_REQUIRED: ${{ needs.changes.outputs.distribution }}
+      DISTRIBUTION_RESULT: ${{ needs.distribution-and-image.result }}
+      DBCAN_REQUIRED: ${{ needs.changes.outputs.dbcan }}
+      DBCAN_RESULT: ${{ needs.dbcan-runtime-image.result }}
+    steps:
+      - name: Require every selected gate
+        run: |
+          test "${CHANGE_RESULT}" = "success"
+          test "${DOCUMENTATION_RESULT}" = "success"
+          if [[ "${TEST_REQUIRED}" == "true" ]]; then
+            test "${TEST_RESULT}" = "success"
+          fi
+          if [[ "${DISTRIBUTION_REQUIRED}" == "true" ]]; then
+            test "${DISTRIBUTION_RESULT}" = "success"
+          fi
+          if [[ "${DBCAN_REQUIRED}" == "true" ]]; then
+            test "${DBCAN_RESULT}" = "success"
+          fi

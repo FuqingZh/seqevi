@@ -35,9 +35,16 @@
 
 ## Validation
 
-- Run `pdm run check` before claiming a change is complete.
-- Contract changes require focused tests plus an update to the authoritative
-  architecture document.
+- Select the smallest repository-owned checks that directly cover the changed
+  seams. Documentation-only wording, navigation, and archival changes require
+  diff and relative-link checks, plus any focused contract test that owns a
+  changed authority path; they do not require `pdm run check` by themselves.
+- Run the canonical `pdm run check` gate for runtime behavior, public or
+  compatibility contracts, generated artifacts, executable workflows,
+  validation/build/package/dependency changes, broad refactors, and final
+  release candidates, or when focused checks cannot cover the affected seam.
+- Contract changes also require focused tests and an update to the
+  authoritative architecture document.
 - Shared-store changes must be tested against PostgreSQL as well as SQLite.
 - Evidence-only successors must preserve mechanically identifiable code,
   harness, input, ToolRuntimeDigest, ResourceID, and semantic-parameter
