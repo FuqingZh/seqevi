@@ -25,15 +25,15 @@ Create a complete template for one official adapter:
 
 ```bash
 seqevi profile init eggnog-local --adapter eggnog
-seqevi profile show eggnog-local
 ```
 
 Edit the reported TOML file so `executable` points to the supported launcher
 and `resource` points to the native annotation database root. Then validate it
-without launching the tool:
+without launching the tool, and inspect the resolved named profile:
 
 ```bash
-seqevi profile validate eggnog-local
+seqevi profile validate --config ~/.config/seqevi/profiles/eggnog-local.toml
+seqevi profile show eggnog-local
 ```
 
 The same flow accepts `interpro-pfam` or `dbcan-cazyme` as the adapter name.
@@ -60,7 +60,7 @@ run; it is not a whole-invocation or peer-wait deadline.
 from seqevi import scan_annotations
 
 annotations = scan_annotations("proteins.eggnog.duckdb")
-print(annotations.limit(5).df())
+print(annotations.limit(5).pl())
 ```
 
 The public relation keeps the adapter's native row grain. Aggregate a
