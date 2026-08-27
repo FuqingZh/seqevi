@@ -201,8 +201,8 @@ seqevi resource verify \
 - Exact, immutable evidence keys.
 - Explicit `eggnog`, `interpro-pfam`, and official-runtime-validated
   `dbcan-cazyme` adapters. dbCAN direct/local/shared scientific acceptance is
-  complete; publishing the managed runtime image remains separate work, and
-  annotation databases remain caller supplied.
+  complete, and the managed runtime image publication record is accepted and
+  current. Annotation databases remain caller supplied.
 - Local SQLite/POSIX Store and shared PostgreSQL/POSIX Store service.
 - One self-describing DuckDB result per invocation; adapter-native normalized
   evidence remains Parquet inside the incremental Store.
