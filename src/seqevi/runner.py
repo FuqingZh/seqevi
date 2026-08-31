@@ -84,6 +84,15 @@ class ToolCancelledError(RuntimeError):
         super().__init__(f"tool was cancelled; stderr: {result.stderr_path}")
 
 
+class ToolOutputLimitError(RuntimeError):
+    """Raised after a process exceeded its caller-owned output byte cap."""
+
+    def __init__(self, result: ToolRunResult, output_limit_bytes: int) -> None:
+        self.result = result
+        self.output_limit_bytes = output_limit_bytes
+        super().__init__(f"tool output exceeded {output_limit_bytes} bytes")
+
+
 @dataclass(frozen=True, slots=True)
 class _ProcessMember:
     pid: int
@@ -112,11 +121,14 @@ class ToolRunner:
         *,
         timeout_seconds: float | None = None,
         cancellation_signal: Event | None = None,
+        output_limit_bytes: int | None = None,
     ) -> ToolRunResult:
         """Run a command, reacting directly to cancellation and owning cleanup."""
 
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if output_limit_bytes is not None and output_limit_bytes < 0:
+            raise ValueError("output_limit_bytes must not be negative")
         if not hasattr(os, "waitid") or not Path("/proc").is_dir():
             raise RuntimeError("ToolRunner process containment requires Linux /proc")
 
@@ -152,6 +164,12 @@ class ToolRunner:
             live_members = ()
             try:
                 while True:
+                    if output_limit_bytes is not None and (
+                        stdout.tell() > output_limit_bytes
+                        or stderr.tell() > output_limit_bytes
+                    ):
+                        reason = "output-limit"
+                        break
                     leader_exited = self._leader_exited(process.pid)
                     if leader_exited:
                         if cancellation_signal.is_set():
@@ -201,6 +219,18 @@ class ToolRunner:
             raise ToolTimeoutError(result, timeout_seconds)
         if reason == "cancelled":
             raise ToolCancelledError(result)
+        if (
+            reason is None
+            and output_limit_bytes is not None
+            and (
+                result.stdout_path.stat().st_size > output_limit_bytes
+                or result.stderr_path.stat().st_size > output_limit_bytes
+            )
+        ):
+            raise ToolOutputLimitError(result, output_limit_bytes)
+        if reason == "output-limit":
+            assert output_limit_bytes is not None
+            raise ToolOutputLimitError(result, output_limit_bytes)
         return result
 
     def _terminate_and_reap(

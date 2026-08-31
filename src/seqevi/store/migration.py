@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any, Callable, Iterator, cast
+from typing import Any, Callable, Iterator, Literal, cast, overload
 
 from alembic import command
 from alembic.config import Config
@@ -26,9 +26,14 @@ from sqlalchemy.exc import DBAPIError
 _POSTGRES_MIGRATION_LOCK_ID = 0x534551455649
 _MAINTENANCE_TIMEOUT_SECONDS = 60.0
 _MAINTENANCE_READBACK_TIMEOUT_SECONDS = 60.0
-_CURRENT_REVISION = "0004_claim_sessions"
+_CURRENT_REVISION = "0005_oci_artifact_storage"
+_CLAIM_SESSION_REVISION = "0004_claim_sessions"
 _AUTOMATIC_EXISTING_CEILING = "0003_evidence_claim_leases"
 _PREPARATION_SOURCE_REVISION = "0002_artifact_byte_size_bigint"
+_PRE_CLAIM_REVISIONS = {
+    "0001_initial_store",
+    _PREPARATION_SOURCE_REVISION,
+}
 _CLAIM_SESSION_TABLES = {
     "claim_sessions",
     "session_claims",
@@ -37,6 +42,13 @@ _CLAIM_SESSION_TABLES = {
     "claim_session_acquire_receipts",
     "claim_session_acquire_receipt_items",
 }
+_OCI_ARTIFACT_COLUMNS = {
+    "storage_kind",
+    "registry_id",
+    "repository",
+    "manifest_digest",
+}
+_OCI_ARTIFACT_CONSTRAINT = "ck_artifact_storage_reference"
 _POSTGRES_ACQUISITION_LOCK = threading.Lock()
 _RESOLVER_STOP_GRACE_SECONDS = 0.2
 _ACQUISITION_CANCEL_TIMEOUT_SECONDS = 0.05
@@ -182,6 +194,41 @@ def _sqlite_file_identity(path_or_fd: Path | int) -> tuple[int, int]:
 
 
 @contextmanager
+def _sqlite_foreign_key_rebuild_window(
+    connection: Connection, *, enabled: bool
+) -> Iterator[None]:
+    """Temporarily release child-table checks for SQLite table recreation.
+
+    SQLite cannot drop a parent table while evidence references artifact. The
+    maintenance fence has already established exclusive ownership; this helper
+    disables checks before the migration transaction and restores them only
+    after it has committed or rolled back.
+    """
+
+    if not enabled:
+        yield
+        return
+    connection.commit()
+    foreign_keys_enabled = bool(
+        connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one()
+    )
+    if not foreign_keys_enabled:
+        yield
+        return
+    connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    try:
+        yield
+    finally:
+        if connection.in_transaction():
+            connection.rollback()
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        if not connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one():
+            raise RuntimeError(
+                "SQLite maintenance failed to restore foreign-key checks"
+            )
+
+
+@contextmanager
 def _pinned_sqlite_database(
     path: Path, acknowledged_identity: tuple[int, int]
 ) -> Iterator[int]:
@@ -221,7 +268,7 @@ def _validate_opened_sqlite_target(
 
 
 def upgrade_database(engine: Engine, store_root: Path) -> None:
-    """Bootstrap pristine SQLite to 0004; fail closed for existing pre-0004 Stores."""
+    """Bootstrap pristine SQLite to 0005; fail closed for existing Stores."""
 
     with _exclusive_migration_lock(store_root), engine.connect() as connection:
         connection.exec_driver_sql("BEGIN EXCLUSIVE")
@@ -238,19 +285,18 @@ def upgrade_database(engine: Engine, store_root: Path) -> None:
                 raise RuntimeError(
                     "ambiguous unversioned Store refuses automatic migration"
                 )
-            if revision != _AUTOMATIC_EXISTING_CEILING:
+            if revision in _PRE_CLAIM_REVISIONS:
                 command.upgrade(_configure(connection), _AUTOMATIC_EXISTING_CEILING)
                 connection.commit()
-            raise RuntimeError(
-                "existing Store requires the explicit ClaimSession 0004 maintenance upgrade"
-            )
+                revision = _AUTOMATIC_EXISTING_CEILING
+            raise RuntimeError(_existing_store_maintenance_error(revision))
         except Exception:
             connection.rollback()
             raise
 
 
 def upgrade_postgres_database(engine: Engine) -> None:
-    """Bootstrap pristine PostgreSQL to 0004; fail closed for existing Stores."""
+    """Bootstrap pristine PostgreSQL to 0005; fail closed for existing Stores."""
 
     with engine.connect() as connection:
         connection.exec_driver_sql(
@@ -268,12 +314,11 @@ def upgrade_postgres_database(engine: Engine) -> None:
                     "ambiguous unversioned Store refuses automatic migration"
                 )
             else:
-                if revision != _AUTOMATIC_EXISTING_CEILING:
+                if revision in _PRE_CLAIM_REVISIONS:
                     command.upgrade(_configure(connection), _AUTOMATIC_EXISTING_CEILING)
                     connection.commit()
-                raise RuntimeError(
-                    "existing Store requires the explicit ClaimSession 0004 maintenance upgrade"
-                )
+                    revision = _AUTOMATIC_EXISTING_CEILING
+                raise RuntimeError(_existing_store_maintenance_error(revision))
             connection.commit()
         except Exception:
             connection.rollback()
@@ -283,6 +328,19 @@ def upgrade_postgres_database(engine: Engine) -> None:
                 "SELECT pg_advisory_unlock(%s)", (_POSTGRES_MIGRATION_LOCK_ID,)
             )
             connection.commit()
+
+
+def _existing_store_maintenance_error(revision: str | None) -> str:
+    if revision == _CLAIM_SESSION_REVISION:
+        return (
+            "existing Store requires the explicit OCI artifact storage 0005 "
+            "maintenance upgrade"
+        )
+    if revision == _AUTOMATIC_EXISTING_CEILING:
+        return (
+            "existing Store requires the explicit ClaimSession 0004 maintenance upgrade"
+        )
+    return "existing Store has an unsupported migration revision; inspect it before migration"
 
 
 def maintenance_prepare_database(
@@ -499,9 +557,10 @@ def maintenance_upgrade_database(
     store_root: Path | None,
     acknowledgement: MaintenanceAcknowledgement,
 ) -> None:
-    """Apply 0004 under a bounded persistence fence after operator quiescence."""
+    """Apply exactly one acknowledged Store migration after operator quiescence."""
 
     deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
+    target = _maintenance_upgrade_target(acknowledgement.expected_revision)
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
@@ -527,22 +586,28 @@ def maintenance_upgrade_database(
                     connection.exec_driver_sql(
                         f"PRAGMA busy_timeout={max(int(remaining * 1000), 1)}"
                     )
-                    raw = cast(Any, connection.connection.driver_connection)
-                    raw.set_progress_handler(
-                        lambda: 1 if time.monotonic() >= deadline else 0, 1000
-                    )
-                    try:
-                        connection.exec_driver_sql("BEGIN EXCLUSIVE")
-                        _run_maintenance_upgrade(connection, acknowledgement, deadline)
-                        _validate_opened_sqlite_target(
-                            connection, database_path, pinned_descriptor
+                    with _sqlite_foreign_key_rebuild_window(
+                        connection, enabled=target == _CURRENT_REVISION
+                    ):
+                        raw = cast(Any, connection.connection.driver_connection)
+                        raw.set_progress_handler(
+                            lambda: 1 if time.monotonic() >= deadline else 0, 1000
                         )
-                    finally:
-                        raw.set_progress_handler(None, 0)
+                        try:
+                            connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                            _run_maintenance_upgrade(
+                                connection, acknowledgement, deadline
+                            )
+                            _validate_opened_sqlite_target(
+                                connection, database_path, pinned_descriptor
+                            )
+                        finally:
+                            raw.set_progress_handler(None, 0)
             except _AmbiguousMaintenanceCommit as error:
                 _classify_ambiguous_maintenance(
                     engine,
-                    _CURRENT_REVISION,
+                    acknowledgement.expected_revision,
+                    target,
                     _readback_deadline(),
                     error,
                     sqlite_binding=(database_path, pinned_descriptor),
@@ -550,7 +615,7 @@ def maintenance_upgrade_database(
                 return
             _verify_maintenance_completion(
                 engine,
-                _CURRENT_REVISION,
+                target,
                 _readback_deadline(),
                 sqlite_binding=(database_path, pinned_descriptor),
             )
@@ -561,10 +626,14 @@ def maintenance_upgrade_database(
         _maintenance_upgrade_postgres(engine, acknowledgement, deadline)
     except _AmbiguousMaintenanceCommit as error:
         _classify_ambiguous_maintenance(
-            engine, _CURRENT_REVISION, _readback_deadline(), error
+            engine,
+            acknowledgement.expected_revision,
+            target,
+            _readback_deadline(),
+            error,
         )
         return
-    _verify_maintenance_completion(engine, _CURRENT_REVISION, _readback_deadline())
+    _verify_maintenance_completion(engine, target, _readback_deadline())
 
 
 def maintenance_downgrade_database(
@@ -572,9 +641,10 @@ def maintenance_downgrade_database(
     store_root: Path | None,
     acknowledgement: MaintenanceAcknowledgement,
 ) -> None:
-    """Downgrade 0004 to empty 0003 coordination under the same bounded fence."""
+    """Downgrade exactly one acknowledged Store migration under the same fence."""
 
     deadline = time.monotonic() + _MAINTENANCE_TIMEOUT_SECONDS
+    target = _maintenance_downgrade_target(acknowledgement.expected_revision)
     if engine.dialect.name == "sqlite":
         if store_root is None:
             raise ValueError("SQLite maintenance requires the Store root")
@@ -599,24 +669,29 @@ def maintenance_downgrade_database(
                     connection.exec_driver_sql(
                         f"PRAGMA busy_timeout={max(int(_remaining(deadline) * 1000), 1)}"
                     )
-                    raw = cast(Any, connection.connection.driver_connection)
-                    raw.set_progress_handler(
-                        lambda: 1 if time.monotonic() >= deadline else 0, 1000
-                    )
-                    try:
-                        connection.exec_driver_sql("BEGIN EXCLUSIVE")
-                        _run_maintenance_downgrade(
-                            connection, acknowledgement, deadline
+                    with _sqlite_foreign_key_rebuild_window(
+                        connection,
+                        enabled=acknowledgement.expected_revision == _CURRENT_REVISION,
+                    ):
+                        raw = cast(Any, connection.connection.driver_connection)
+                        raw.set_progress_handler(
+                            lambda: 1 if time.monotonic() >= deadline else 0, 1000
                         )
-                        _validate_opened_sqlite_target(
-                            connection, database_path, pinned_descriptor
-                        )
-                    finally:
-                        raw.set_progress_handler(None, 0)
+                        try:
+                            connection.exec_driver_sql("BEGIN EXCLUSIVE")
+                            _run_maintenance_downgrade(
+                                connection, acknowledgement, deadline
+                            )
+                            _validate_opened_sqlite_target(
+                                connection, database_path, pinned_descriptor
+                            )
+                        finally:
+                            raw.set_progress_handler(None, 0)
             except _AmbiguousMaintenanceCommit as error:
                 _classify_ambiguous_maintenance(
                     engine,
-                    _AUTOMATIC_EXISTING_CEILING,
+                    acknowledgement.expected_revision,
+                    target,
                     _readback_deadline(),
                     error,
                     sqlite_binding=(database_path, pinned_descriptor),
@@ -624,7 +699,7 @@ def maintenance_downgrade_database(
                 return
             _verify_maintenance_completion(
                 engine,
-                _AUTOMATIC_EXISTING_CEILING,
+                target,
                 _readback_deadline(),
                 sqlite_binding=(database_path, pinned_descriptor),
             )
@@ -636,18 +711,37 @@ def maintenance_downgrade_database(
     except _AmbiguousMaintenanceCommit as error:
         _classify_ambiguous_maintenance(
             engine,
-            _AUTOMATIC_EXISTING_CEILING,
+            acknowledgement.expected_revision,
+            target,
             _readback_deadline(),
             error,
         )
         return
-    _verify_maintenance_completion(
-        engine, _AUTOMATIC_EXISTING_CEILING, _readback_deadline()
-    )
+    _verify_maintenance_completion(engine, target, _readback_deadline())
 
 
 def _readback_deadline() -> float:
     return time.monotonic() + _MAINTENANCE_READBACK_TIMEOUT_SECONDS
+
+
+@overload
+def _maintenance_state(
+    engine: Engine,
+    deadline: float,
+    *,
+    sqlite_binding: tuple[Path, int] | None = None,
+    include_artifact_schema: Literal[False] = False,
+) -> tuple[str | None, set[str]]: ...
+
+
+@overload
+def _maintenance_state(
+    engine: Engine,
+    deadline: float,
+    *,
+    sqlite_binding: tuple[Path, int] | None = None,
+    include_artifact_schema: Literal[True],
+) -> tuple[str | None, set[str], set[str], set[str]]: ...
 
 
 def _maintenance_state(
@@ -655,7 +749,8 @@ def _maintenance_state(
     deadline: float,
     *,
     sqlite_binding: tuple[Path, int] | None = None,
-) -> tuple[str | None, set[str]]:
+    include_artifact_schema: bool = False,
+) -> tuple[str | None, set[str]] | tuple[str | None, set[str], set[str], set[str]]:
     if engine.dialect.name == "sqlite":
         engine.dispose()
     connection_context = (
@@ -677,9 +772,8 @@ def _maintenance_state(
                 lambda: 1 if time.monotonic() >= deadline else 0, 1000
             )
             try:
-                state = (
-                    _revision(connection),
-                    set(inspect(connection).get_table_names()),
+                state = _maintenance_state_from_connection(
+                    connection, include_artifact_schema
                 )
                 _validate_opened_sqlite_target(connection, *sqlite_binding)
                 _remaining(deadline)
@@ -689,7 +783,9 @@ def _maintenance_state(
         watchdog = _arm_postgres_transaction_timeout(connection, deadline)
         try:
             connection.exec_driver_sql("BEGIN")
-            state = _revision(connection), set(inspect(connection).get_table_names())
+            state = _maintenance_state_from_connection(
+                connection, include_artifact_schema
+            )
             watchdog.require_precommit_budget()
             return state
         except BaseException:
@@ -710,14 +806,70 @@ def _maintenance_state(
                 watchdog.cancel()
 
 
-def _state_matches_target(revision: str | None, tables: set[str], target: str) -> bool:
+def _maintenance_state_from_connection(
+    connection: Connection, include_artifact_schema: bool
+) -> tuple[str | None, set[str]] | tuple[str | None, set[str], set[str], set[str]]:
+    revision = _revision(connection)
+    inspector = inspect(connection)
+    tables = set(inspector.get_table_names())
+    if not include_artifact_schema:
+        return revision, tables
+    if "artifact" not in tables:
+        return revision, tables, set(), set()
+    columns = {column["name"] for column in inspector.get_columns("artifact")}
+    constraints = {
+        constraint["name"]
+        for constraint in inspector.get_check_constraints("artifact")
+        if constraint["name"] is not None
+    }
+    return revision, tables, columns, constraints
+
+
+def _state_matches_target(
+    revision: str | None,
+    tables: set[str],
+    target: str,
+    artifact_columns: set[str],
+    artifact_constraints: set[str],
+) -> bool:
     if revision != target:
         return False
     if target == _CURRENT_REVISION:
-        return _CLAIM_SESSION_TABLES <= tables and "evidence_claim" not in tables
+        return (
+            _CLAIM_SESSION_TABLES <= tables
+            and "evidence_claim" not in tables
+            and _OCI_ARTIFACT_COLUMNS <= artifact_columns
+            and _OCI_ARTIFACT_CONSTRAINT in artifact_constraints
+        )
+    if target == _CLAIM_SESSION_REVISION:
+        return (
+            _CLAIM_SESSION_TABLES <= tables
+            and "evidence_claim" not in tables
+            and not (_OCI_ARTIFACT_COLUMNS & artifact_columns)
+            and _OCI_ARTIFACT_CONSTRAINT not in artifact_constraints
+        )
     if target == _PREPARATION_SOURCE_REVISION:
         return "evidence_claim" not in tables and not (_CLAIM_SESSION_TABLES & tables)
     return "evidence_claim" in tables and not (_CLAIM_SESSION_TABLES & tables)
+
+
+def _maintenance_target_state(
+    engine: Engine,
+    target: str,
+    deadline: float,
+    *,
+    sqlite_binding: tuple[Path, int] | None = None,
+) -> bool:
+    state = _maintenance_state(
+        engine,
+        deadline,
+        sqlite_binding=sqlite_binding,
+        include_artifact_schema=True,
+    )
+    revision, tables, artifact_columns, artifact_constraints = state
+    return _state_matches_target(
+        revision, tables, target, artifact_columns, artifact_constraints
+    )
 
 
 def _verify_maintenance_completion(
@@ -727,32 +879,28 @@ def _verify_maintenance_completion(
     *,
     sqlite_binding: tuple[Path, int] | None = None,
 ) -> None:
-    revision, tables = _maintenance_state(
-        engine, deadline, sqlite_binding=sqlite_binding
-    )
-    if not _state_matches_target(revision, tables, target):
+    if not _maintenance_target_state(
+        engine, target, deadline, sqlite_binding=sqlite_binding
+    ):
         raise RuntimeError("maintenance completion readback found mixed schema state")
 
 
 def _classify_ambiguous_maintenance(
     engine: Engine,
+    source: str,
     target: str,
     deadline: float,
     error: BaseException,
     *,
     sqlite_binding: tuple[Path, int] | None = None,
 ) -> None:
-    revision, tables = _maintenance_state(
-        engine, deadline, sqlite_binding=sqlite_binding
-    )
-    if _state_matches_target(revision, tables, target):
+    if _maintenance_target_state(
+        engine, target, deadline, sqlite_binding=sqlite_binding
+    ):
         return
-    source = (
-        _AUTOMATIC_EXISTING_CEILING
-        if target == _CURRENT_REVISION
-        else _CURRENT_REVISION
-    )
-    if _state_matches_target(revision, tables, source):
+    if _maintenance_target_state(
+        engine, source, deadline, sqlite_binding=sqlite_binding
+    ):
         raise RuntimeError(
             "maintenance commit did not change the acknowledged source schema"
         ) from error
@@ -768,12 +916,13 @@ def _classify_ambiguous_transition(
     *,
     sqlite_binding: tuple[Path, int] | None = None,
 ) -> None:
-    revision, tables = _maintenance_state(
-        engine, deadline, sqlite_binding=sqlite_binding
-    )
-    if _state_matches_target(revision, tables, target):
+    if _maintenance_target_state(
+        engine, target, deadline, sqlite_binding=sqlite_binding
+    ):
         return
-    if _state_matches_target(revision, tables, source):
+    if _maintenance_target_state(
+        engine, source, deadline, sqlite_binding=sqlite_binding
+    ):
         raise RuntimeError(
             "maintenance commit did not change the acknowledged source schema"
         ) from error
@@ -803,6 +952,26 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
+def _maintenance_upgrade_target(source: str) -> str:
+    if source == _AUTOMATIC_EXISTING_CEILING:
+        return _CLAIM_SESSION_REVISION
+    if source == _CLAIM_SESSION_REVISION:
+        return _CURRENT_REVISION
+    raise RuntimeError(
+        "maintenance upgrade requires acknowledged revision 0003 or 0004"
+    )
+
+
+def _maintenance_downgrade_target(source: str) -> str:
+    if source == _CURRENT_REVISION:
+        return _CLAIM_SESSION_REVISION
+    if source == _CLAIM_SESSION_REVISION:
+        return _AUTOMATIC_EXISTING_CEILING
+    raise RuntimeError(
+        "maintenance downgrade requires acknowledged revision 0004 or 0005"
+    )
+
+
 def _run_maintenance_upgrade(
     connection: Connection,
     acknowledgement: MaintenanceAcknowledgement,
@@ -813,23 +982,27 @@ def _run_maintenance_upgrade(
     if revision != acknowledgement.expected_revision:
         connection.rollback()
         raise RuntimeError("maintenance acknowledgement has a stale revision")
-    if revision != _AUTOMATIC_EXISTING_CEILING:
+    if revision not in {_AUTOMATIC_EXISTING_CEILING, _CLAIM_SESSION_REVISION}:
         connection.rollback()
-        raise RuntimeError("maintenance upgrade requires revision 0003")
-    clock = (
-        "clock_timestamp()"
-        if connection.dialect.name == "postgresql"
-        else "CURRENT_TIMESTAMP"
-    )
-    live_claims = connection.execute(
-        text(f"SELECT count(*) FROM evidence_claim WHERE expires_at > {clock}")  # noqa: S608
-    ).scalar_one()
-    if live_claims:
-        connection.rollback()
-        raise RuntimeError("maintenance upgrade refuses unexpired evidence claims")
+        raise RuntimeError("maintenance upgrade requires revision 0003 or 0004")
+    target = _maintenance_upgrade_target(revision)
+    if revision == _AUTOMATIC_EXISTING_CEILING:
+        clock = (
+            "clock_timestamp()"
+            if connection.dialect.name == "postgresql"
+            else "CURRENT_TIMESTAMP"
+        )
+        live_claims = connection.execute(
+            text(f"SELECT count(*) FROM evidence_claim WHERE expires_at > {clock}")  # noqa: S608
+        ).scalar_one()
+        if live_claims:
+            connection.rollback()
+            raise RuntimeError("maintenance upgrade refuses unexpired evidence claims")
     _remaining(deadline)
-    command.upgrade(_configure(connection), _CURRENT_REVISION)
+    command.upgrade(_configure(connection), target)
     _remaining(deadline)
+    if target == _CURRENT_REVISION:
+        _verify_sqlite_foreign_key_integrity(connection, deadline)
     if commit is not None:
         commit()
     else:
@@ -846,12 +1019,27 @@ def _run_maintenance_downgrade(
     commit: Callable[[], None] | None = None,
 ) -> None:
     revision = _revision(connection)
-    if revision != acknowledgement.expected_revision or revision != _CURRENT_REVISION:
+    if revision != acknowledgement.expected_revision:
         connection.rollback()
-        raise RuntimeError("maintenance downgrade requires acknowledged revision 0004")
+        raise RuntimeError("maintenance acknowledgement has a stale revision")
+    if revision not in {_CLAIM_SESSION_REVISION, _CURRENT_REVISION}:
+        connection.rollback()
+        raise RuntimeError("maintenance downgrade requires revision 0004 or 0005")
+    target = _maintenance_downgrade_target(revision)
+    if revision == _CURRENT_REVISION:
+        oci_rows = connection.execute(
+            text("SELECT count(*) FROM artifact WHERE storage_kind = 'oci'")
+        ).scalar_one()
+        if oci_rows:
+            connection.rollback()
+            raise RuntimeError(
+                "maintenance downgrade refuses Store with OCI artifact rows"
+            )
     _remaining(deadline)
-    command.downgrade(_configure(connection), _AUTOMATIC_EXISTING_CEILING)
+    command.downgrade(_configure(connection), target)
     _remaining(deadline)
+    if revision == _CURRENT_REVISION:
+        _verify_sqlite_foreign_key_integrity(connection, deadline)
     if commit is not None:
         commit()
     else:
@@ -859,6 +1047,19 @@ def _run_maintenance_downgrade(
             connection.commit()
         except DBAPIError as error:
             raise _AmbiguousMaintenanceCommit from error
+
+
+def _verify_sqlite_foreign_key_integrity(
+    connection: Connection, deadline: float
+) -> None:
+    if connection.dialect.name != "sqlite":
+        return
+    _remaining(deadline)
+    violations = connection.exec_driver_sql("PRAGMA foreign_key_check").all()
+    _remaining(deadline)
+    if violations:
+        connection.rollback()
+        raise RuntimeError("SQLite maintenance found foreign-key violations")
 
 
 def _maintenance_upgrade_postgres(
@@ -904,13 +1105,21 @@ def _maintenance_upgrade_postgres(
                     connection.exec_driver_sql(
                         f"SET LOCAL lock_timeout = '{lock_ms}ms'"
                     )
-                    lock_tables = (
-                        "LOCK TABLE claim_session_open_receipts, claim_sessions, "
+                    claim_session_tables = (
+                        "claim_session_open_receipts, claim_sessions, "
                         "evidence_claim_generations, session_claims, "
                         "claim_session_acquire_receipt_items, "
-                        "claim_session_acquire_receipts, sequence, artifact, evidence "
+                        "claim_session_acquire_receipts, "
+                    )
+                    lock_tables = "LOCK TABLE " + (
+                        claim_session_tables + "sequence, artifact, evidence "
                         if downgrade
-                        else "LOCK TABLE sequence, evidence_claim, artifact, evidence "
+                        else (
+                            "sequence, evidence_claim, artifact, evidence "
+                            if acknowledgement.expected_revision
+                            == _AUTOMATIC_EXISTING_CEILING
+                            else claim_session_tables + "sequence, artifact, evidence "
+                        )
                     )
                     connection.exec_driver_sql(lock_tables + "IN ACCESS EXCLUSIVE MODE")
                     _remaining(deadline)

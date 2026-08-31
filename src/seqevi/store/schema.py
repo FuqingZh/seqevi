@@ -41,11 +41,23 @@ artifacts = Table(
     Column("digest", String(64), primary_key=True),
     Column("media_type", Text, nullable=False),
     Column("byte_size", BigInteger, nullable=False),
-    Column("relative_path", Text, nullable=False, unique=True),
+    Column("relative_path", Text, nullable=True, unique=True),
+    Column("storage_kind", String(16), nullable=False, default="posix"),
+    Column("registry_id", Text, nullable=True),
+    Column("repository", Text, nullable=True),
+    Column("manifest_digest", String(64), nullable=True),
     Column(
         "created_at", DateTime(timezone=True), nullable=False, server_default=func.now()
     ),
     CheckConstraint("byte_size >= 0", name="ck_artifact_byte_size_nonnegative"),
+    CheckConstraint(
+        "(storage_kind = 'posix' AND relative_path IS NOT NULL "
+        "AND registry_id IS NULL AND repository IS NULL AND manifest_digest IS NULL) "
+        "OR (storage_kind = 'oci' AND relative_path IS NULL "
+        "AND registry_id IS NOT NULL AND repository IS NOT NULL "
+        "AND manifest_digest IS NOT NULL)",
+        name="ck_artifact_storage_reference",
+    ),
 )
 
 evidence = Table(

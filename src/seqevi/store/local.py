@@ -559,6 +559,8 @@ class LocalStore:
             )
         if row is None:
             raise StoreIntegrityError(f"artifact metadata is missing: {digest}")
+        if row["storage_kind"] != "posix":
+            raise StoreIntegrityError("local Store cannot read OCI storage references")
         return self.artifact_store.reference(
             StoredArtifact(
                 digest=row["digest"],

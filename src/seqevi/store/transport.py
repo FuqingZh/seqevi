@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
+from ipaddress import ip_address
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -21,17 +24,119 @@ from seqevi.evidence import (
     EvidenceStatus,
     ClaimSessionAuthority,
     SessionEvidenceClaim,
+    StoredArtifact,
 )
 from seqevi.sequence import SequenceIdentity
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 SequenceId = Annotated[str, Field(pattern=r"^SQ\.[A-Za-z0-9_-]{32}$")]
+OCI_CLIENT_CAPABILITY = "oci-artifacts-v1"
+OCI_CAPABILITY_HEADER = "X-SeqEvi-Client-Capability"
+RegistryId = Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")]
+RepositoryName = Annotated[
+    str,
+    Field(
+        pattern=r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$",
+        max_length=255,
+    ),
+]
 
 
 class TransportModel(BaseModel):
     """Strict base for the public Store wire contract."""
 
     model_config = ConfigDict(extra="forbid")
+
+
+class RegistryModel(TransportModel):
+    """Administrator-selected Registry; discovery never carries credentials."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    id: RegistryId
+    endpoint: str
+    repository: RepositoryName
+
+    @model_validator(mode="after")
+    def validate_endpoint(self) -> RegistryModel:
+        parsed = urlsplit(self.endpoint)
+        if (
+            not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+            or any(char.isspace() for char in self.endpoint)
+        ):
+            raise ValueError("Registry endpoint must be a credential-free origin")
+        _ = parsed.port
+        if parsed.scheme == "http":
+            try:
+                loopback = ip_address(parsed.hostname).is_loopback
+            except ValueError:
+                loopback = False
+            if not loopback:
+                raise ValueError("plain HTTP Registry is allowed only for loopback")
+        elif parsed.scheme != "https":
+            raise ValueError("Registry endpoint requires HTTPS")
+        return self
+
+
+class StorageDiscoveryResponse(TransportModel):
+    protocol: Literal["storage-discovery-v1"] = "storage-discovery-v1"
+    artifact_backend: Literal["legacy-posix", "oci-registry"]
+    minimum_client_capability: Literal["oci-artifacts-v1"] | None = None
+    registry: RegistryModel | None = None
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> StorageDiscoveryResponse:
+        if self.artifact_backend == "oci-registry":
+            if self.registry is None or self.minimum_client_capability is None:
+                raise ValueError(
+                    "OCI discovery requires Registry and client capability"
+                )
+        elif self.registry is not None or self.minimum_client_capability is not None:
+            raise ValueError("legacy discovery must not advertise OCI configuration")
+        return self
+
+
+class PosixStorageReference(TransportModel):
+    kind: Literal["posix"] = "posix"
+    relative_path: str
+
+    @model_validator(mode="after")
+    def validate_path(self) -> PosixStorageReference:
+        path = PurePosixPath(self.relative_path)
+        if not self.relative_path or path.is_absolute() or ".." in path.parts:
+            raise ValueError("artifact path must remain relative to its Store")
+        return self
+
+
+class OciStorageReference(TransportModel):
+    kind: Literal["oci"] = "oci"
+    registry_id: RegistryId
+    repository: RepositoryName
+    manifest_digest: Sha256
+
+
+StorageReference = Annotated[
+    PosixStorageReference | OciStorageReference, Field(discriminator="kind")
+]
+
+
+def storage_reference(artifact: StoredArtifact) -> StorageReference:
+    """Encode a validated storage location without changing raw identity."""
+    if artifact.storage_kind == "posix":
+        assert artifact.relative_path is not None
+        return PosixStorageReference(relative_path=artifact.relative_path)
+    assert artifact.registry_id is not None
+    assert artifact.repository is not None
+    assert artifact.manifest_digest is not None
+    return OciStorageReference(
+        registry_id=artifact.registry_id,
+        repository=artifact.repository,
+        manifest_digest=artifact.manifest_digest,
+    )
 
 
 class SequenceModel(TransportModel):
@@ -108,6 +213,18 @@ class ArtifactReferenceModel(TransportModel):
     digest: Sha256
     media_type: str
     byte_size: Annotated[int, Field(ge=0, strict=True)]
+    # Absent on legacy wire requests: old services reject even a null new field.
+    storage_reference: StorageReference | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+
+class ArtifactResolveRequest(TransportModel):
+    digest: Sha256
+
+
+class ArtifactResolveResponse(TransportModel):
+    artifact: ArtifactReferenceModel | None
 
 
 class EvidenceRecordModel(TransportModel):

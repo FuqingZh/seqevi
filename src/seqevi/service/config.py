@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from seqevi.store.transport import RegistryModel
 
 
 DEFAULT_DATABASE_POOL_SIZE = 16
@@ -35,12 +38,20 @@ class ServiceSettings(BaseSettings):
 
     database_url: str
     artifacts_dir: Path
+    artifact_backend: Literal["legacy-posix", "oci-registry"] = "legacy-posix"
+    oci_registry_id: str | None = None
+    oci_registry_endpoint: str | None = None
+    oci_registry_repository: str | None = None
+    oci_oras_executable: Path | None = None
+    oci_registry_config: Path | None = None
+    oci_registry_ca_file: Path | None = None
     maximum_batch_size: int = Field(default=1000, ge=1, le=10000)
     maximum_artifact_bytes: int = Field(
         default=512 * 1024 * 1024,
         ge=1,
         le=8 * 1024 * 1024 * 1024,
     )
+    maximum_concurrent_artifact_uploads: int = Field(default=8, ge=1, le=64)
     database_pool_size: int = Field(default=DEFAULT_DATABASE_POOL_SIZE, ge=1, le=256)
     database_max_overflow: int = Field(
         default=DEFAULT_DATABASE_MAX_OVERFLOW, ge=0, le=256
@@ -61,6 +72,30 @@ class ServiceSettings(BaseSettings):
     )
 
     def model_post_init(self, _context: object) -> None:
+        oci_values = (
+            self.oci_registry_id,
+            self.oci_registry_endpoint,
+            self.oci_registry_repository,
+            self.oci_oras_executable,
+            self.oci_registry_config,
+        )
+        if self.artifact_backend == "oci-registry":
+            if not all(oci_values):
+                raise ValueError(
+                    "OCI mode requires explicit Registry, ORAS and auth-file settings"
+                )
+            self.registry_definition()
+            for path in (
+                self.oci_oras_executable,
+                self.oci_registry_config,
+                self.oci_registry_ca_file,
+            ):
+                if path is not None and not path.is_absolute():
+                    raise ValueError("service OCI file paths must be absolute")
+        elif any(
+            value is not None for value in (*oci_values, self.oci_registry_ca_file)
+        ):
+            raise ValueError("OCI settings require artifact_backend=oci-registry")
         total_wait = (
             self.database_pool_timeout_seconds
             + self.database_transaction_timeout_seconds
@@ -79,4 +114,17 @@ class ServiceSettings(BaseSettings):
             self,
             "artifacts_dir",
             self.artifacts_dir.expanduser().resolve(),
+        )
+
+    def registry_definition(self) -> RegistryModel | None:
+        """Return public endpoint metadata, never service credential paths."""
+        if self.artifact_backend != "oci-registry":
+            return None
+        assert self.oci_registry_id is not None
+        assert self.oci_registry_endpoint is not None
+        assert self.oci_registry_repository is not None
+        return RegistryModel(
+            id=self.oci_registry_id,
+            endpoint=self.oci_registry_endpoint,
+            repository=self.oci_registry_repository,
         )

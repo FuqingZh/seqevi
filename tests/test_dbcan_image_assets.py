@@ -44,6 +44,7 @@ def test_runtime_inputs_are_exact_and_hash_locked() -> None:
         "diamond-binary",
         "diamond-source",
         "diamond-license",
+        "oras-binary",
     }
     assert "dbcan==5.2.9" in dbcan_lock
     assert (
@@ -58,6 +59,14 @@ def test_runtime_inputs_are_exact_and_hash_locked() -> None:
     assert artifacts["diamond-binary"]["sha256"] == (
         "2c1507fbb32164e861857d606fddf4b92d481174e4015cc50682f51c7b2f978a"
     )
+    assert artifacts["oras-binary"] == {
+        "name": "oras-binary",
+        "url": (
+            "https://github.com/oras-project/oras/releases/download/v1.3.4/"
+            "oras_1.3.4_linux_amd64.tar.gz"
+        ),
+        "sha256": "f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454",
+    }
     for lock_path in IMAGE_ROOT.glob("requirements-*.lock"):
         lock = lock_path.read_text(encoding="utf-8")
         requirements = re.findall(r"(?m)^[-a-zA-Z0-9_.]+==[^ \\]+", lock)
@@ -93,6 +102,9 @@ def test_image_build_has_public_labels_and_no_database_acquisition() -> None:
     assert "cp /opt/dbcan-venv/bin/run_dbcan" not in dockerfile
     assert "importlib.metadata.version('dbcan')" not in dockerfile
     assert "/usr/local/bin/diamond" in dockerfile
+    assert "/usr/local/bin/oras" in dockerfile
+    assert "tar -xzf /tmp/downloads/oras-binary -C /opt/oras oras LICENSE" in dockerfile
+    assert "oras version | grep -F 'Version:        1.3.4'" in dockerfile
     for database_file in DATABASE_FILES:
         assert database_file not in inputs
 
@@ -115,6 +127,8 @@ def test_compliance_bundle_maps_gpl_artifacts_to_sources() -> None:
     assert "sources/dbcan-source" in correspondence
     assert "sources/diamond-source" in correspondence
     assert "CPython 3.13.11" in correspondence
+    assert "ORAS 1.3.4" in correspondence
+    assert "ORAS-Apache-2.0.txt" in correspondence
     assert "BuildKit's attached" in correspondence
     assert "final-image SBOM" in correspondence
 

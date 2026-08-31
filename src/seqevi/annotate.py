@@ -123,11 +123,17 @@ class _MeasuringToolRunner(ToolRunner):
         *,
         timeout_seconds: float | None = None,
         cancellation_signal: threading.Event | None = None,
+        output_limit_bytes: int | None = None,
     ) -> ToolRunResult:
         result = self.delegate.run(
             command,
             timeout_seconds=timeout_seconds,
             cancellation_signal=cancellation_signal or self.cancellation_signal,
+            **(
+                {"output_limit_bytes": output_limit_bytes}
+                if output_limit_bytes is not None
+                else {}
+            ),
         )
         self.duration_seconds += result.duration_seconds
         return result

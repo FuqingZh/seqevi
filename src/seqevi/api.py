@@ -35,6 +35,7 @@ from .progress import (
 )
 from .result import RESULT_FORMAT_VERSION, scan_annotations as _scan_annotations
 from .store import open_evidence_store
+from .store.oci import OciClientFiles
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +79,8 @@ def annotate(
     store: str | Path | None = None,
     threads: int | None = None,
     timeout_seconds: float | None = None,
+    oci_registry_config: str | Path | None = None,
+    oci_registry_ca_file: str | Path | None = None,
 ) -> duckdb.DuckDBPyRelation:
     """Annotate a protein FASTA and return its native DuckDB relation.
 
@@ -92,6 +95,9 @@ def annotate(
         store: Local Store path or shared Store URL.
         threads: Operational worker-thread override.
         timeout_seconds: Optional external-tool timeout.
+        oci_registry_config: Optional Docker/ORAS registry config file for one
+            OCI-backed shared Store invocation. It is never persisted in a profile.
+        oci_registry_ca_file: Optional PEM trust anchor for that registry.
 
     Returns:
         The `main.annotations` DuckDB relation. It keeps the read-only result
@@ -127,6 +133,8 @@ def annotate(
         store=store,
         threads=threads,
         timeout_seconds=timeout_seconds,
+        oci_registry_config=oci_registry_config,
+        oci_registry_ca_file=oci_registry_ca_file,
     )
     return invocation.relation
 
@@ -170,9 +178,15 @@ def _run_annotation_application(
     store: str | Path | None,
     threads: int | None,
     timeout_seconds: float | None,
+    oci_registry_config: str | Path | None = None,
+    oci_registry_ca_file: str | Path | None = None,
     adapter_factory: Callable[[AdapterConfiguration], AnnotationAdapter] | None = None,
     progress_sink: ProgressSink | None = None,
 ) -> AnnotationInvocation:
+    oci_files = _resolve_oci_client_files(
+        oci_registry_config=oci_registry_config,
+        oci_registry_ca_file=oci_registry_ca_file,
+    )
     emit_progress(
         progress_sink,
         ProgressEvent(
@@ -207,6 +221,7 @@ def _run_annotation_application(
             store=inputs.store,
             threads=inputs.threads,
             timeout_seconds=inputs.timeout_seconds,
+            oci_files=oci_files,
         )
         emit_progress(
             progress_sink,
@@ -243,7 +258,7 @@ def _run_annotation_application(
         )
     )
     metadata = _result_metadata_template(configured_adapter)
-    with open_evidence_store(inputs.store) as evidence_store:
+    with open_evidence_store(inputs.store, oci_files=oci_files) as evidence_store:
         summary = run_annotation(
             fasta_path=fasta.expanduser().resolve(),
             output_dir=output.expanduser().resolve(),
@@ -288,6 +303,25 @@ def _run_annotation_application(
         ),
     )
     return invocation
+
+
+def _resolve_oci_client_files(
+    *,
+    oci_registry_config: str | Path | None,
+    oci_registry_ca_file: str | Path | None,
+) -> OciClientFiles | None:
+    """Resolve invocation-only OCI client files without reading credentials."""
+
+    if oci_registry_config is None and oci_registry_ca_file is None:
+        return None
+    return OciClientFiles(
+        registry_config=(
+            Path(oci_registry_config) if oci_registry_config is not None else None
+        ),
+        ca_file=Path(oci_registry_ca_file)
+        if oci_registry_ca_file is not None
+        else None,
+    ).validated()
 
 
 def resolve_annotation_inputs(

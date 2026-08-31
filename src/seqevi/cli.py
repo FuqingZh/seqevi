@@ -347,6 +347,30 @@ def annotate_command(
             help="Local Store path or shared Store HTTP(S) URL.",
         ),
     ] = None,
+    oci_registry_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--oci-registry-config",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help="Invocation-only ORAS registry config for an OCI-backed shared Store.",
+        ),
+    ] = None,
+    oci_registry_ca_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--oci-registry-ca-file",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help="Invocation-only PEM trust anchor for an OCI registry.",
+        ),
+    ] = None,
     timeout_seconds: Annotated[
         float | None,
         typer.Option(
@@ -398,6 +422,8 @@ def annotate_command(
             store=store,
             threads=threads,
             timeout_seconds=timeout_seconds,
+            oci_registry_config=oci_registry_config,
+            oci_registry_ca_file=oci_registry_ca_file,
             adapter_factory=create_adapter,
             progress_sink=renderer,
         )
@@ -846,13 +872,14 @@ def store_maintenance_upgrade_command(
         typer.Option("--store-root", file_okay=False, resolve_path=True),
     ] = None,
 ) -> None:
-    """Run the acknowledgement-bound, fail-closed ClaimSession Store upgrade."""
+    """Run the acknowledgement-bound, fail-closed Store schema upgrade."""
 
     try:
         from sqlalchemy import create_engine
 
         from .store.migration import (
             MaintenanceAcknowledgement,
+            _maintenance_upgrade_target,
             maintenance_upgrade_database,
         )
 
@@ -877,7 +904,9 @@ def store_maintenance_upgrade_command(
     except Exception as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from error
-    typer.echo("Store maintenance upgrade completed at 0004_claim_sessions")
+    typer.echo(
+        f"Store maintenance upgrade completed at {_maintenance_upgrade_target(acknowledge_revision)}"
+    )
 
 
 @app.command("store-maintenance-prepare")
@@ -988,13 +1017,14 @@ def store_maintenance_downgrade_command(
         typer.Option("--store-root", file_okay=False, resolve_path=True),
     ] = None,
 ) -> None:
-    """Run the acknowledgement-bound, fail-closed rollback to empty 0003."""
+    """Run one acknowledgement-bound, fail-closed Store schema rollback."""
 
     try:
         from sqlalchemy import create_engine
 
         from .store.migration import (
             MaintenanceAcknowledgement,
+            _maintenance_downgrade_target,
             maintenance_downgrade_database,
         )
 
@@ -1019,7 +1049,10 @@ def store_maintenance_downgrade_command(
     except Exception as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from error
-    typer.echo("Store maintenance downgrade completed at 0003_evidence_claim_leases")
+    typer.echo(
+        "Store maintenance downgrade completed at "
+        f"{_maintenance_downgrade_target(acknowledge_revision)}"
+    )
 
 
 def main() -> None:

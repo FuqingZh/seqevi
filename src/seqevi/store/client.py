@@ -45,7 +45,11 @@ from seqevi.evidence import (
 )
 
 from .transport import (
+    OCI_CAPABILITY_HEADER,
+    OCI_CLIENT_CAPABILITY,
     ArtifactReferenceModel,
+    ArtifactResolveRequest,
+    ArtifactResolveResponse,
     ArtifactUploadResponse,
     CommitModel,
     CommitRequest,
@@ -71,8 +75,12 @@ from .transport import (
     LookupRequest,
     LookupResponse,
     SessionEvidenceClaimModel,
+    OciStorageReference,
+    StorageDiscoveryResponse,
     canonical_query_digest,
+    storage_reference,
 )
+from .oci import OciClientFiles, OciRegistry
 
 
 class _StoreResponseError(StoreError):
@@ -90,11 +98,28 @@ _MAX_CLAIM_BACKPRESSURE_RETRIES = 3
 _DEFAULT_CLAIM_RETRY_SECONDS = 0.25
 _CLAIM_RETRY_JITTER_RATIO = 0.1
 _TRANSFER_CHUNK_SIZE = 1024 * 1024
+_ARTIFACT_UPLOAD_TIMEOUT_SECONDS = 900.0
+_ARTIFACT_UPLOAD_IO_TIMEOUT_SECONDS = 60.0
+# Bound cancellation observation without adding a watcher thread per request.
+_REQUEST_CANCELLATION_POLL_SECONDS = 0.05
 _FINALIZE_RECONCILIATION_RUNWAY_SECONDS = 1.0
 _READER_STOP_GRACE_SECONDS = 0.2
 _READER_HEADER = struct.Struct("!q")
 _READER_EOF = -1
 _READER_ERROR = -2
+
+
+def _exception_type_chain(error: BaseException) -> str:
+    names: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen and len(names) < 8:
+        seen.add(id(current))
+        names.append(type(current).__name__)
+        current = current.__cause__ or (
+            None if current.__suppress_context__ else current.__context__
+        )
+    return "<-".join(names)
 
 
 def _artifact_reader_command(path: Path) -> tuple[str, ...]:
@@ -143,6 +168,7 @@ class _ClaimTransportRuntime:
         self._active_operations = 0
         self._close_error: BaseException | None = None
         self._requests: set[asyncio.Task[object]] = set()
+        self.headers: dict[str, str] = {}
         self._thread = threading.Thread(
             target=self._run,
             name="seqevi-claim-http-runtime",
@@ -233,16 +259,49 @@ class _ClaimTransportRuntime:
         return future.result()
 
     def request(
-        self, method: str, path: str, *, deadline: float, **kwargs: Any
+        self,
+        method: str,
+        path: str,
+        *,
+        deadline: float,
+        cancellation_signal: threading.Event | None = None,
+        **kwargs: Any,
     ) -> httpx.Response:
         with self.operation():
             future: Future[httpx.Response] = asyncio.run_coroutine_threadsafe(
-                self._request(method, path, deadline=deadline, **kwargs), self._loop
+                self._request(
+                    method,
+                    path,
+                    deadline=deadline,
+                    cancellation_signal=cancellation_signal,
+                    **kwargs,
+                ),
+                self._loop,
             )
-            return future.result()
+            # Do not cancel this concurrent Future: it can report cancellation
+            # before the coroutine has finished closing its HTTP body/reader.
+            try:
+                return future.result()
+            except BaseException:
+                if cancellation_signal is not None and not future.done():
+                    # A caller interrupt must not release operation ownership
+                    # while the asynchronous request still owns resources.
+                    cancellation_signal.set()
+                    while not future.done():
+                        try:
+                            future.result()
+                        except BaseException:
+                            continue
+                raise
 
     async def _request(
-        self, method: str, path: str, *, deadline: float, **kwargs: Any
+        self,
+        method: str,
+        path: str,
+        *,
+        deadline: float,
+        cancellation_signal: threading.Event | None = None,
+        **kwargs: Any,
     ) -> httpx.Response:
         task = asyncio.current_task()
         assert task is not None
@@ -250,16 +309,39 @@ class _ClaimTransportRuntime:
         content = kwargs.get("content")
         close_content = getattr(content, "aclose", None)
         remaining = deadline - time.monotonic()
+        cancellation_watch: asyncio.TimerHandle | None = None
+
+        def observe_cancellation() -> None:
+            nonlocal cancellation_watch
+            assert cancellation_signal is not None
+            if cancellation_signal.is_set():
+                task.cancel()
+            else:
+                cancellation_watch = self._loop.call_later(
+                    _REQUEST_CANCELLATION_POLL_SECONDS, observe_cancellation
+                )
+
         try:
+            if cancellation_signal is not None:
+                if cancellation_signal.is_set():
+                    raise StoreError("ClaimSession request cancelled")
+                observe_cancellation()
             if remaining <= 0:
                 raise TimeoutError
             kwargs.setdefault("timeout", httpx.Timeout(remaining))
+            kwargs["headers"] = {**self.headers, **kwargs.get("headers", {})}
             # asyncio.timeout covers connection, headers, and complete body
             # consumption. Leaving it cancels and awaits httpx/httpcore before
             # the sync caller resumes.
             async with asyncio.timeout(remaining):
                 return await self._client.request(method, path, **kwargs)
+        except asyncio.CancelledError as error:
+            if cancellation_signal is not None and cancellation_signal.is_set():
+                raise StoreError("ClaimSession request cancelled") from error
+            raise
         finally:
+            if cancellation_watch is not None:
+                cancellation_watch.cancel()
             try:
                 if close_content is not None:
                     cleanup = asyncio.create_task(close_content())
@@ -325,6 +407,7 @@ class HttpEvidenceStore:
         timeout_seconds: float = 120.0,
         maximum_artifact_bytes: int | None = None,
         maximum_batch_size: int | None = None,
+        oci_files: OciClientFiles | None = None,
         _client: httpx.Client | None = None,
         _async_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -332,6 +415,11 @@ class HttpEvidenceStore:
             raise ValueError("timeout_seconds must be finite and positive")
         self._timeout_seconds = timeout_seconds
         self._closing = threading.Event()
+        self._headers: dict[str, str] = {}
+        self._registry: OciRegistry | None = None
+        self._oci_files = oci_files or OciClientFiles()
+        self._artifact_references: dict[str, ArtifactReferenceModel] = {}
+        self._staging_cancellations: set[threading.Event] = set()
         self._close_condition = threading.Condition()
         self._close_started = False
         self._closed = False
@@ -398,6 +486,34 @@ class HttpEvidenceStore:
         self.maximum_artifact_bytes = maximum_artifact_bytes
         self.maximum_batch_size = maximum_batch_size
         try:
+            discovery_response = self.client.get("/v1/storage/discovery")
+        except httpx.HTTPError as error:
+            raise StoreError("shared Store storage discovery request failed") from error
+        if discovery_response.status_code == 404:
+            # Only an exact missing endpoint on a healthy legacy service is a
+            # fallback. Auth, malformed discovery, and transport errors fail.
+            HealthResponse.model_validate(self._request("GET", "/health").json())
+            discovery = StorageDiscoveryResponse(artifact_backend="legacy-posix")
+        else:
+            _raise_for_store_status(discovery_response)
+            discovery = StorageDiscoveryResponse.model_validate(
+                discovery_response.json()
+            )
+        if discovery.artifact_backend == "oci-registry":
+            assert discovery.registry is not None
+            self._headers[OCI_CAPABILITY_HEADER] = OCI_CLIENT_CAPABILITY
+            self._claim_transport.headers = dict(self._headers)
+            self._registry = OciRegistry(discovery.registry, files=self._oci_files)
+            self._registry.preflight(
+                deadline=time.monotonic() + min(self._timeout_seconds, 30.0),
+                cancellation_signal=self._closing,
+            )
+        elif (
+            self._oci_files.registry_config is not None
+            or self._oci_files.ca_file is not None
+        ):
+            raise StoreError("OCI file inputs require an OCI-enabled shared Store")
+        try:
             capability_response = self._claim_transport.request(
                 "GET",
                 "/v1/internal/claim-sessions/capabilities",
@@ -459,6 +575,8 @@ class HttpEvidenceStore:
                 return
             self._close_started = True
             self._closing.set()
+            for signal in self._staging_cancellations:
+                signal.set()
         error: BaseException | None = None
         try:
             error = self._cleanup_resources()
@@ -526,7 +644,7 @@ class HttpEvidenceStore:
         for offset in range(0, len(commits), self.maximum_batch_size):
             chunk = commits[offset : offset + self.maximum_batch_size]
             request = CommitRequest(
-                commits=[CommitModel.from_domain(item) for item in chunk]
+                commits=[self._commit_model(item) for item in chunk]
             )
             response = self._request(
                 "POST", "/v1/evidence/commit", json=request.model_dump(mode="json")
@@ -600,6 +718,14 @@ class HttpEvidenceStore:
         }
 
     def _upload(self, payload: ArtifactFile) -> None:
+        if self._registry is not None:
+            with self._claim_transport.operation():
+                self._stage_oci(
+                    payload,
+                    deadline=time.monotonic() + _ARTIFACT_UPLOAD_TIMEOUT_SECONDS,
+                    cancellation_signal=self._closing,
+                )
+            return
         headers = {
             "X-Artifact-Media-Type": payload.media_type,
             "X-Artifact-Byte-Size": str(payload.byte_size),
@@ -619,10 +745,128 @@ class HttpEvidenceStore:
         if uploaded != expected:
             raise StoreIntegrityError("shared Store returned wrong artifact metadata")
 
+    def _commit_model(self, commit: EvidenceCommit) -> CommitModel:
+        model = CommitModel.from_domain(commit)
+        if self._registry is None:
+            return model
+        for name in ("normalized_artifact", "raw_artifact"):
+            reference = getattr(model, name)
+            if reference is None:
+                continue
+            staged = self._artifact_references.get(reference.digest)
+            if staged is None or (
+                staged.media_type != reference.media_type
+                or staged.byte_size != reference.byte_size
+            ):
+                raise StoreIntegrityError(
+                    "artifact has no matching staged storage reference"
+                )
+            model = model.model_copy(update={name: staged})
+        return model
+
+    def _resolve_artifact(
+        self,
+        digest: str,
+        *,
+        deadline: float,
+        cancellation_signal: threading.Event | None = None,
+    ) -> ArtifactReferenceModel | None:
+        request = ArtifactResolveRequest(digest=digest)
+        response = self._claim_transport.request(
+            "POST",
+            "/v1/artifacts/resolve",
+            deadline=deadline,
+            cancellation_signal=cancellation_signal,
+            json=request.model_dump(mode="json"),
+        )
+        _raise_for_store_status(response)
+        artifact = ArtifactResolveResponse.model_validate(response.json()).artifact
+        if artifact is not None and (
+            artifact.digest != digest or artifact.storage_reference is None
+        ):
+            raise StoreIntegrityError("shared Store returned wrong artifact resolution")
+        return artifact
+
+    def _stage_oci(
+        self,
+        payload: ArtifactFile,
+        *,
+        deadline: float,
+        cancellation_signal: threading.Event,
+    ) -> None:
+        assert self._registry is not None
+        if payload.byte_size > self.maximum_artifact_bytes:
+            raise StoreIntegrityError("artifact exceeds configured client upload limit")
+        if cancellation_signal.is_set() or self._closing.is_set():
+            raise StoreError("OCI artifact staging cancelled")
+        reference = self._resolve_artifact(
+            payload.digest, deadline=deadline, cancellation_signal=cancellation_signal
+        )
+        if reference is not None:
+            if (
+                reference.byte_size != payload.byte_size
+                or reference.media_type != payload.media_type
+            ):
+                raise StoreIntegrityError(
+                    "registered artifact has conflicting metadata"
+                )
+            if isinstance(reference.storage_reference, OciStorageReference):
+                self._registry.verify(
+                    reference,
+                    reference.storage_reference,
+                    deadline=deadline,
+                    cancellation_signal=cancellation_signal,
+                )
+        else:
+            stored = self._registry.stage(
+                payload,
+                deadline=deadline,
+                cancellation_signal=cancellation_signal,
+            )
+            reference = ArtifactReferenceModel(
+                digest=stored.digest,
+                media_type=stored.media_type,
+                byte_size=stored.byte_size,
+                storage_reference=storage_reference(stored),
+            )
+        if cancellation_signal.is_set() or self._closing.is_set():
+            raise StoreError("OCI artifact staging cancelled")
+        self._artifact_references[payload.digest] = reference
+
     def _download(self, digest: str) -> ArtifactFile:
         cached = self._downloaded_artifacts.get(digest)
         if cached is not None:
             return cached
+        if self._registry is not None:
+            with self._claim_transport.operation():
+                deadline = time.monotonic() + _ARTIFACT_UPLOAD_TIMEOUT_SECONDS
+                reference = self._resolve_artifact(
+                    digest, deadline=deadline, cancellation_signal=self._closing
+                )
+                if reference is None:
+                    raise StoreIntegrityError("registered artifact is missing")
+                if reference.byte_size > self.maximum_artifact_bytes:
+                    raise StoreIntegrityError(
+                        "artifact exceeds configured client download limit"
+                    )
+                if isinstance(reference.storage_reference, OciStorageReference):
+                    target = self._download_root / digest
+                    self._registry.download(
+                        reference,
+                        reference.storage_reference,
+                        target,
+                        deadline=deadline,
+                        cancellation_signal=self._closing,
+                    )
+                    artifact = ArtifactFile(
+                        path=target,
+                        digest=digest,
+                        media_type=reference.media_type,
+                        byte_size=reference.byte_size,
+                        lifetime=ArtifactLifetime.STORE,
+                    )
+                    self._downloaded_artifacts[digest] = artifact
+                    return artifact
         hasher = hashlib.sha256()
         byte_size = 0
         target = self._download_root / digest
@@ -630,7 +874,9 @@ class HttpEvidenceStore:
         try:
             try:
                 with (
-                    self.client.stream("GET", f"/v1/artifacts/{digest}") as response,
+                    self.client.stream(
+                        "GET", f"/v1/artifacts/{digest}", headers=self._headers
+                    ) as response,
                     temporary.open("wb") as handle,
                 ):
                     _raise_for_store_status(response, include_body=False)
@@ -668,6 +914,7 @@ class HttpEvidenceStore:
             temporary.unlink(missing_ok=True)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        kwargs["headers"] = {**self._headers, **kwargs.get("headers", {})}
         try:
             response = self.client.request(method, path, **kwargs)
         except httpx.HTTPError as error:
@@ -685,11 +932,14 @@ class _HttpClaimSession:
         self.store = store
         self.capabilities = capabilities
         self.cancellation_signal = threading.Event()
+        self._staging_cancel = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._operation_condition = threading.Condition()
+        self._active_operations: dict[int, int] = {}
         self._close_started = False
-        self._close_error: RuntimeError | None = None
+        self._close_error: BaseException | None = None
         self._lost: BaseException | None = None
         self._claims: dict[EvidenceKey, SessionEvidenceClaim] = {}
         self._heartbeat_jitter = random.uniform(0.8, 1.2)
@@ -726,6 +976,10 @@ class _HttpClaimSession:
             daemon=True,
         )
         self._thread.start()
+        with self.store._close_condition:
+            self.store._staging_cancellations.add(self._staging_cancel)
+            if self.store._closing.is_set():
+                self._staging_cancel.set()
 
     def __enter__(self) -> _HttpClaimSession:
         return self
@@ -738,6 +992,27 @@ class _HttpClaimSession:
             raise EvidenceClaimLostError(
                 "ClaimSession authority was lost"
             ) from self._lost
+
+    @contextlib.contextmanager
+    def _operation(self) -> Iterator[None]:
+        """Fence this session's staging/finalization against synchronous close."""
+        identity = threading.get_ident()
+        with self._operation_condition:
+            if self._stop.is_set() or self.store._closing.is_set():
+                raise StoreError("ClaimSession is closed")
+            self._active_operations[identity] = (
+                self._active_operations.get(identity, 0) + 1
+            )
+        try:
+            yield
+        finally:
+            with self._operation_condition:
+                depth = self._active_operations[identity] - 1
+                if depth:
+                    self._active_operations[identity] = depth
+                else:
+                    del self._active_operations[identity]
+                self._operation_condition.notify_all()
 
     @staticmethod
     def _authority_deadline(
@@ -787,6 +1062,7 @@ class _HttpClaimSession:
             except BaseException as error:
                 self._lost = error
                 self.cancellation_signal.set()
+                self._staging_cancel.set()
                 return
 
     def _heartbeat_once(self, started: float) -> None:
@@ -924,12 +1200,48 @@ class _HttpClaimSession:
     def finalize_many(
         self, proposed: Iterable[EvidenceCommit]
     ) -> tuple[CommitOutcome, ...]:
-        with self.store._claim_transport.operation():
+        with self._operation(), self.store._claim_transport.operation():
+            self.raise_if_lost()
+            commits = tuple(proposed)
+            if len({commit.key for commit in commits}) != len(commits):
+                raise ValueError("finalize batch contains a duplicate evidence key")
+            if not commits:
+                return ()
+            payloads: dict[str, ArtifactFile] = {}
+            for commit in commits:
+                if commit.key not in self._claims:
+                    raise EvidenceClaimLostError("no exact claim for finalization")
+                CommitModel.from_domain(commit)
+                for payload in (commit.normalized_artifact, commit.raw_artifact):
+                    if payload is None:
+                        continue
+                    previous = payloads.get(payload.digest)
+                    if previous is not None and (
+                        previous.byte_size != payload.byte_size
+                        or previous.media_type != payload.media_type
+                    ):
+                        raise StoreIntegrityError("conflicting artifact metadata")
+                    payloads[payload.digest] = payload
+            for payload in payloads.values():
+                self.raise_if_lost()
+                if self._stop.is_set():
+                    raise StoreError("ClaimSession closed during artifact staging")
+                if payload.digest not in self.store._uploaded_artifact_digests:
+                    self._upload_artifact(
+                        payload,
+                        deadline=time.monotonic() + _ARTIFACT_UPLOAD_TIMEOUT_SECONDS,
+                    )
+                    self.store._uploaded_artifact_digests.add(payload.digest)
+            # Staging publishes bytes, not evidence. Heartbeats may have renewed
+            # authority while uploading; never use the pre-upload snapshot.
+            self.raise_if_lost()
+            if self._stop.is_set():
+                raise StoreError("ClaimSession closed during artifact staging")
             started = time.monotonic()
             authority_request, renew_deadline = self._authority_request_and_deadline()
             deadline = min(started + 30.0, renew_deadline)
             return self._finalize_many(
-                proposed,
+                commits,
                 started=started,
                 deadline=deadline,
                 authority_request=authority_request,
@@ -968,14 +1280,6 @@ class _HttpClaimSession:
             raise EvidenceClaimLostError(
                 "ClaimSession finalization has no reconciliation runway"
             )
-        for commit in commits:
-            for payload in (commit.normalized_artifact, commit.raw_artifact):
-                if (
-                    payload is not None
-                    and payload.digest not in self.store._uploaded_artifact_digests
-                ):
-                    self._upload_artifact(payload, deadline=transport_deadline)
-                    self.store._uploaded_artifact_digests.add(payload.digest)
         items = []
         for commit in commits:
             claim = self._claims.get(commit.key)
@@ -983,7 +1287,7 @@ class _HttpClaimSession:
                 raise EvidenceClaimLostError("no exact claim for finalization")
             items.append(
                 ClaimSessionFinalizeItem(
-                    commit=CommitModel.from_domain(commit),
+                    commit=self.store._commit_model(commit),
                     claim_generation=claim.generation,
                 )
             )
@@ -1188,6 +1492,8 @@ class _HttpClaimSession:
         **kwargs: Any,
     ) -> httpx.Response:
         while True:
+            if self._stop.is_set():
+                raise StoreError("ClaimSession closed during request")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if deadline_loses_authority:
@@ -1197,7 +1503,11 @@ class _HttpClaimSession:
                 raise StoreError("ClaimSession operation deadline expired")
             try:
                 response = self.store._claim_transport.request(
-                    method, path, deadline=deadline, **kwargs
+                    method,
+                    path,
+                    deadline=deadline,
+                    cancellation_signal=self._staging_cancel,
+                    **kwargs,
                 )
             except (httpx.HTTPError, TimeoutError):
                 response = None
@@ -1225,10 +1535,14 @@ class _HttpClaimSession:
                 raise StoreError("ClaimSession closed during request")
 
     def _upload_until(self, payload: ArtifactFile, *, deadline: float) -> None:
+        started = time.monotonic()
+        request_id = uuid4().hex
         headers = {
             "X-Artifact-Media-Type": payload.media_type,
             "X-Artifact-Byte-Size": str(payload.byte_size),
+            "X-Request-ID": request_id,
         }
+        response: httpx.Response | None = None
         try:
             response = self.store._claim_transport.request(
                 "PUT",
@@ -1236,36 +1550,91 @@ class _HttpClaimSession:
                 deadline=deadline,
                 headers=headers,
                 content=_async_file_chunks(payload.path),
+                cancellation_signal=self._staging_cancel,
+                timeout=httpx.Timeout(
+                    max(
+                        0.001,
+                        min(
+                            _ARTIFACT_UPLOAD_IO_TIMEOUT_SECONDS,
+                            deadline - started,
+                        ),
+                    )
+                ),
             )
-        except (httpx.HTTPError, TimeoutError) as error:
-            raise StoreError("ClaimSession artifact upload failed") from error
-        _raise_for_store_status(response)
-        uploaded = ArtifactUploadResponse.model_validate(response.json()).artifact
-        expected = ArtifactReferenceModel(
-            digest=payload.digest,
-            media_type=payload.media_type,
-            byte_size=payload.byte_size,
-        )
-        if uploaded != expected:
-            raise StoreIntegrityError("shared Store returned wrong artifact metadata")
+            _raise_for_store_status(response)
+            uploaded = ArtifactUploadResponse.model_validate(response.json()).artifact
+            expected = ArtifactReferenceModel(
+                digest=payload.digest,
+                media_type=payload.media_type,
+                byte_size=payload.byte_size,
+            )
+            if uploaded != expected:
+                raise StoreIntegrityError(
+                    "shared Store returned wrong artifact metadata"
+                )
+        except (
+            httpx.HTTPError,
+            TimeoutError,
+            StoreError,
+            OSError,
+            ValueError,
+        ) as error:
+            now = time.monotonic()
+            error_class = (
+                EvidenceConflictError
+                if isinstance(error, EvidenceConflictError)
+                else StoreIntegrityError
+                if isinstance(error, StoreIntegrityError)
+                else StoreError
+            )
+            # Exception text and response bodies can embed credentials or URLs.
+            # Preserve the real cause, but expose only bounded type names here.
+            raise error_class(
+                "ClaimSession artifact upload failed: phase=staging "
+                f"digest={payload.digest} bytes={payload.byte_size} "
+                f"elapsed={now - started:.3f}s remaining={max(0.0, deadline - now):.3f}s "
+                f"request_id={request_id} "
+                f"http_status={response.status_code if response is not None else 'none'} "
+                f"cause={_exception_type_chain(error)}"
+            ) from error
 
     def _upload_artifact(self, payload: ArtifactFile, *, deadline: float) -> None:
-        if deadline <= time.monotonic():
-            raise EvidenceClaimLostError(
-                "ClaimSession artifact upload has no reconciliation runway"
-            )
-        self._upload_until(payload, deadline=deadline)
+        with self._operation():
+            if deadline <= time.monotonic():
+                raise StoreError("ClaimSession artifact staging deadline expired")
+            if self.store._registry is not None:
+                self.store._stage_oci(
+                    payload, deadline=deadline, cancellation_signal=self._staging_cancel
+                )
+                return
+            self._upload_until(payload, deadline=deadline)
 
     def close(self) -> None:
+        """Cancel this session and return only after its admitted work is drained.
+
+        Examples:
+            ``session.close()`` leaves no session-owned upload child running;
+            another session on the same Store remains usable.
+
+        Notes:
+            Cleanup may wait for uninterruptible I/O. Never treat a cancellation
+            signal or an interrupted wait as completed resource release.
+        """
+        with self._operation_condition:
+            if threading.get_ident() in self._active_operations:
+                raise RuntimeError("cannot close ClaimSession from its own operation")
         with self._close_lock:
             if self._close_started:
                 if self._close_error is not None:
                     raise self._close_error
                 return
             self._close_started = True
-            self._stop.set()
-            self._thread.join()
+            with self._operation_condition:
+                self._stop.set()
+                self._staging_cancel.set()
+            error: BaseException | None = None
             try:
+                self._thread.join()
                 with self.store._claim_transport.operation():
                     request = ClaimSessionCloseRequest.model_validate(
                         self._authority_request()
@@ -1277,15 +1646,35 @@ class _HttpClaimSession:
                         deadline=time.monotonic()
                         + min(self.store._timeout_seconds, 5.0),
                     )
-            except RuntimeError as error:
+            except RuntimeError as caught:
                 if not (
                     self.store._closing.is_set()
                     or self.store._claim_transport._closing.is_set()
                 ):
-                    self._close_error = error
-                    raise
+                    self._close_error = caught
             except (httpx.HTTPError, TimeoutError):
                 pass
+            except BaseException as caught:
+                self._close_error = caught
+            finally:
+                # An interrupted close still owns its cleanup. Wait without
+                # holding the condition lock needed by operation finalizers.
+                while self._thread.is_alive():
+                    try:
+                        self._thread.join()
+                    except BaseException as caught:
+                        error = error or caught
+                with self._operation_condition:
+                    while self._active_operations:
+                        try:
+                            self._operation_condition.wait()
+                        except BaseException as caught:
+                            error = error or caught
+                with self.store._close_condition:
+                    self.store._staging_cancellations.discard(self._staging_cancel)
+            self._close_error = self._close_error or error
+            if self._close_error is not None:
+                raise self._close_error
 
 
 def _claim_retry_delay(response: httpx.Response) -> float:
