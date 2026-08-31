@@ -15,6 +15,7 @@ from seqevi.adapters import AdapterName
 from seqevi.errors import AnnotationError
 from seqevi.execution_profile import ExecutionProfile, ManagedRuntime
 from seqevi.distribution.manifest import KitComponent, KitManifest
+from seqevi.store.oci import OciClientFiles
 
 
 def _manifest(files: tuple[tuple[str, str, bytes], ...]) -> KitManifest:
@@ -120,6 +121,62 @@ def _write_result(path: Path, resource_id: str, seqevi_version: str) -> None:
                 "input",
                 "now",
             ],
+        )
+
+
+def test_managed_registry_files_use_fixed_readonly_container_paths(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "registry.json"
+    ca_file = tmp_path / "registry.pem"
+    files = OciClientFiles(registry_config=config, ca_file=ca_file)
+
+    mounts = oci._registry_mounts(files)
+    command = oci._inner_command(
+        fasta="/mnt/seqevi/input.fasta",
+        output="/mnt/seqevi/output/result.duckdb",
+        resource="/mnt/seqevi/resource",
+        store="https://store.example.test",
+        threads=1,
+        timeout_seconds=None,
+        oci_files=files,
+    )
+
+    assert mounts == (
+        f"type=bind,source={config},target=/run/seqevi/registry/config.json,readonly",
+        f"type=bind,source={ca_file},target=/run/seqevi/registry/ca.pem,readonly",
+    )
+    assert "--oci-registry-config" in command
+    assert "/run/seqevi/registry/config.json" in command
+    assert "--oci-registry-ca-file" in command
+    assert "/run/seqevi/registry/ca.pem" in command
+    assert str(config) not in command
+    assert str(ca_file) not in command
+
+
+def test_managed_local_store_rejects_registry_files(tmp_path: Path) -> None:
+    with pytest.raises(AnnotationError, match="HTTP\\(S\\) shared Store"):
+        oci._resolve_store(
+            tmp_path / "store",
+            oci_files=OciClientFiles(registry_config=tmp_path / "registry.json"),
+        )
+
+
+def test_old_managed_kit_rejects_oci_files_before_docker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _resource, profile, fasta, output = _inputs(tmp_path)
+    monkeypatch.setattr(oci, "load_kit_manifest", lambda _name: manifest)
+
+    with pytest.raises(AnnotationError, match="does not include OCI artifact support"):
+        oci.run_oci_annotation(
+            fasta=fasta,
+            output=output,
+            profile=profile,
+            store="https://store.example.test",
+            threads=1,
+            timeout_seconds=None,
+            oci_files=OciClientFiles(registry_config=tmp_path / "registry.json"),
         )
 
 

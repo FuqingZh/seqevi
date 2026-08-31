@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import hashlib
 import os
 import logging
 import json
@@ -10,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +19,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from inspect import getclosurevars, signature
 from typing import Any, cast
 
@@ -49,6 +52,7 @@ from seqevi.errors import (
     StoreIntegrityError,
 )
 from seqevi.evidence import (
+    ArtifactFile,
     ClaimDisposition,
     CommitOutcome,
     EvidenceCommit,
@@ -495,6 +499,8 @@ def test_service_openapi_preserves_legacy_and_adds_claim_operations(
     paths = set(app.openapi()["paths"])
     assert paths == {
         "/health",
+        "/v1/storage/discovery",
+        "/v1/artifacts/resolve",
         "/v1/artifacts/{digest}",
         "/v1/evidence/commit",
         "/v1/evidence/fetch",
@@ -662,7 +668,21 @@ def test_claim_request_logging_uses_validated_batch_size_once(
 
 
 def _claim_mock_client(handler: httpx.MockTransport) -> httpx.Client:
-    return httpx.Client(transport=handler, base_url="http://testserver")
+    def legacy_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/storage/discovery":
+            return httpx.Response(404)
+        response = handler.handle_request(request)
+        if request.url.path == "/health":
+            # Claim-only handlers predate storage discovery; retain explicit
+            # health limits but supply the healthy legacy bootstrap otherwise.
+            if response.status_code == 200 and "maximum_batch_size" in response.json():
+                return response
+            return httpx.Response(200, json=_claim_health())
+        return response
+
+    return httpx.Client(
+        transport=httpx.MockTransport(legacy_handler), base_url="http://testserver"
+    )
 
 
 def _claim_health(maximum_batch_size: int = 1000) -> dict[str, object]:
@@ -681,6 +701,7 @@ def test_http_store_released_constructor_compatibility_boundary() -> None:
         "timeout_seconds",
         "maximum_artifact_bytes",
         "maximum_batch_size",
+        "oci_files",
     ]
     assert "client" not in parameters
     with httpx.Client() as released_client:
@@ -1348,7 +1369,7 @@ def test_claim_transport_aclose_failure_still_joins_runtime() -> None:
         runtime.close()
 
 
-def test_claim_artifact_upload_reserves_reconciliation_runway(
+def test_claim_artifact_upload_uses_staging_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store_client_module = importlib.import_module("seqevi.store.client")
@@ -1357,6 +1378,12 @@ def test_claim_artifact_upload_reserves_reconciliation_runway(
     )
     session = object.__new__(store_client_module._HttpClaimSession)
     upload_deadline = 104.0
+    session._operation_condition = threading.Condition()
+    session._active_operations = {}
+    session._stop = threading.Event()
+    session.store = object.__new__(HttpEvidenceStore)
+    session.store._closing = threading.Event()
+    session.store._registry = None
     observed: list[float] = []
     monkeypatch.setattr(store_client_module.time, "monotonic", lambda: 100.0)
     monkeypatch.setattr(
@@ -1370,7 +1397,7 @@ def test_claim_artifact_upload_reserves_reconciliation_runway(
     assert observed == [upload_deadline]
 
 
-def test_claim_artifact_upload_rejects_insufficient_runway_before_transport(
+def test_claim_artifact_upload_rejects_expired_staging_before_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store_client_module = importlib.import_module("seqevi.store.client")
@@ -1379,6 +1406,11 @@ def test_claim_artifact_upload_rejects_insufficient_runway_before_transport(
     )
     session = object.__new__(store_client_module._HttpClaimSession)
     upload_called = False
+    session._operation_condition = threading.Condition()
+    session._active_operations = {}
+    session._stop = threading.Event()
+    session.store = object.__new__(HttpEvidenceStore)
+    session.store._closing = threading.Event()
     monkeypatch.setattr(store_client_module.time, "monotonic", lambda: 100.0)
 
     def record_upload(_payload: object, *, deadline: float) -> None:
@@ -1387,9 +1419,238 @@ def test_claim_artifact_upload_rejects_insufficient_runway_before_transport(
 
     monkeypatch.setattr(session, "_upload_until", record_upload)
 
-    with pytest.raises(EvidenceClaimLostError, match="no reconciliation runway"):
+    with pytest.raises(StoreError, match="staging deadline expired"):
         session._upload_artifact(payload, deadline=100.0)
     assert not upload_called
+
+
+@pytest.mark.parametrize("cause", ["transport", "http", "metadata", "conflict"])
+def test_claim_upload_diagnostics_are_correlated_and_redacted(
+    tmp_path: Path, cause: str
+) -> None:
+    module = importlib.import_module("seqevi.store.client")
+    payload = write_artifact_file(tmp_path / "payload", b"payload", "text/plain")
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(404)
+        requests.append(request)
+        if cause == "transport":
+            try:
+                raise OSError("secret://password@host")
+            except OSError as inner:
+                raise httpx.ReadTimeout("secret://password@host") from inner
+        if cause == "http":
+            return httpx.Response(503, text="secret://password@host")
+        if cause == "conflict":
+            return httpx.Response(409, text="secret://password@host")
+        return httpx.Response(200, json={"secret": "secret://password@host"})
+
+    with HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    ) as store:
+        session = object.__new__(module._HttpClaimSession)
+        session.store = store
+        session._staging_cancel = threading.Event()
+        with pytest.raises(StoreError) as caught:
+            session._upload_until(payload, deadline=time.monotonic() + 900)
+        message = str(caught.value)
+        assert f"digest={payload.digest} bytes=7" in message
+        assert "phase=staging" in message and "elapsed=" in message
+        assert "remaining=" in message and "cause=" in message
+        assert "secret" not in message and "password" not in message
+        assert caught.value.__cause__ is not None
+        if cause == "conflict":
+            assert isinstance(caught.value, EvidenceConflictError)
+        assert len(requests) == 1  # R1 does not silently add upload retries.
+        assert requests[0].headers["X-Request-ID"] in message
+        assert requests[0].extensions["timeout"] == {
+            "connect": 60.0,
+            "read": 60.0,
+            "write": 60.0,
+            "pool": 60.0,
+        }
+        if cause == "transport":
+            assert "ReadTimeout<-OSError" in message
+
+
+@pytest.mark.parametrize("request_id", ["a" * 32, "secret://password@host"])
+def test_service_artifact_upload_logs_safe_request_identity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, request_id: str
+) -> None:
+    app = create_service_app(_settings(tmp_path), persistence=_memory_persistence())
+    payload = b"payload"
+    digest = sha256_digest(payload)
+    with (
+        TestClient(app) as service,
+        caplog.at_level(logging.INFO, logger="seqevi.service.claims"),
+    ):
+        response = service.put(
+            f"/v1/artifacts/{digest}",
+            content=payload,
+            headers={
+                "X-Artifact-Media-Type": "text/plain",
+                "X-Artifact-Byte-Size": "7",
+                "X-Request-ID": request_id,
+            },
+        )
+    assert response.status_code == 200
+    records = [
+        json.loads(record.message)
+        for record in caplog.records
+        if record.name == "seqevi.service.claims"
+    ]
+    logged = next(
+        record for record in records if record["event"] == "seqevi.artifact_request"
+    )
+    if request_id == "a" * 32:
+        assert logged["request_id"] == request_id
+    else:
+        assert len(logged["request_id"]) == 32
+        assert set(logged["request_id"]) <= set("0123456789abcdef")
+        assert "secret" not in json.dumps(records)
+    assert logged["digest"] == digest and logged["byte_size"] == 7
+    assert logged["outcome"] == "created" and logged["duration_ms"] >= 0
+
+
+def test_claim_artifact_staging_total_timeout_cancels_http_task(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("seqevi.store.client")
+    payload = write_artifact_file(tmp_path / "payload", b"payload", "text/plain")
+    cancelled = threading.Event()
+    timeout_values: list[float] = []
+
+    async def chunks(_path: Path):
+        yield b"payload"
+
+    # This test isolates HTTP cancellation from interpreter startup; the
+    # reader's subprocess/reap boundary has its own real-reader tests.
+    monkeypatch.setattr(module, "_async_file_chunks", chunks)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/capabilities"):
+            return httpx.Response(404)
+        timeout_values.append(request.extensions["timeout"]["read"])
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        raise AssertionError("unreachable")
+
+    with HttpEvidenceStore(
+        "http://testserver",
+        maximum_artifact_bytes=1024,
+        maximum_batch_size=1,
+        _client=_claim_mock_client(httpx.MockTransport(lambda _: httpx.Response(404))),
+        _async_transport=httpx.MockTransport(handler),
+    ) as store:
+        session = object.__new__(module._HttpClaimSession)
+        session.store = store
+        session._staging_cancel = threading.Event()
+        with pytest.raises(StoreError, match="cause=TimeoutError"):
+            session._upload_until(payload, deadline=time.monotonic() + 0.5)
+        assert cancelled.is_set()
+        assert not store._claim_transport._requests
+        assert len(timeout_values) == 1 and 0 < timeout_values[0] <= 0.5
+
+
+def test_blocking_artifact_fsync_does_not_block_service_health(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = importlib.import_module("seqevi.store.artifact")
+    app = create_service_app(_settings(tmp_path), persistence=_memory_persistence())
+    entered = threading.Event()
+    release = threading.Event()
+    original = module.os.fsync
+
+    def block(descriptor: int) -> None:
+        entered.set()
+        assert release.wait(3)
+        original(descriptor)
+
+    monkeypatch.setattr(module.os, "fsync", block)
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            upload = asyncio.create_task(
+                client.put(
+                    f"/v1/artifacts/{sha256_digest(b'payload')}",
+                    content=b"payload",
+                    headers={
+                        "X-Artifact-Media-Type": "text/plain",
+                        "X-Artifact-Byte-Size": "7",
+                    },
+                )
+            )
+            try:
+                async with asyncio.timeout(2):
+                    while not entered.is_set():
+                        await asyncio.sleep(0.005)
+                    response = await client.get("/health")
+                assert response.status_code == 200
+                assert not upload.done()
+            finally:
+                release.set()
+                assert (await upload).status_code == 200
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(180)
+def test_claim_artifact_staging_512_mib_round_trip(tmp_path: Path) -> None:
+    """Local ASGI scale check, not a network/restart durability benchmark."""
+    module = importlib.import_module("seqevi.store.client")
+    with tempfile.TemporaryDirectory(
+        dir=tmp_path, prefix="artifact-scale-"
+    ) as directory:
+        root = Path(directory)
+        source = root / "source"
+        chunk = bytes(range(256)) * 4096
+        with source.open("wb") as handle:
+            for _ in range(512):
+                handle.write(chunk)
+        payload = ArtifactFile.from_path(source, "application/octet-stream")
+        assert payload.byte_size == 512 * 1024 * 1024
+        settings = _settings(root)
+        app = create_service_app(settings, persistence=_memory_persistence())
+        with (
+            TestClient(app) as service,
+            HttpEvidenceStore(
+                "http://testserver",
+                _client=service,
+                _async_transport=httpx.ASGITransport(app=app),
+            ) as store,
+        ):
+            session = object.__new__(module._HttpClaimSession)
+            session.store = store
+            session._staging_cancel = threading.Event()
+            started = time.monotonic()
+            session._upload_until(payload, deadline=started + 900)
+            elapsed = time.monotonic() - started
+        target = (
+            settings.artifacts_dir
+            / "sha256"
+            / payload.digest[:2]
+            / payload.digest[2:4]
+            / payload.digest
+        )
+        with target.open("rb") as handle:
+            actual_digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        assert target.stat().st_size == payload.byte_size
+        assert actual_digest == payload.digest
+        print(
+            f"artifact_staging bytes={payload.byte_size} elapsed={elapsed:.3f}s digest={actual_digest}"
+        )
 
 
 def test_slow_renew_body_promptly_publishes_session_loss() -> None:
@@ -1834,6 +2095,7 @@ def test_claim_request_rejects_response_after_absolute_deadline(
     session = object.__new__(store_client_module._HttpClaimSession)
     session.store = Store()
     session._stop = threading.Event()
+    session._staging_cancel = threading.Event()
     monkeypatch.setattr(store_client_module.time, "monotonic", lambda: clock[0])
 
     expected_error = StoreError if operation == "acquire" else EvidenceClaimLostError
@@ -2492,8 +2754,11 @@ def test_http_finalize_readback_timeout_is_clamped_to_authority_deadline(
     assert all(0 < timeout <= 1.4 for timeout in lookup_timeouts)
 
 
-def test_finalize_batch_split_and_artifacts_share_one_absolute_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "staging_result", ["success", "transport_failure", "authority_lost"]
+)
+def test_finalize_stages_before_fresh_authority_and_shared_metadata_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staging_result: str
 ) -> None:
     store_client_module = importlib.import_module("seqevi.store.client")
     commits = (
@@ -2566,26 +2831,51 @@ def test_finalize_batch_split_and_artifacts_share_one_absolute_budget(
         method: str, path: str, *, deadline: float, **kwargs: Any
     ) -> httpx.Response:
         if path.endswith("/finalize"):
+            assert kwargs["json"]["owner_token"] == "renewed-owner"
             deadlines.append(("finalize", deadline))
             clock[0] += 3.0
         return original_request(method, path, deadline=deadline, **kwargs)
 
     def capture_upload(_payload: object, *, deadline: float) -> None:
         deadlines.append(("upload", deadline))
-        clock[0] += 3.0
+        assert deadline == clock[0] + 900.0
+        clock[0] += 40.0
+        # Model the heartbeat renewing while a transfer exceeds the old cutoff.
+        session._renew_deadline = clock[0] + 90.0
+        session._authority = replace(session._authority, owner_token="renewed-owner")
+        if staging_result == "transport_failure":
+            raise StoreError("upload unavailable")
+        if staging_result == "authority_lost":
+            session._lost = StoreError("lost during upload")
 
     monkeypatch.setattr(store._claim_transport, "request", capture_request)
     monkeypatch.setattr(session, "_upload_until", capture_upload)
-    assert session.finalize_many(commits) == (
-        CommitOutcome.CREATED,
-        CommitOutcome.CREATED,
-    )
-    cutoff = 125.0 - store_client_module._FINALIZE_RECONCILIATION_RUNWAY_SECONDS
-    assert len([kind for kind, _ in deadlines if kind == "upload"]) >= 2
-    assert deadlines == [(kind, cutoff) for kind, _deadline in deadlines]
-    session._stop.set()
-    session._thread.join(0.5)
-    store.close()
+    try:
+        if staging_result != "success":
+            with pytest.raises(StoreError):
+                session.finalize_many(commits)
+            assert [kind for kind, _ in deadlines] == ["upload"]
+            return
+        assert session.finalize_many(commits) == (
+            CommitOutcome.CREATED,
+            CommitOutcome.CREATED,
+        )
+        uploads = [deadline for kind, deadline in deadlines if kind == "upload"]
+        assert len(uploads) >= 2
+        metadata_started = 100.0 + len(uploads) * 40.0
+        cutoff = metadata_started + 29.0
+        assert [deadline for kind, deadline in deadlines if kind == "finalize"] == [
+            cutoff,
+            cutoff,
+        ]
+        assert [kind for kind, _ in deadlines] == ["upload"] * len(uploads) + [
+            "finalize",
+            "finalize",
+        ]
+    finally:
+        session._stop.set()
+        session._thread.join(0.5)
+        store.close()
 
 
 def test_http_finalize_does_not_reconcile_deterministic_422(tmp_path: Path) -> None:
@@ -3356,9 +3646,9 @@ def test_pressure_fresh_database_guard_accepts_empty_and_rejects_data() -> None:
                 connection.execute(
                     text(
                         "INSERT INTO artifact "
-                        "(digest, media_type, byte_size, relative_path) "
+                        "(digest, media_type, byte_size, relative_path, storage_kind) "
                         "VALUES (:digest, 'application/octet-stream', 0, "
-                        "'occupied/artifact')"
+                        "'occupied/artifact', 'posix')"
                     ),
                     {"digest": "1" * 64},
                 )
@@ -3443,14 +3733,17 @@ def _seed_0002_evidence(connection) -> None:
 
 
 def _snapshot_legacy_rows(connection) -> dict[str, tuple[tuple[object, ...], ...]]:
+    statements = {
+        "sequence": "SELECT * FROM sequence ORDER BY 1",
+        "artifact": (
+            "SELECT digest, media_type, byte_size, relative_path, created_at "
+            "FROM artifact ORDER BY 1"
+        ),
+        "evidence": "SELECT * FROM evidence ORDER BY 1",
+    }
     return {
-        table_name: tuple(
-            tuple(row)
-            for row in connection.execute(
-                text(f"SELECT * FROM {table_name} ORDER BY 1")  # noqa: S608
-            )
-        )
-        for table_name in ("sequence", "artifact", "evidence")
+        table_name: tuple(tuple(row) for row in connection.execute(text(statement)))
+        for table_name, statement in statements.items()
     }
 
 
@@ -3981,10 +4274,19 @@ def test_sqlite_maintenance_classifies_commit_after_operation_deadline(
         expected_revision="0003_evidence_claim_leases",
     )
     original = store_migration._run_maintenance_upgrade  # pyright: ignore[reportPrivateUsage]
+    clock = [time.monotonic()]
+    # Force the intended post-commit deadline crossing, independently of disk
+    # latency. Keep real migration/readback; do not change production budgets
+    # or patch the process-global clock used by unrelated runtime threads.
+    monkeypatch.setattr(
+        store_migration,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], sleep=time.sleep),
+    )
 
     def committed_late(*args, **kwargs):
         original(*args, **kwargs)
-        time.sleep(0.25)
+        clock[0] += 0.25
         raise store_migration._AmbiguousMaintenanceCommit(  # pyright: ignore[reportPrivateUsage]
             "commit returned after operation deadline"
         )
@@ -4019,7 +4321,9 @@ def test_sqlite_maintenance_canonicalizes_relative_database_identity(
         config.attributes["connection"] = connection
         command.upgrade(
             config,
-            "0003_evidence_claim_leases" if direction == "upgrade" else "head",
+            "0003_evidence_claim_leases"
+            if direction == "upgrade"
+            else "0004_claim_sessions",
         )
         connection.commit()
     absolute_engine.dispose()
@@ -4214,8 +4518,15 @@ def test_sqlite_maintenance_discards_stale_pooled_database_handle(
 def test_postgres_fenced_downgrade_recreates_empty_0003_coordination() -> None:
     with _isolated_postgres_url() as database_url:
         engine = create_engine(database_url)
-        persistence = PostgresEvidencePersistence.open(database_url)
-        persistence.close()
+        config = Config()
+        config.set_main_option(
+            "script_location",
+            str(Path(store_migration.__file__).with_name("migrations")),
+        )
+        with engine.connect() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0004_claim_sessions")
+            connection.commit()
         acknowledgement = store_migration.MaintenanceAcknowledgement(
             database_identity=store_migration._database_identity(engine),  # pyright: ignore[reportPrivateUsage]
             expected_revision="0004_claim_sessions",
@@ -4419,6 +4730,55 @@ def test_postgres_http_claim_session_end_to_end(tmp_path: Path) -> None:
                 decision = session.acquire_many((query,))[0]
                 assert decision.disposition is ClaimDisposition.ACQUIRED
                 assert session.finalize_many((commit,)) == (CommitOutcome.CREATED,)
+            fetched = store.fetch(commit.key)
+            assert fetched is not None
+            assert fetched.record.payload_digest == commit.payload_digest
+
+
+@pytest.mark.requires_postgres
+def test_postgres_staged_artifacts_cannot_finalize_after_local_authority_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        app = create_service_app(_settings(tmp_path), persistence=persistence)
+        commit = _hit_commit(tmp_path / "sources", "MSTAGINGLOSS")
+        query = EvidenceQuery(commit.identity, commit.key)
+        with (
+            TestClient(app) as service,
+            HttpEvidenceStore(
+                "http://testserver",
+                _client=service,
+                _async_transport=httpx.ASGITransport(app=app),
+            ) as store,
+        ):
+            with store.claim_session() as session:
+                session.acquire_many((query,))
+                original = session._upload_until
+                staged = 0
+
+                def stage_then_lose(payload: ArtifactFile, *, deadline: float) -> None:
+                    nonlocal staged
+                    original(payload, deadline=deadline)
+                    staged += 1
+                    if staged == 2:
+                        session._lost = StoreError("local authority loss after staging")
+
+                monkeypatch.setattr(session, "_upload_until", stage_then_lose)
+                with pytest.raises(EvidenceClaimLostError):
+                    session.finalize_many((commit,))
+                assert store.lookup_many((query,)) == {}
+                assert staged == 2
+            # Closing the first session releases its claims. Reuse already
+            # staged bytes in a new session, but publish evidence only now.
+            with store.claim_session() as resumed:
+
+                def unexpected_upload(*_args: object, **_kwargs: object) -> None:
+                    raise AssertionError("successful staging should be reused")
+
+                monkeypatch.setattr(resumed, "_upload_until", unexpected_upload)
+                resumed.acquire_many((query,))
+                assert resumed.finalize_many((commit,)) == (CommitOutcome.CREATED,)
             fetched = store.fetch(commit.key)
             assert fetched is not None
             assert fetched.record.payload_digest == commit.payload_digest

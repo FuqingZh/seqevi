@@ -21,6 +21,7 @@ from seqevi.evidence import sha256_digest
 from seqevi.execution_profile import ExecutionProfile, ManagedRuntime
 from seqevi.resource_lock import read_resource_lock
 from seqevi.result import RESULT_FORMAT_VERSION
+from seqevi.store.oci import OciClientFiles
 
 from .manifest import KitManifest, load_kit_manifest
 
@@ -30,6 +31,8 @@ _CONTAINER_OUTPUT = "/mnt/seqevi/output"
 _CONTAINER_STORE = "/mnt/seqevi/store"
 _CONTAINER_ENTRYPOINT = "/opt/venv/bin/seqevi"
 _CONTAINER_EXECUTABLE = "/opt/dbcan-venv/bin/run_dbcan"
+_CONTAINER_REGISTRY_CONFIG = "/run/seqevi/registry/config.json"
+_CONTAINER_REGISTRY_CA_FILE = "/run/seqevi/registry/ca.pem"
 _DEFAULT_DOCKER_TIMEOUT_SECONDS = 30.0
 _PULL_TIMEOUT_SECONDS = 900.0
 
@@ -57,6 +60,7 @@ def run_oci_annotation(
     store: str | Path | None,
     threads: int,
     timeout_seconds: float | None,
+    oci_files: OciClientFiles | None = None,
 ) -> OciAnnotationResult:
     """Delegate one v2 annotation through its digest-pinned Docker image.
 
@@ -68,8 +72,8 @@ def run_oci_annotation(
 
     Notes:
         The managed profile and bundled kit are checked together before Docker
-        is launched. The function intentionally rejects credential-bearing
-        shared Store URLs until an external secret boundary is available.
+        is launched. A registered kit must explicitly include OCI artifact
+        support before invocation-only registry files may be passed through.
         Container cleanup is explicit so failures and cancellations do not
         leave an annotation process behind.
     """
@@ -95,13 +99,25 @@ def run_oci_annotation(
 
     manifest = load_kit_manifest("dbcan-cazyme")
     _validate_runtime(runtime, manifest)
+    if _has_oci_client_files(oci_files):
+        raise AnnotationError(
+            "the selected managed kit does not include OCI artifact support; "
+            "select an OCI-enabled kit after it is published"
+        )
     expected_resource_id = _resource_id_from_lock(resource, manifest)
     docker = shutil.which("docker")
     if docker is None:
         raise AnnotationError("Docker executable is not available on PATH")
     _ensure_image(docker, manifest, runtime.image)
 
-    store_mount, store_argument, network = _resolve_store(store)
+    resolved_oci_files = (
+        oci_files.validated(headless=True)
+        if oci_files is not None and _has_oci_client_files(oci_files)
+        else None
+    )
+    store_mount, store_argument, network = _resolve_store(
+        store, oci_files=resolved_oci_files
+    )
     stage = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
     staged_output = stage / output.name
     container_name = f"seqevi-annotate-oci-{uuid.uuid4().hex[:16]}"
@@ -115,6 +131,7 @@ def run_oci_annotation(
             store=store_argument,
             threads=threads,
             timeout_seconds=timeout_seconds,
+            oci_files=resolved_oci_files,
         )
         mounts = (
             _mount(fasta.resolve(), _CONTAINER_INPUT, readonly=True),
@@ -123,6 +140,7 @@ def run_oci_annotation(
         )
         if store_mount is not None:
             mounts += (_mount(store_mount, _CONTAINER_STORE, readonly=False),)
+        mounts += _registry_mounts(resolved_oci_files)
         create_args = (
             "create",
             "--name",
@@ -242,7 +260,9 @@ def _ensure_image(docker: str, manifest: KitManifest, image: str) -> None:
         )
 
 
-def _resolve_store(store: str | Path | None) -> tuple[Path | None, str, str]:
+def _resolve_store(
+    store: str | Path | None, *, oci_files: OciClientFiles | None = None
+) -> tuple[Path | None, str, str]:
     if store is None:
         raise AnnotationError(
             "a Store path or URL is required via --store or SEQEVI_STORE"
@@ -258,6 +278,10 @@ def _resolve_store(store: str | Path | None) -> tuple[Path | None, str, str]:
         return None, raw, "bridge"
     if "://" in raw:
         raise AnnotationError(f"unsupported Store URL scheme: {raw.split(':', 1)[0]}")
+    if _has_oci_client_files(oci_files):
+        raise AnnotationError(
+            "OCI registry files require an HTTP(S) shared Store, not a local Store"
+        )
     path = Path(raw).expanduser().resolve()
     try:
         path.mkdir(parents=True, exist_ok=True)
@@ -276,6 +300,7 @@ def _inner_command(
     store: str,
     threads: int,
     timeout_seconds: float | None,
+    oci_files: OciClientFiles | None,
 ) -> tuple[str, ...]:
     command = (
         "annotate",
@@ -297,6 +322,11 @@ def _inner_command(
     )
     if timeout_seconds is not None:
         command += ("--timeout-seconds", str(timeout_seconds))
+    if oci_files is not None:
+        if oci_files.registry_config is not None:
+            command += ("--oci-registry-config", _CONTAINER_REGISTRY_CONFIG)
+        if oci_files.ca_file is not None:
+            command += ("--oci-registry-ca-file", _CONTAINER_REGISTRY_CA_FILE)
     return command
 
 
@@ -425,6 +455,33 @@ def _publish_without_overwrite(staged: Path, output: Path) -> None:
 def _mount(source: Path, target: str, *, readonly: bool) -> str:
     suffix = ",readonly" if readonly else ""
     return f"type=bind,source={source},target={target}{suffix}"
+
+
+def _registry_mounts(oci_files: OciClientFiles | None) -> tuple[str, ...]:
+    """Return the only credential/trust mounts exposed to a managed run."""
+
+    if oci_files is None:
+        return ()
+    mounts: tuple[str, ...] = ()
+    if oci_files.registry_config is not None:
+        mounts += (
+            _mount(
+                oci_files.registry_config,
+                _CONTAINER_REGISTRY_CONFIG,
+                readonly=True,
+            ),
+        )
+    if oci_files.ca_file is not None:
+        mounts += (
+            _mount(oci_files.ca_file, _CONTAINER_REGISTRY_CA_FILE, readonly=True),
+        )
+    return mounts
+
+
+def _has_oci_client_files(oci_files: OciClientFiles | None) -> bool:
+    return oci_files is not None and (
+        oci_files.registry_config is not None or oci_files.ca_file is not None
+    )
 
 
 def _json_result(stdout: str) -> dict[str, object]:

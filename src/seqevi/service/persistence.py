@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any, Iterator, Protocol
 
 from sqlalchemy import and_, create_engine, delete, func, select, text, tuple_, update
@@ -101,6 +102,8 @@ class ServicePersistence(Protocol):
         self,
         commits: Iterable[CommitModel],
         stored_artifacts: dict[str, StoredArtifact],
+        *,
+        deadline: float | None = None,
     ) -> tuple[CommitOutcome, ...]: ...
 
     def fetch_record(self, key: EvidenceKey) -> EvidenceRecord | None: ...
@@ -137,6 +140,8 @@ class ServicePersistence(Protocol):
         authority: ClaimSessionAuthority,
         commits: Iterable[ClaimSessionFinalizeItem],
         stored_artifacts: dict[str, StoredArtifact],
+        *,
+        deadline: float | None = None,
     ) -> tuple[CommitOutcome, ...]: ...
 
     def claim_session_authority_is_live(
@@ -228,14 +233,21 @@ class PostgresEvidencePersistence:
             ) from error
 
     @contextmanager
-    def _transaction(self) -> Iterator[Connection]:
+    def _transaction(self, *, deadline: float | None = None) -> Iterator[Connection]:
         """Apply bounded PostgreSQL mutation deadlines and translate saturation."""
 
         try:
             with self.engine.begin() as connection:
+                timeout = self.transaction_timeout_seconds
+                if deadline is not None:
+                    timeout = min(timeout, deadline - monotonic())
+                    if timeout <= 0:
+                        raise StoreBackpressureError(
+                            "metadata deadline expired before transaction"
+                        )
                 connection.execute(
                     text("SELECT set_config('transaction_timeout', :value, true)"),
-                    {"value": f"{self.transaction_timeout_seconds:g}s"},
+                    {"value": f"{timeout:g}s"},
                 )
                 connection.execute(
                     text("SELECT set_config('lock_timeout', :value, true)"),
@@ -246,6 +258,10 @@ class PostgresEvidencePersistence:
                     {"value": f"{self.statement_timeout_seconds:g}s"},
                 )
                 yield connection
+                if deadline is not None and monotonic() >= deadline:
+                    raise StoreBackpressureError(
+                        "metadata deadline expired before commit"
+                    )
         except SQLAlchemyTimeoutError as error:
             raise StoreBackpressureError(
                 "shared Store database pool is saturated; retry the request"
@@ -847,11 +863,13 @@ class PostgresEvidencePersistence:
         authority: ClaimSessionAuthority,
         commits: Iterable[ClaimSessionFinalizeItem],
         stored_artifacts: dict[str, StoredArtifact],
+        *,
+        deadline: float | None = None,
     ) -> tuple[CommitOutcome, ...]:
         proposed = tuple(commits)
         keys = tuple(item.commit.key.to_domain() for item in proposed)
         outcomes: dict[EvidenceKey, CommitOutcome] = {}
-        with self._transaction() as connection:
+        with self._transaction(deadline=deadline) as connection:
             _lock_evidence_keys(connection, keys)
             locked_session = (
                 connection.execute(
@@ -933,12 +951,7 @@ class PostgresEvidencePersistence:
                     postgres_insert(artifacts)
                     .values(
                         [
-                            {
-                                "digest": artifact.digest,
-                                "media_type": artifact.media_type,
-                                "byte_size": artifact.byte_size,
-                                "relative_path": artifact.relative_path,
-                            }
+                            _artifact_values(artifact)
                             for artifact in stored_artifacts.values()
                         ]
                     )
@@ -954,11 +967,7 @@ class PostgresEvidencePersistence:
                 }
                 for digest, artifact in stored_artifacts.items():
                     row = persisted_artifacts[digest]
-                    if (row["media_type"], row["byte_size"], row["relative_path"]) != (
-                        artifact.media_type,
-                        artifact.byte_size,
-                        artifact.relative_path,
-                    ):
+                    if _artifact_from_row(row) != artifact:
                         raise StoreIntegrityError(
                             f"artifact metadata conflict: {digest}"
                         )
@@ -1058,6 +1067,8 @@ class PostgresEvidencePersistence:
         self,
         commits: Iterable[CommitModel],
         stored_artifacts: dict[str, StoredArtifact],
+        *,
+        deadline: float | None = None,
     ) -> tuple[CommitOutcome, ...]:
         proposed = tuple(commits)
         if len({commit.key.to_domain() for commit in proposed}) != len(proposed):
@@ -1066,7 +1077,7 @@ class PostgresEvidencePersistence:
             proposed, key=lambda item: _key_sort_value(item.key.to_domain())
         )
         outcomes: dict[EvidenceKey, CommitOutcome] = {}
-        with self._transaction() as connection:
+        with self._transaction(deadline=deadline) as connection:
             _lock_evidence_keys(
                 connection, (commit.key.to_domain() for commit in proposed)
             )
@@ -1130,12 +1141,33 @@ class PostgresEvidencePersistence:
             )
         if row is None:
             return None
-        return StoredArtifact(
-            digest=row["digest"],
-            media_type=row["media_type"],
-            byte_size=row["byte_size"],
-            relative_path=row["relative_path"],
-        )
+        return _artifact_from_row(row)
+
+
+def _artifact_values(artifact: StoredArtifact) -> dict[str, object]:
+    return {
+        "digest": artifact.digest,
+        "media_type": artifact.media_type,
+        "byte_size": artifact.byte_size,
+        "relative_path": artifact.relative_path,
+        "storage_kind": artifact.storage_kind,
+        "registry_id": artifact.registry_id,
+        "repository": artifact.repository,
+        "manifest_digest": artifact.manifest_digest,
+    }
+
+
+def _artifact_from_row(row: RowMapping) -> StoredArtifact:
+    return StoredArtifact(
+        digest=row["digest"],
+        media_type=row["media_type"],
+        byte_size=row["byte_size"],
+        relative_path=row["relative_path"],
+        storage_kind=row["storage_kind"],
+        registry_id=row["registry_id"],
+        repository=row["repository"],
+        manifest_digest=row["manifest_digest"],
+    )
 
 
 def _insert_sequence(connection: Connection, identity: SequenceIdentity) -> None:
@@ -1196,12 +1228,7 @@ def _verify_sequences(
 def _insert_artifact(connection: Connection, artifact: StoredArtifact) -> None:
     statement = (
         postgres_insert(artifacts)
-        .values(
-            digest=artifact.digest,
-            media_type=artifact.media_type,
-            byte_size=artifact.byte_size,
-            relative_path=artifact.relative_path,
-        )
+        .values(**_artifact_values(artifact))
         .on_conflict_do_nothing(index_elements=[artifacts.c.digest])
     )
     inserted = connection.execute(
@@ -1216,9 +1243,7 @@ def _insert_artifact(connection: Connection, artifact: StoredArtifact) -> None:
         .mappings()
         .one()
     )
-    persisted = (row["media_type"], row["byte_size"], row["relative_path"])
-    proposed = (artifact.media_type, artifact.byte_size, artifact.relative_path)
-    if persisted != proposed:
+    if _artifact_from_row(row) != artifact:
         raise StoreIntegrityError(f"artifact metadata conflict: {artifact.digest}")
 
 

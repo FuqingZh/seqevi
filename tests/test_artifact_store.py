@@ -32,6 +32,7 @@ def test_artifact_store_detects_corrupt_existing_bytes(tmp_path: Path) -> None:
     store = PosixArtifactStore(tmp_path / "artifacts")
     payload = write_artifact_file(tmp_path / "source.txt", b"expected", "text/plain")
     artifact = store.put(payload)
+    assert artifact.relative_path is not None
     artifact_path = store.root / artifact.relative_path
     artifact_path.write_bytes(b"corrupt")
 

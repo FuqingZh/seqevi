@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, contextmanager
-from time import perf_counter
+from time import monotonic, perf_counter
+from threading import Event
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Iterator
 from uuid import uuid4
@@ -23,10 +25,14 @@ from seqevi.errors import (
     EvidenceConflictError,
     StoreBackpressureError,
     StoreIntegrityError,
+    StoreError,
 )
-from seqevi.evidence import ClaimSessionAuthority, EvidenceKey
+from seqevi.evidence import ClaimSessionAuthority, EvidenceKey, StoredArtifact
 from seqevi.store.artifact import PosixArtifactStore
+from seqevi.store.oci import OciClientFiles, OciRegistry
 from seqevi.store.transport import (
+    ArtifactResolveRequest,
+    ArtifactResolveResponse,
     ArtifactReferenceModel,
     ArtifactUploadResponse,
     BusyEvidenceClaimModel,
@@ -56,6 +62,12 @@ from seqevi.store.transport import (
     LookupRequest,
     LookupResponse,
     SessionEvidenceClaimModel,
+    OciStorageReference,
+    PosixStorageReference,
+    StorageDiscoveryResponse,
+    OCI_CAPABILITY_HEADER,
+    OCI_CLIENT_CAPABILITY,
+    storage_reference,
 )
 
 from .config import ServiceSettings
@@ -76,6 +88,18 @@ def create_service_app(
 ) -> FastAPI:
     """Construct a bounded v1 Store API without annotation scheduling."""
 
+    registry_definition = settings.registry_definition()
+    registry: OciRegistry | None = None
+    closing = Event()
+    if registry_definition is not None:
+        registry = OciRegistry(
+            registry_definition,
+            executable=settings.oci_oras_executable,
+            files=OciClientFiles(
+                settings.oci_registry_config, settings.oci_registry_ca_file
+            ).validated(headless=True),
+        )
+        registry.preflight(deadline=monotonic() + 30.0, cancellation_signal=closing)
     database = persistence or PostgresEvidencePersistence.open(
         settings.database_url,
         pool_size=settings.database_pool_size,
@@ -85,7 +109,10 @@ def create_service_app(
         statement_timeout_seconds=settings.database_statement_timeout_seconds,
         transaction_timeout_seconds=settings.database_transaction_timeout_seconds,
     )
-    artifact_store = PosixArtifactStore(settings.artifacts_dir)
+    artifact_store = PosixArtifactStore(
+        settings.artifacts_dir,
+        maximum_concurrent_uploads=settings.maximum_concurrent_artifact_uploads,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -110,6 +137,7 @@ def create_service_app(
         try:
             yield
         finally:
+            closing.set()
             stopped.set()
             await sweeper
             database.close()
@@ -125,6 +153,18 @@ def create_service_app(
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
+        if (
+            registry is not None
+            and request.url.path not in {"/health", "/v1/storage/discovery"}
+            and request.headers.get(OCI_CAPABILITY_HEADER) != OCI_CLIENT_CAPABILITY
+        ):
+            return JSONResponse(
+                status_code=status.HTTP_426_UPGRADE_REQUIRED,
+                content={
+                    "detail": "OCI Store requires a client supporting oci-artifacts-v1; upgrade before annotation"
+                },
+                headers={"Upgrade": OCI_CLIENT_CAPABILITY},
+            )
         operation = _claim_operation(request.url.path)
         if operation is not None:
             request.state.seqevi_claim_request_id = uuid4().hex
@@ -182,10 +222,79 @@ def create_service_app(
         )
 
     @app.get("/health", response_model=HealthResponse)
-    def health() -> HealthResponse:
+    async def health() -> HealthResponse:
         return HealthResponse(
             maximum_batch_size=settings.maximum_batch_size,
             maximum_artifact_bytes=settings.maximum_artifact_bytes,
+        )
+
+    @app.get("/v1/storage/discovery", response_model=StorageDiscoveryResponse)
+    def storage_discovery() -> StorageDiscoveryResponse:
+        return StorageDiscoveryResponse(
+            artifact_backend=settings.artifact_backend,
+            minimum_client_capability=(
+                OCI_CLIENT_CAPABILITY if registry is not None else None
+            ),
+            registry=registry_definition,
+        )
+
+    @app.post("/v1/artifacts/resolve", response_model=ArtifactResolveResponse)
+    def resolve_artifact(request: ArtifactResolveRequest) -> ArtifactResolveResponse:
+        try:
+            artifact = database.artifact_metadata(request.digest)
+        except StoreBackpressureError as error:
+            raise _backpressure_error(error) from error
+        return ArtifactResolveResponse(
+            artifact=None
+            if artifact is None
+            else ArtifactReferenceModel(
+                digest=artifact.digest,
+                media_type=artifact.media_type,
+                byte_size=artifact.byte_size,
+                storage_reference=storage_reference(artifact),
+            )
+        )
+
+    def retain_artifact(
+        reference: ArtifactReferenceModel, deadline: float
+    ) -> StoredArtifact:
+        if reference.byte_size > settings.maximum_artifact_bytes:
+            raise StoreIntegrityError("artifact exceeds configured size limit")
+        if registry is None:
+            if reference.storage_reference is not None:
+                raise StoreIntegrityError(
+                    "non-OCI Store does not accept storage references"
+                )
+            return artifact_store.describe_existing(
+                digest=reference.digest,
+                media_type=reference.media_type,
+                byte_size=reference.byte_size,
+            )
+        if monotonic() >= deadline or closing.is_set():
+            raise StoreError(
+                "OCI metadata verification deadline expired or Store closed"
+            )
+        location = reference.storage_reference
+        if location is None:
+            raise StoreIntegrityError("OCI finalization requires a storage reference")
+        existing = database.artifact_metadata(reference.digest)
+        if existing is not None:
+            if (
+                existing.media_type != reference.media_type
+                or existing.byte_size != reference.byte_size
+                or storage_reference(existing) != location
+            ):
+                raise StoreIntegrityError(
+                    "registered artifact metadata or storage conflict"
+                )
+            if isinstance(location, PosixStorageReference):
+                return artifact_store.describe_registered(existing)
+        if not isinstance(location, OciStorageReference):
+            raise StoreIntegrityError(
+                "new OCI-mode artifacts must use Registry storage"
+            )
+        return registry.verify(
+            reference, location, deadline=deadline, cancellation_signal=closing
         )
 
     @app.get(
@@ -351,6 +460,7 @@ def create_service_app(
         http_request.state.seqevi_claim_batch_size = len(request.commits)
         _check_batch_size(len(request.commits), min(settings.maximum_batch_size, 1000))
         stored = {}
+        deadline = monotonic() + 30.0
         references: dict[str, ArtifactReferenceModel] = {}
         try:
             for item in request.commits:
@@ -369,14 +479,18 @@ def create_service_app(
                             f"artifact reference conflict: {reference.digest}"
                         )
                     if reference.digest not in stored:
-                        stored[reference.digest] = artifact_store.describe_existing(
-                            digest=reference.digest,
-                            media_type=reference.media_type,
-                            byte_size=reference.byte_size,
-                        )
-            outcomes = database.finalize_claim_session(
-                _request_authority(request), request.commits, stored
-            )
+                        stored[reference.digest] = retain_artifact(reference, deadline)
+            if registry is None:
+                outcomes = database.finalize_claim_session(
+                    _request_authority(request), request.commits, stored
+                )
+            else:
+                outcomes = database.finalize_claim_session(
+                    _request_authority(request),
+                    request.commits,
+                    stored,
+                    deadline=deadline,
+                )
         except EvidenceClaimLostError as error:
             raise HTTPException(
                 status.HTTP_412_PRECONDITION_FAILED, str(error)
@@ -389,6 +503,10 @@ def create_service_app(
             ) from error
         except StoreBackpressureError as error:
             raise _backpressure_error(error) from error
+        except StoreError as error:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, str(error)
+            ) from error
         return ClaimSessionFinalizeResponse(outcomes=list(outcomes))
 
     @app.post("/v1/evidence/lookup", response_model=LookupResponse)
@@ -445,6 +563,57 @@ def create_service_app(
         media_type: Annotated[str, Header(alias="X-Artifact-Media-Type")],
         byte_size: Annotated[int, Header(alias="X-Artifact-Byte-Size", ge=0)],
     ) -> ArtifactUploadResponse:
+        started = perf_counter()
+        supplied_id = request.headers.get("X-Request-ID", "")
+        request_id = (
+            supplied_id if re.fullmatch(r"[0-9a-f]{32}", supplied_id) else uuid4().hex
+        )
+        outcome = "error"
+        error_type: str | None = None
+        status_code = 500
+        try:
+            result = await store_uploaded_artifact(
+                digest, request, media_type, byte_size
+            )
+            outcome = result.status
+            status_code = 200
+            return result
+        except HTTPException as error:
+            status_code = error.status_code
+            error_type = type(error.__cause__ or error).__name__
+            raise
+        except BaseException as error:
+            error_type = type(error).__name__
+            raise
+        finally:
+            _CLAIM_LOGGER.info(
+                json.dumps(
+                    {
+                        "event": "seqevi.artifact_request",
+                        "operation": "upload",
+                        "phase": "staging",
+                        "request_id": request_id,
+                        "digest": digest
+                        if re.fullmatch(r"[0-9a-f]{64}", digest)
+                        else None,
+                        "byte_size": byte_size,
+                        "duration_ms": round((perf_counter() - started) * 1000, 3),
+                        "outcome": outcome,
+                        "status_code": status_code,
+                        "error_type": error_type,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+
+    async def store_uploaded_artifact(
+        digest: str, request: Request, media_type: str, byte_size: int
+    ) -> ArtifactUploadResponse:
+        if registry is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "OCI mode requires direct Registry staging"
+            )
         if byte_size > settings.maximum_artifact_bytes:
             raise HTTPException(
                 status.HTTP_413_CONTENT_TOO_LARGE,
@@ -477,6 +646,11 @@ def create_service_app(
             raise _backpressure_error(error) from error
         if artifact is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact is not registered")
+        if artifact.storage_kind != "posix":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "resolve OCI artifacts and download from the Registry",
+            )
         return StreamingResponse(
             artifact_store.iter_bytes(digest),
             media_type=artifact.media_type,
@@ -490,6 +664,7 @@ def create_service_app(
     def commit(request: CommitRequest) -> CommitResponse:
         _check_batch_size(len(request.commits), settings.maximum_batch_size)
         stored = {}
+        deadline = monotonic() + 30.0
         references: dict[str, ArtifactReferenceModel] = {}
         try:
             for commit_model in request.commits:
@@ -509,18 +684,23 @@ def create_service_app(
                         )
                     if reference.digest in stored:
                         continue
-                    stored[reference.digest] = artifact_store.describe_existing(
-                        digest=reference.digest,
-                        media_type=reference.media_type,
-                        byte_size=reference.byte_size,
-                    )
-            outcomes = database.commit_many(request.commits, stored)
+                    stored[reference.digest] = retain_artifact(reference, deadline)
+            if registry is None:
+                outcomes = database.commit_many(request.commits, stored)
+            else:
+                outcomes = database.commit_many(
+                    request.commits, stored, deadline=deadline
+                )
         except StoreBackpressureError as error:
             raise _backpressure_error(error) from error
         except EvidenceConflictError as error:
             raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
         except (StoreIntegrityError, ValueError) as error:
             raise HTTPException(422, str(error)) from error
+        except StoreError as error:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, str(error)
+            ) from error
         return CommitResponse(outcomes=list(outcomes))
 
     return app

@@ -73,6 +73,12 @@ def test_public_annotate_does_not_export_progress_callback() -> None:
     assert "progress_sink" not in inspect.signature(seqevi.annotate).parameters
 
 
+def test_public_annotate_exposes_invocation_only_oci_client_files() -> None:
+    parameters = inspect.signature(seqevi.annotate).parameters
+    assert "oci_registry_config" in parameters
+    assert "oci_registry_ca_file" in parameters
+
+
 def test_public_annotate_rejects_existing_result_without_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -132,7 +138,9 @@ def test_application_progress_finalizes_across_store_close_and_result_scan(
         trace.append(event.phase.value)
 
     monkeypatch.setattr(
-        seqevi.api, "open_evidence_store", lambda _value: TracedStoreContext()
+        seqevi.api,
+        "open_evidence_store",
+        lambda _value, **_kwargs: TracedStoreContext(),
     )
     monkeypatch.setattr(seqevi.api, "_scan_annotations", traced_scan)
 
@@ -157,6 +165,59 @@ def test_application_progress_finalizes_across_store_close_and_result_scan(
     assert trace.index(ProgressPhase.FINALIZATION.value) < trace.index("store_close")
     assert trace.index("store_close") < trace.index("result_scan")
     assert trace.index("result_scan") < trace.index(ProgressPhase.COMPLETED.value)
+    invocation.relation.close()
+
+
+def test_native_shared_store_receives_invocation_only_oci_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fasta = tmp_path / "proteins.fasta"
+    fasta.write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+    executable = write_fixture_tool(tmp_path / "fixture-tool")
+    database = write_fixture_database(tmp_path / "database")
+    local_store = LocalStore.open(tmp_path / "store")
+    marker = object()
+    observed: list[object] = []
+
+    monkeypatch.setattr(
+        seqevi.api, "_resolve_oci_client_files", lambda **_kwargs: marker
+    )
+    monkeypatch.setattr(
+        seqevi.api,
+        "create_adapter",
+        lambda configuration: FixtureAdapter(
+            executable=configuration.executable,
+            database=configuration.database,
+        ),
+    )
+
+    class StoreContext:
+        def __enter__(self) -> LocalStore:
+            return local_store.__enter__()
+
+        def __exit__(self, *error: object) -> None:
+            local_store.__exit__(*error)
+
+    def open_shared_store(_store: object, *, oci_files: object) -> StoreContext:
+        observed.append(oci_files)
+        return StoreContext()
+
+    monkeypatch.setattr(seqevi.api, "open_evidence_store", open_shared_store)
+
+    invocation = seqevi.api._run_annotation_application(
+        fasta=fasta,
+        output=tmp_path / "annotations.duckdb",
+        profile=None,
+        config=None,
+        adapter="interpro-pfam",
+        executable=executable,
+        resource=database,
+        store="https://store.example.test",
+        threads=1,
+        timeout_seconds=None,
+    )
+
+    assert observed == [marker]
     invocation.relation.close()
 
 

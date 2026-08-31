@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 
 import seqevi.cli
 from seqevi.cli import app
+from seqevi.errors import StoreError
 
 from .support import FixtureAdapter, write_fixture_database, write_fixture_tool
 
@@ -440,6 +441,41 @@ def test_annotate_cli_json_reports_typed_error(
     assert result.exit_code == 1
     assert payload["status"] == "error"
     assert payload["error_type"] == "AnnotationError"
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_annotate_cli_displays_upload_summary_without_raw_exception_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, json_output: bool
+) -> None:
+    summary = (
+        "ClaimSession artifact upload failed: phase=staging cause=ReadTimeout<-OSError"
+    )
+    (tmp_path / "input").write_text(">protein\nMPEPTIDE\n", encoding="utf-8")
+
+    def fail(**_kwargs: object) -> NoReturn:
+        try:
+            raise OSError("secret://password@host")
+        except OSError as cause:
+            raise StoreError(summary) from cause
+
+    monkeypatch.setattr(seqevi.cli, "_run_annotation_application", fail)
+    result = runner.invoke(
+        app,
+        [
+            "annotate",
+            "--no-progress",
+            "--fasta",
+            str(tmp_path / "input"),
+            "--output",
+            str(tmp_path / "output.duckdb"),
+            *(["--json"] if json_output else []),
+        ],
+    )
+    assert result.exit_code == 1
+    assert summary in result.stderr
+    assert "secret" not in result.stderr and "password" not in result.stderr
+    if json_output:
+        assert json.loads(result.stderr)["error"] == summary
 
 
 def test_annotate_cli_stops_progress_after_untyped_exception(

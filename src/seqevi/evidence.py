@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .hashing import sha256_file
 from .sequence import SequenceIdentity
@@ -221,12 +221,34 @@ class ArtifactFile:
 
 @dataclass(frozen=True, slots=True)
 class StoredArtifact:
-    """Metadata for one immutable content-addressed artifact."""
+    """Raw content identity with one selected storage location.
+
+    Notes:
+        A manifest digest locates retained storage; it never replaces the raw
+        digest in evidence. Local Stores construct only the POSIX variant.
+    """
 
     digest: str
     media_type: str
     byte_size: int
-    relative_path: str
+    relative_path: str | None
+    storage_kind: Literal["posix", "oci"] = "posix"
+    registry_id: str | None = None
+    repository: str | None = None
+    manifest_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        oci_fields = (self.registry_id, self.repository, self.manifest_digest)
+        if self.storage_kind == "posix":
+            if not self.relative_path or any(value is not None for value in oci_fields):
+                raise ValueError("POSIX artifact requires only a relative path")
+        elif self.storage_kind == "oci":
+            if self.relative_path is not None or not all(oci_fields):
+                raise ValueError("OCI artifact requires only a Registry reference")
+            if not _SHA256_PATTERN.fullmatch(self.manifest_digest or ""):
+                raise ValueError("OCI artifact manifest digest must be SHA-256")
+        else:
+            raise ValueError("unsupported artifact storage kind")
 
 
 @dataclass(frozen=True, slots=True)

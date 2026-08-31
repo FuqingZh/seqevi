@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-08-27
+> Last updated: 2026-08-31
 
 This index is the navigation authority for SeqEvi documentation. It identifies
 the current system description, current contracts, active work, incomplete
@@ -18,7 +18,7 @@ documents or turn plans and reviews into runtime authority.
 6. [Validation strategy v1.4](testing/20260825-v1.4-validation-strategy.md)
 
 Operators should additionally read the
-[current Store-maintenance runbook](operations/20260818-v1.2-claim-session-store-maintenance.md).
+[current Store-maintenance runbook](operations/20260831-v1.3-oci-store-maintenance.md).
 
 ## Current Authority
 
@@ -30,7 +30,7 @@ Operators should additionally read the
 | DuckDB result | [result consumption v1.1](architecture/20260804-v1.1-result-consumption-contract.md) |
 | host execution profiles | [profile v1](architecture/20260724-v1.0-execution-profile-contract.md) |
 | managed OCI profiles | [profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
-| local/shared Store and deployment | [storage v1.6](architecture/20260814-v1.6-storage-deployment-architecture.md) |
+| local/shared Store and deployment | [storage v1.8](architecture/20260831-v1.8-storage-deployment-architecture.md) |
 | managed dbCAN distribution | [managed distribution v1.2](architecture/20260806-v1.2-managed-adapter-distribution-architecture.md) |
 | progress | [progress v1.1](architecture/20260824-v1.1-progress-observability-contract.md) |
 | validation | [validation strategy v1.4](testing/20260825-v1.4-validation-strategy.md) |
@@ -58,10 +58,16 @@ The bundled managed dbCAN kit intentionally retains its producer SeqEvi 0.3.1
 image and digest. Host 0.3.5 validates that exact kit; this is not an implicit
 upgrade.
 
+The unreleased R2 working tree additionally supports explicit native OCI-backed
+shared artifacts and acknowledged schema 0005. This is not a published 0.3.5
+feature or a production cutover. The existing managed kit remains unchanged;
+candidate-image build/verification and new-kit publication are separate gates.
+
 ## Active Work
 
 | Work | Status | Authority |
 | --- | --- | --- |
+| artifact upload/finalization boundary | R2 close/drain and relative-path review corrections locally verified: final canonical gate 662 passed, zero skips, including SQLite, PostgreSQL and native 512 MiB OCI integration. Harbor-based `20260831-closefix2` local candidate passes runtime, source-hash and mount checks; Mako remains 1.4.1. No production deployment, migration, or SeqEvi publication | [implementation plan](implementation-plan/20260829-v1.0-artifact-upload-finalization-boundary-implementation-plan.md), [qualification](benchmarks/20260831-v1.0-native-oci-qualification.md), [integration specification](implementation-plan/20260831-v1.0-native-oci-integration-specification.md) |
 | 0.3.5 tree-review remediation | Unit 0 was completed by the initial PR #71 delivery plus a follow-up closeout reconciling the remaining README publication wording. The plan remains active for later units, which are separately pending and unauthorized | [corrected review](architecture/20260825-v1.0-seqevi-0.3.5-tree-review.md), [implementation plan](implementation-plan/20260825-v1.0-tree-review-remediation-implementation-plan.md) |
 | InterPro target-Store | v2 identity/exact-key refresh remains next before sanity | [successor plan](implementation-plan/20260820-v1.0-interpro-target-store-successor-implementation-plan.md) |
 | global cache seeding | eggNOG and bounded dbCAN lanes have recorded closure; global expansion remains incomplete | [master plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
@@ -81,6 +87,8 @@ upgrade.
 
 Relevant evidence:
 
+- [Native zot/ORAS Unit 0 qualification and its explicit runtime limits](benchmarks/20260831-v1.0-native-oci-qualification.md)
+- [Historical OCI qualification: Distribution v3.1.1 no-go under the now-withdrawn per-chunk durability gate](benchmarks/20260830-v1.0-oci-registry-qualification.md)
 - [managed dbCAN public-release gate](benchmarks/20260806-v1.4-dbcan-public-release-gate.md)
 - [dbCAN target-Store closeout](benchmarks/20260819-v1.0-dbcan-target-store-closeout.md)
 - [eggNOG target-Store closeout](benchmarks/20260818-v1.0-eggnog-target-store-closeout.md)
@@ -89,7 +97,7 @@ Relevant evidence:
 
 ## Operations
 
-- [ClaimSession Store maintenance v1.2](operations/20260818-v1.2-claim-session-store-maintenance.md)
+- [OCI Store maintenance v1.3](operations/20260831-v1.3-oci-store-maintenance.md)
 - [private-cluster ingress](operations/20260729-v0.1.0-private-cluster-ingress-runbook.md)
 - [loopback service](operations/20260727-v0.1.0-loopback-service-runbook.md)
 

@@ -22,9 +22,12 @@ RUN wheel_path="$(find /tmp/seqevi-wheel -maxdepth 1 -name "seqevi-${VERSION}-*.
 
 COPY inputs.json fetch_inputs.py /tmp/inputs/
 RUN python /tmp/inputs/fetch_inputs.py /tmp/inputs/inputs.json /tmp/downloads \
-    && mkdir -p /opt/diamond /usr/share/seqevi/licenses /usr/share/seqevi/compliance/sources \
+    && mkdir -p /opt/diamond /opt/oras /usr/share/seqevi/licenses /usr/share/seqevi/compliance/sources \
     && tar -xzf /tmp/downloads/diamond-binary -C /opt/diamond \
     && install -m 0755 /opt/diamond/diamond /usr/local/bin/diamond \
+    && tar -xzf /tmp/downloads/oras-binary -C /opt/oras oras LICENSE \
+    && install -m 0755 /opt/oras/oras /usr/local/bin/oras \
+    && install -m 0644 /opt/oras/LICENSE /usr/share/seqevi/licenses/ORAS-Apache-2.0.txt \
     && install -m 0644 /tmp/downloads/dbcan-license /usr/share/seqevi/licenses/dbCAN-GPL-3.0.txt \
     && install -m 0644 /tmp/downloads/diamond-license /usr/share/seqevi/licenses/DIAMOND-GPL-3.0.txt \
     && install -m 0644 /tmp/downloads/dbcan-source /usr/share/seqevi/compliance/sources/dbcan-source \
@@ -52,6 +55,7 @@ ENV PATH=/opt/venv/bin:/opt/dbcan-venv/bin:/usr/local/bin:${PATH} \
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /opt/dbcan-venv /opt/dbcan-venv
 COPY --from=builder /usr/local/bin/diamond /usr/local/bin/diamond
+COPY --from=builder /usr/local/bin/oras /usr/local/bin/oras
 COPY --from=builder /usr/share/seqevi /usr/share/seqevi
 COPY --from=builder /tmp/seqevi-python-compliance /usr/share/seqevi/licenses/python/seqevi-environment
 COPY --from=builder /tmp/dbcan-python-compliance /usr/share/seqevi/licenses/python/dbcan-environment
@@ -63,6 +67,7 @@ RUN install -m 0644 /usr/local/lib/python3.13/LICENSE.txt \
 RUN install -d -m 1777 /work /tmp \
     && /opt/venv/bin/seqevi --version \
     && /opt/dbcan-venv/bin/run_dbcan version | grep -F 5.2.9 \
+    && oras version | grep -F 'Version:        1.3.4' \
     && diamond version \
     && ! find / -xdev -type f \( -name CAZy.dmnd -o -name dbCAN.hmm -o -name dbCAN-sub.hmm -o -name fam-substrate-mapping.tsv \) -print -quit | grep .
 
