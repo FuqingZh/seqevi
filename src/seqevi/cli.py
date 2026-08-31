@@ -1024,6 +1024,7 @@ def store_maintenance_downgrade_command(
 
         from .store.migration import (
             MaintenanceAcknowledgement,
+            _maintenance_downgrade_target,
             maintenance_downgrade_database,
         )
 
@@ -1048,7 +1049,10 @@ def store_maintenance_downgrade_command(
     except Exception as error:
         typer.echo(f"Error: {error}", err=True)
         raise typer.Exit(code=1) from error
-    typer.echo("Store maintenance downgrade completed at 0003_evidence_claim_leases")
+    typer.echo(
+        "Store maintenance downgrade completed at "
+        f"{_maintenance_downgrade_target(acknowledge_revision)}"
+    )
 
 
 def main() -> None:

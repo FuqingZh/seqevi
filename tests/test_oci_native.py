@@ -32,6 +32,7 @@ from seqevi.evidence import (
 )
 from seqevi.service import ServiceSettings, create_service_app
 from seqevi.service.persistence import PostgresEvidencePersistence
+from seqevi.sequence import identify_protein_sequence
 from seqevi.store import HttpEvidenceStore
 from seqevi.store import client as client_module
 from seqevi.store.oci import OciRegistryError, OciRegistry, manifest_digest
@@ -300,3 +301,73 @@ def test_native_postgres_claim_finalize_and_fetch(
             assert registered is not None and registered.storage_kind == "oci"
             assert registered.digest == commit.raw_artifact.digest
             assert registered.manifest_digest != registered.digest
+
+
+@pytest.mark.requires_postgres
+@pytest.mark.timeout(120)
+def test_native_postgres_finalizes_representative_shared_artifact_batch(
+    native_registry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _storage_root, configured = native_registry
+    auth_file = root / "representative-anonymous.json"
+    auth_file.write_text('{"auths":{}}')
+    monkeypatch.setattr(
+        client_module, "OciRegistry", partial(OciRegistry, executable=ORAS_PATH)
+    )
+    template = _hit_commit(root / "representative-claim-sources")
+    commits = tuple(
+        replace(
+            template,
+            identity=(identity := identify_protein_sequence("M" + "A" * (index + 1))),
+            key=replace(template.key, sequence_id=identity.sequence_id),
+        )
+        for index in range(1000)
+    )
+    with _isolated_postgres_url() as database_url:
+        persistence = PostgresEvidencePersistence.open(database_url)
+        settings = ServiceSettings(
+            database_url=database_url,
+            artifacts_dir=root / "representative-legacy-artifacts",
+            artifact_backend="oci-registry",
+            oci_registry_id=configured.id,
+            oci_registry_endpoint=configured.endpoint,
+            oci_registry_repository=configured.repository,
+            oci_oras_executable=ORAS_PATH,
+            oci_registry_config=auth_file,
+        )
+        app = create_service_app(settings, persistence=persistence)
+        with (
+            TestClient(app) as service,
+            HttpEvidenceStore(
+                "http://testserver",
+                _client=cast(httpx.Client, service),
+                _async_transport=httpx.ASGITransport(app=app),
+            ) as store,
+        ):
+            with store.claim_session() as session:
+                decisions = session.acquire_many(
+                    EvidenceQuery(commit.identity, commit.key) for commit in commits
+                )
+                assert all(
+                    decision.disposition is ClaimDisposition.ACQUIRED
+                    for decision in decisions
+                )
+                started = time.monotonic()
+                outcomes = session.finalize_many(commits)
+                elapsed = time.monotonic() - started
+            assert outcomes == (CommitOutcome.CREATED,) * 1000
+            assert elapsed < 30.0
+            with persistence.engine.connect() as connection:
+                assert (
+                    connection.exec_driver_sql(
+                        "SELECT count(*) FROM evidence"
+                    ).scalar_one()
+                    == 1000
+                )
+                assert (
+                    connection.exec_driver_sql(
+                        "SELECT count(*) FROM artifact"
+                    ).scalar_one()
+                    == 2
+                )

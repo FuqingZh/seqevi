@@ -166,6 +166,7 @@ class _Registry:
         self.files = files
         self.preflight_calls = 0
         self.verify_calls = 0
+        self.verify_deadlines: list[float] = []
         type(self).instances.append(self)
 
     def preflight(self, *, deadline: float, cancellation_signal: object) -> None:
@@ -184,6 +185,7 @@ class _Registry:
         assert deadline > 0
         assert hasattr(cancellation_signal, "is_set")
         self.verify_calls += 1
+        self.verify_deadlines.append(deadline)
         if self.verify_error is not None:
             raise self.verify_error
         return StoredArtifact(
@@ -407,6 +409,78 @@ def test_oci_finalize_verifies_before_database_finalization(
     assert persistence.finalize_calls == 0
     assert len(_Registry.instances) == 1
     assert _Registry.instances[0].verify_calls == 1
+
+
+def test_oci_finalize_deduplicates_batch_artifacts_at_representative_scale(
+    oci_service,
+) -> None:
+    app, persistence = oci_service
+    template = _commit_model()
+    raw = ArtifactReferenceModel(
+        digest="b" * 64,
+        media_type="text/plain",
+        byte_size=7,
+        storage_reference=OciStorageReference(
+            registry_id="team-cache",
+            repository="seqevi/evidence",
+            manifest_digest="c" * 64,
+        ),
+    )
+    normalized = ArtifactReferenceModel(
+        digest="e" * 64,
+        media_type="text/plain",
+        byte_size=11,
+        storage_reference=OciStorageReference(
+            registry_id="team-cache",
+            repository="seqevi/evidence",
+            manifest_digest="f" * 64,
+        ),
+    )
+    commits = []
+    for index in range(1000):
+        identity = identify_protein_sequence("M" + "A" * (index + 1))
+        key = EvidenceKey.from_parameters(
+            sequence_id=identity.sequence_id,
+            adapter_contract_version="fixture/1",
+            tool_runtime_digest="sha256:" + "a" * 64,
+            resource_id="fixture/1",
+            semantic_parameters={"threshold": 0.01},
+        )
+        commits.append(
+            ClaimSessionFinalizeItem(
+                commit=template.model_copy(
+                    update={
+                        "identity": SequenceModel.from_domain(identity),
+                        "key": EvidenceKeyModel.from_domain(key),
+                        "status": EvidenceStatus.HIT,
+                        "normalized_artifact": normalized,
+                        "raw_artifact": raw,
+                    }
+                ),
+                claim_generation=1,
+            )
+        )
+    request = ClaimSessionFinalizeRequest(
+        session_id="session",
+        owner_token="owner",
+        generation=1,
+        finalize_request_id="finalize-representative-batch",
+        commits=commits,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/internal/claim-sessions/finalize",
+            json=request.model_dump(mode="json"),
+            headers=_oci_headers(),
+        )
+
+    assert response.status_code == 200
+    assert persistence.finalize_calls == 1
+    assert len(_Registry.instances) == 1
+    registry = _Registry.instances[0]
+    assert registry.verify_calls == 2
+    assert len(set(registry.verify_deadlines)) == 1
 
 
 def test_oci_direct_put_is_rejected_even_for_capable_client(oci_service) -> None:

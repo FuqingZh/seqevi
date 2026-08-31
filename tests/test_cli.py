@@ -101,6 +101,43 @@ def test_maintenance_commands_normalize_postgresql_url_for_psycopg3(
     assert urls == ["postgresql+psycopg://seqevi@postgres/seqevi"]
 
 
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("0005_oci_artifact_storage", "0004_claim_sessions"),
+        ("0004_claim_sessions", "0003_evidence_claim_leases"),
+    ],
+)
+def test_maintenance_downgrade_reports_actual_one_step_target(
+    monkeypatch: pytest.MonkeyPatch, source: str, target: str
+) -> None:
+    class FakeEngine:
+        def dispose(self) -> None:
+            pass
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", lambda _url: FakeEngine())
+    monkeypatch.setattr(
+        "seqevi.store.migration.maintenance_downgrade_database",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "store-maintenance-downgrade",
+            "--database-url",
+            "sqlite+pysqlite:///:memory:",
+            "--acknowledge-database",
+            "sqlite:fixture",
+            "--acknowledge-revision",
+            source,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip() == f"Store maintenance downgrade completed at {target}"
+
+
 def test_annotate_help_uses_concrete_external_input_names() -> None:
     result = runner.invoke(
         app,
