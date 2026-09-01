@@ -17,20 +17,20 @@ DATABASE_FILES = (
 
 
 def test_image_version_declarations_match_project_version() -> None:
-    project_version = tomllib.loads(
-        (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    )["project"]["version"]
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     dockerfile = (IMAGE_ROOT / "Dockerfile").read_text(encoding="utf-8")
     notice = (IMAGE_ROOT / "NOTICE").read_text(encoding="utf-8")
     correspondence = (IMAGE_ROOT / "SOURCE-CORRESPONDENCE.md").read_text(
         encoding="utf-8"
     )
 
-    version_declaration = re.search(r"(?m)^ARG VERSION=([^\s]+)$", dockerfile)
-    assert version_declaration is not None
-    assert version_declaration.group(1) == project_version
-    assert f"SeqEvi {project_version} (MIT)" in notice
-    assert f"| SeqEvi {project_version} |" in correspondence
+    assert "version" in project["project"]["dynamic"]
+    assert project["tool"]["pdm"]["version"]["source"] == "scm"
+    assert re.search(r"(?m)^ARG VERSION$", dockerfile)
+    assert "SeqEvi (MIT)" in notice
+    assert "| SeqEvi | versioned wheel" in correspondence
+    assert "SeqEvi 0.4.0" not in notice
+    assert "SeqEvi 0.4.0" not in correspondence
 
 
 def test_runtime_inputs_are_exact_and_hash_locked() -> None:
@@ -174,4 +174,6 @@ def test_publish_workflow_uses_ghcr_attestations_without_latest() -> None:
     assert "database_url" not in workflow.casefold()
     assert "resource_url" not in workflow.casefold()
     assert "steps.project.outputs.version" in workflow
+    assert "steps.project.outputs.tag_version" in workflow
+    assert 'tag_version="${version//+/-}"' in workflow
     assert "seqevi-0.2.0" not in workflow

@@ -1,6 +1,6 @@
 [project]
 name = "seqevi"
-version = "0.4.0"
+dynamic = ["version"]
 description = "Content-addressed, reusable protein sequence annotation evidence."
 authors = [
     {name = "Fuqing Zhang", email = "fu.qing.zhang.work@gmail.com"},
@@ -62,10 +62,18 @@ dev = [
     "pytest-timeout>=2.4,<3",
     "pytest-xdist>=3.8,<4",
     "ruff>=0.15,<0.16",
+    "packaging<27,>=25",
+    "twine<7,>=6.2",
 ]
 
 [tool.pdm]
 distribution = true
+
+[tool.pdm.version]
+source = "scm"
+tag_filter = "v[0-9]*.[0-9]*.[0-9]*"
+tag_regex = "^v(?P<version>(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*))$"
+version_format = "scripts.version:format_version"
 
 [tool.pdm.scripts]
 format = "ruff format ."

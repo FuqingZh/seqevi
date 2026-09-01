@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from importlib.metadata import version
 from pathlib import Path
 from typing import NoReturn
 
@@ -27,7 +28,7 @@ def test_cli_reports_version() -> None:
     result = runner.invoke(app, ["--version"])
 
     assert result.exit_code == 0
-    assert result.stdout.strip() == "0.4.0"
+    assert result.stdout.strip() == version("seqevi")
 
 
 def test_cli_without_command_describes_current_surface() -> None:

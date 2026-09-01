@@ -2,7 +2,7 @@
 
 | Runtime component | Installed artifact | Corresponding source |
 | --- | --- | --- |
-| SeqEvi 0.4.0 | wheel built from the labeled image revision | `https://github.com/FuqingZh/seqevi/tree/<org.opencontainers.image.revision>` |
+| SeqEvi | versioned wheel built from the labeled image revision | `https://github.com/FuqingZh/seqevi/tree/<org.opencontainers.image.revision>` |
 | dbCAN 5.2.9 | PyPI wheel SHA-256 `daf39033e9921d116f46a374714f6095b71394eb6438035f1754354d7e20d8d2` | tag `v5.2.9`, commit `614c93f896939042ae5bd574b9c6b971e80803f6`; the verified source archive is bundled as `sources/dbcan-source` |
 | DIAMOND 2.1.15 | Linux archive SHA-256 `2c1507fbb32164e861857d606fddf4b92d481174e4015cc50682f51c7b2f978a` | tag `v2.1.15`, commit `5c6b545d2d6eb1b31a5d553f39b3cc65e0aec6ce`; the verified source archive is bundled as `sources/diamond-source` |
 | ORAS 1.3.4 | Linux/amd64 archive SHA-256 `f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454` | [release v1.3.4](https://github.com/oras-project/oras/releases/tag/v1.3.4); its Apache-2.0 license is bundled as `../licenses/ORAS-Apache-2.0.txt` |

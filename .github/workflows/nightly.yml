@@ -1,0 +1,71 @@
+name: Nightly package validation
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: main
+      - name: Require exact clean main with complete tags
+        id: source
+        run: |
+          git fetch --force --tags origin main:refs/remotes/origin/main
+          test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          mapfile -t release_tags < <(git tag --points-at HEAD | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || true)
+          test "${#release_tags[@]}" -le 1
+          if [ "${#release_tags[@]}" -eq 1 ]; then
+            echo "version=${release_tags[0]#v}" >> "${GITHUB_OUTPUT}"
+          fi
+      - uses: pdm-project/setup-pdm@544d7237314ee09c256785bd360f6b30add38b37 # v4
+        with:
+          version: 2.26.9
+          python-version: "3.13"
+          cache: true
+      - run: pdm install --frozen-lockfile -G dev -G server
+      - run: pdm run check
+      - run: pdm build
+      - name: Validate development identity and package metadata
+        run: |
+          if [ -n "${{ steps.source.outputs.version }}" ]; then
+            pdm run python scripts/release_contract.py artifacts \
+              --dist-dir dist --expected-version "${{ steps.source.outputs.version }}"
+          else
+            pdm run python scripts/release_contract.py artifacts \
+              --dist-dir dist --development-source "${{ steps.source.outputs.sha }}"
+          fi
+          pdm run python -m twine check dist/*
+      - name: Smoke-test wheel and source distribution
+        run: |
+          if [ -n "${{ steps.source.outputs.version }}" ]; then
+            version="${{ steps.source.outputs.version }}"
+          else
+            version="$(pdm run python scripts/release_contract.py artifacts \
+              --dist-dir dist --development-source "${{ steps.source.outputs.sha }}")"
+          fi
+          python -m venv "${RUNNER_TEMP}/seqevi-wheel"
+          "${RUNNER_TEMP}/seqevi-wheel/bin/pip" install dist/*.whl
+          "${RUNNER_TEMP}/seqevi-wheel/bin/pip" check
+          test "$("${RUNNER_TEMP}/seqevi-wheel/bin/seqevi" --version)" = "${version}"
+          python -m venv "${RUNNER_TEMP}/seqevi-sdist"
+          "${RUNNER_TEMP}/seqevi-sdist/bin/pip" install dist/*.tar.gz
+          "${RUNNER_TEMP}/seqevi-sdist/bin/pip" check
+          test "$("${RUNNER_TEMP}/seqevi-sdist/bin/seqevi" --version)" = "${version}"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: nightly-${{ steps.source.outputs.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

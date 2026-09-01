@@ -16,7 +16,9 @@ _LIGHTWEIGHT_DOC_PREFIXES = (
     "docs/implementation-plan/",
     "docs/tutorials/",
 )
-_PACKAGE_INPUT_FILES = frozenset({"LICENSE", "README.md", "pdm.lock", "pyproject.toml"})
+_PACKAGE_INPUT_FILES = frozenset(
+    {"LICENSE", "README.md", "pdm.lock", "pyproject.toml", "scripts/version.py"}
+)
 _PACKAGE_INPUT_PREFIXES = ("benchmarks/", "src/")
 _TEST_ONLY_FILES = frozenset({"AGENTS.md"})
 
