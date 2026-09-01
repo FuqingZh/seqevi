@@ -1,65 +1,87 @@
-name: Publish
+name: Validate tag and publish Python release
 
 on:
-  workflow_dispatch:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
+  release:
+    types: [published]
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  build-and-validate:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.release.draft == false && github.event.release.prerelease == false)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - uses: pdm-project/setup-pdm@v4
+          ref: ${{ github.event.release.tag_name || github.ref }}
+      - uses: pdm-project/setup-pdm@544d7237314ee09c256785bd360f6b30add38b37 # v4
         with:
           version: 2.26.9
           python-version: "3.13"
           cache: true
-      - run: pdm install --frozen-lockfile -G dev -G server
-      - run: pdm build
-      - name: Require an exact version tag for production
-        if: github.event_name == 'push'
+      - name: Validate immutable tag and event commit
+        id: release
+        env:
+          EVENT_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
         run: |
-          project_version="$(pdm show --version)"
-          test "${GITHUB_REF_NAME}" = "v${project_version}"
-      - uses: actions/upload-artifact@v6
+          [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$(git rev-parse "${RELEASE_TAG}^{commit}")" = "${EVENT_SHA}"
+          test "$(git rev-parse HEAD)" = "${EVENT_SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo "version=${RELEASE_TAG#v}" >> "${GITHUB_OUTPUT}"
+      - run: pdm install --frozen-lockfile -G dev -G server
+      - run: pdm run check
+      - run: pdm build
+      - name: Validate distribution identity and package metadata
+        env:
+          EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          test "$(python scripts/release_contract.py tag "v${EXPECTED_VERSION}")" = "${EXPECTED_VERSION}"
+          python scripts/release_contract.py artifacts \
+            --dist-dir dist --expected-version "${EXPECTED_VERSION}"
+          python -m twine check dist/*
+      - name: Smoke-test wheel and source distribution
+        env:
+          EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python -m venv "${RUNNER_TEMP}/seqevi-wheel"
+          "${RUNNER_TEMP}/seqevi-wheel/bin/pip" install dist/*.whl
+          "${RUNNER_TEMP}/seqevi-wheel/bin/pip" check
+          test "$("${RUNNER_TEMP}/seqevi-wheel/bin/seqevi" --version)" = "${EXPECTED_VERSION}"
+          python -m venv "${RUNNER_TEMP}/seqevi-sdist"
+          "${RUNNER_TEMP}/seqevi-sdist/bin/pip" install dist/*.tar.gz
+          "${RUNNER_TEMP}/seqevi-sdist/bin/pip" check
+          test "$("${RUNNER_TEMP}/seqevi-sdist/bin/seqevi" --version)" = "${EXPECTED_VERSION}"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: python-distributions
+          name: python-distributions-${{ github.sha }}
           path: dist/
           if-no-files-found: error
-
-  publish-testpypi:
-    if: github.event_name == 'workflow_dispatch'
-    needs: build
-    runs-on: ubuntu-latest
-    environment: testpypi
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v7
-        with:
-          name: python-distributions
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
+          retention-days: 14
 
   publish-pypi:
-    if: github.event_name == 'push'
-    needs: build
+    if: >-
+      github.event_name == 'release' &&
+      github.event.action == 'published' &&
+      github.event.release.draft == false &&
+      github.event.release.prerelease == false
+    needs: build-and-validate
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: python-distributions
+          name: python-distributions-${{ github.sha }}
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1

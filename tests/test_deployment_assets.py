@@ -23,13 +23,14 @@ def test_ci_image_migration_check_uses_installed_internal_revision() -> None:
 def test_publish_workflow_preserves_trusted_publisher_boundaries() -> None:
     workflow = (ROOT / ".github/workflows/publish.yml").read_text(encoding="utf-8")
 
-    assert "workflow_dispatch:" in workflow
-    assert "environment: testpypi" in workflow
+    assert "release:\n    types: [published]" in workflow
+    assert "workflow_dispatch:" not in workflow
+    assert "testpypi" not in workflow.casefold()
     assert "environment: pypi" in workflow
     assert "id-token: write" in workflow
-    assert "repository-url: https://test.pypi.org/legacy/" in workflow
-    assert "if: github.event_name == 'workflow_dispatch'" in workflow
-    assert 'test "${GITHUB_REF_NAME}" = "v${project_version}"' in workflow
+    assert "github.event.release.prerelease == false" in workflow
+    assert "python scripts/release_contract.py tag" in workflow
+    assert "python scripts/release_contract.py artifacts" in workflow
     assert "password:" not in workflow
     assert "api-token" not in workflow
 

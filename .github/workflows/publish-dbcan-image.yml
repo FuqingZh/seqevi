@@ -11,8 +11,16 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: pdm-project/setup-pdm@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Require exact clean source revision
+        run: |
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - uses: pdm-project/setup-pdm@544d7237314ee09c256785bd360f6b30add38b37 # v4
         with:
           version: 2.26.9
           python-version: "3.13"
@@ -26,9 +34,9 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/seqevi-wheel"
           cp dist/seqevi-${{ steps.project.outputs.version }}-*.whl "${RUNNER_TEMP}/seqevi-wheel/"
           cp LICENSE "${RUNNER_TEMP}/seqevi-wheel/LICENSE"
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
       - name: Build runtime for pre-publication probes
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: containers/dbcan
           file: containers/dbcan/Dockerfile
@@ -51,14 +59,14 @@ jobs:
           docker run --rm --entrypoint diamond seqevi-dbcan:release-candidate version | grep -F '2.1.15'
           docker run --rm --entrypoint sh seqevi-dbcan:release-candidate -c \
             '! find / -xdev -type f \( -name CAZy.dmnd -o -name dbCAN.hmm -o -name dbCAN-sub.hmm -o -name fam-substrate-mapping.tsv \) -print -quit | grep .'
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Publish revision tags, SBOM, and provenance
         id: push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: containers/dbcan
           file: containers/dbcan/Dockerfile
@@ -88,7 +96,7 @@ jobs:
           docker run --rm --entrypoint diamond "${reference}" version | grep -F '2.1.15'
           docker run --rm --entrypoint sh "${reference}" -c \
             '! find / -xdev -type f \( -name CAZy.dmnd -o -name dbCAN.hmm -o -name dbCAN-sub.hmm -o -name fam-substrate-mapping.tsv \) -print -quit | grep .'
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: dbcan-image-digest-${{ github.sha }}
           path: dbcan-image-digest.txt

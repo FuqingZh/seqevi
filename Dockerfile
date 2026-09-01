@@ -3,7 +3,9 @@ ARG PYTHON_IMAGE=python:3.13-slim
 FROM ${PYTHON_IMAGE} AS builder
 
 ARG PDM_VERSION=2.26.9
+ARG VERSION
 ENV PDM_CHECK_UPDATE=false \
+    PDM_BUILD_SCM_VERSION=${VERSION} \
     PDM_VENV_IN_PROJECT=true
 
 WORKDIR /opt/seqevi
@@ -11,6 +13,7 @@ WORKDIR /opt/seqevi
 RUN python -m pip install --no-cache-dir "pdm==${PDM_VERSION}"
 
 COPY pyproject.toml pdm.lock README.md LICENSE ./
+COPY scripts/__init__.py scripts/version.py ./scripts/
 COPY src ./src
 
 RUN pdm install --frozen-lockfile --prod -G server --no-editable \

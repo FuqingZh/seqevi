@@ -34,6 +34,30 @@ schemas and have accepted direct-runtime parity evidence. Shared Store,
 resource-lock, batching, and result-publication details are routed from the
 [current system architecture](docs/architecture/20260825-v1.0-current-system-architecture.md).
 
+## Release Channels
+
+SeqEvi treats repository CI, nightly packages, version tags, GitHub Releases,
+PyPI publication, and the dbCAN runtime image as distinct states:
+
+- pull requests and ordinary pushes run CI but do not publish;
+- an off-minute daily or manually dispatched nightly validates exact `main`
+  and retains SHA-named wheel/sdist artifacts for 14 days without publishing;
+- an immutable canonical `vX.Y.Z` tag is a validation candidate only and tag
+  push alone never publishes;
+- publishing a stable, non-prerelease GitHub Release for that exact tag starts
+  the separately gated PyPI Trusted Publishing path;
+- PyPI publication completes only after the external project/version/files are
+  read back successfully; GitHub Release publication necessarily precedes that
+  eventual completion; and
+- dbCAN OCI image publication remains an independent, manual dispatch with
+  exact source-revision tags and digest readback.
+
+Untagged builds use a PEP 440 development version derived from the most recent
+canonical tag, commit distance, and source revision. Installed distribution
+metadata, `seqevi.__version__`, and `seqevi --version` report one identity.
+There is no TestPyPI or release-candidate publishing channel in the current
+contract.
+
 ## Why SeqEvi
 
 Two FASTA files do not need to be identical to reuse annotation. If a new FASTA

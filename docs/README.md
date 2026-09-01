@@ -32,6 +32,7 @@ Operators should additionally read the
 | managed OCI profiles | [profile v2.2](architecture/20260806-v2.2-execution-profile-contract.md) |
 | local/shared Store and deployment | [storage v1.8](architecture/20260831-v1.8-storage-deployment-architecture.md) |
 | managed dbCAN distribution | [managed distribution v1.2](architecture/20260806-v1.2-managed-adapter-distribution-architecture.md) |
+| release channels and version identity | [current system architecture](architecture/20260825-v1.0-current-system-architecture.md#release-channels-and-version-identity) |
 | progress | [progress v1.1](architecture/20260824-v1.1-progress-observability-contract.md) |
 | validation | [validation strategy v1.4](testing/20260825-v1.4-validation-strategy.md) |
 
@@ -71,6 +72,7 @@ workflow-dispatch-only.
 
 | Work | Status | Authority |
 | --- | --- | --- |
+| release-channel modernization | Implementation complete with final local and exact-head remote gates pending: separate CI, nightly, immutable tag-candidate validation, GitHub Release, PyPI Trusted Publishing, and manual dbCAN OCI states; no tag or publication is authorized by the plan | [implementation plan](implementation-plan/20260901-v1.0-release-channel-modernization-implementation-plan.md) |
 | artifact upload/finalization boundary | R2 is merged and included in the 0.4.0 release candidate. The final pre-merge canonical gate recorded 662 passed with zero skips, including SQLite, PostgreSQL and native 512 MiB OCI integration. No 0.4.0 publication, production deployment, migration, or new managed-kit registration has occurred | [implementation plan](implementation-plan/20260829-v1.0-artifact-upload-finalization-boundary-implementation-plan.md), [qualification](benchmarks/20260831-v1.0-native-oci-qualification.md), [integration specification](implementation-plan/20260831-v1.0-native-oci-integration-specification.md) |
 | 0.3.5 tree-review remediation | Unit 0 was completed by the initial PR #71 delivery plus a follow-up closeout reconciling the remaining README publication wording. The plan remains active for later units, which are separately pending and unauthorized | [corrected review](architecture/20260825-v1.0-seqevi-0.3.5-tree-review.md), [implementation plan](implementation-plan/20260825-v1.0-tree-review-remediation-implementation-plan.md) |
 | InterPro target-Store | v2 identity/exact-key refresh remains next before sanity | [successor plan](implementation-plan/20260820-v1.0-interpro-target-store-successor-implementation-plan.md) |
