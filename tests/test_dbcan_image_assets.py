@@ -133,6 +133,20 @@ def test_compliance_bundle_maps_gpl_artifacts_to_sources() -> None:
     assert "final-image SBOM" in correspondence
 
 
+def test_publish_workflow_requires_explicit_dispatch() -> None:
+    workflow = (ROOT / ".github/workflows/publish-dbcan-image.yml").read_text(
+        encoding="utf-8"
+    )
+
+    trigger_block = workflow.split("permissions:", 1)[0]
+    assert re.search(r"(?m)^on:\n  workflow_dispatch:\s*$", trigger_block)
+    assert "push:" not in trigger_block
+    assert "pull_request:" not in trigger_block
+    assert "schedule:" not in trigger_block
+    assert "workflow_run:" not in trigger_block
+    assert "workflow_call:" not in trigger_block
+
+
 def test_publish_workflow_uses_ghcr_attestations_without_latest() -> None:
     workflow = (ROOT / ".github/workflows/publish-dbcan-image.yml").read_text(
         encoding="utf-8"

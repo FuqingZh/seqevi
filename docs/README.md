@@ -1,7 +1,7 @@
 # SeqEvi Documentation
 
 > Status: active documentation index
-> Last updated: 2026-08-31
+> Last updated: 2026-09-01
 
 This index is the navigation authority for SeqEvi documentation. It identifies
 the current system description, current contracts, active work, incomplete
@@ -49,25 +49,29 @@ the older rules it explicitly retains.
 
 ## Current Product State
 
-SeqEvi 0.3.5 implements local and shared evidence Stores, immutable DuckDB
-results, three official host-runtime adapters, ClaimSession coordination,
-Linux external-tool containment, and managed dbCAN setup/OCI execution. Managed
-eggNOG and InterPro are not implemented.
+The SeqEvi 0.4.0 release-candidate source implements local and shared evidence
+Stores, immutable DuckDB results, three official host-runtime adapters,
+ClaimSession coordination, Linux external-tool containment, and managed dbCAN
+setup/OCI execution. Managed eggNOG and InterPro are not implemented. No 0.4.0
+Python/GitHub release, production deployment, or historical-byte migration has
+occurred.
 
 The bundled managed dbCAN kit intentionally retains its producer SeqEvi 0.3.1
-image and digest. Host 0.3.5 validates that exact kit; this is not an implicit
-upgrade.
+image and digest. The 0.4.0 candidate validates that exact kit; this is not an
+implicit upgrade.
 
-The unreleased R2 working tree additionally supports explicit native OCI-backed
-shared artifacts and acknowledged schema 0005. This is not a published 0.3.5
-feature or a production cutover. The existing managed kit remains unchanged;
-candidate-image build/verification and new-kit publication are separate gates.
+Merged R2 adds explicit native OCI-backed shared artifacts and acknowledged
+schema 0005. Workflow run `33379681393` automatically published an immutable
+0.3.5 revision image at
+`ghcr.io/fuqingzh/seqevi-dbcan@sha256:1914939f1776fee3faac5241fc84f99f4534f37e20cc4d4d48eedf491c38488a`;
+it did not register a new selectable kit. Image publication is now
+workflow-dispatch-only.
 
 ## Active Work
 
 | Work | Status | Authority |
 | --- | --- | --- |
-| artifact upload/finalization boundary | R2 close/drain and relative-path review corrections locally verified: final canonical gate 662 passed, zero skips, including SQLite, PostgreSQL and native 512 MiB OCI integration. Harbor-based `20260831-closefix2` local candidate passes runtime, source-hash and mount checks; Mako remains 1.4.1. No production deployment, migration, or SeqEvi publication | [implementation plan](implementation-plan/20260829-v1.0-artifact-upload-finalization-boundary-implementation-plan.md), [qualification](benchmarks/20260831-v1.0-native-oci-qualification.md), [integration specification](implementation-plan/20260831-v1.0-native-oci-integration-specification.md) |
+| artifact upload/finalization boundary | R2 is merged and included in the 0.4.0 release candidate. The final pre-merge canonical gate recorded 662 passed with zero skips, including SQLite, PostgreSQL and native 512 MiB OCI integration. No 0.4.0 publication, production deployment, migration, or new managed-kit registration has occurred | [implementation plan](implementation-plan/20260829-v1.0-artifact-upload-finalization-boundary-implementation-plan.md), [qualification](benchmarks/20260831-v1.0-native-oci-qualification.md), [integration specification](implementation-plan/20260831-v1.0-native-oci-integration-specification.md) |
 | 0.3.5 tree-review remediation | Unit 0 was completed by the initial PR #71 delivery plus a follow-up closeout reconciling the remaining README publication wording. The plan remains active for later units, which are separately pending and unauthorized | [corrected review](architecture/20260825-v1.0-seqevi-0.3.5-tree-review.md), [implementation plan](implementation-plan/20260825-v1.0-tree-review-remediation-implementation-plan.md) |
 | InterPro target-Store | v2 identity/exact-key refresh remains next before sanity | [successor plan](implementation-plan/20260820-v1.0-interpro-target-store-successor-implementation-plan.md) |
 | global cache seeding | eggNOG and bounded dbCAN lanes have recorded closure; global expansion remains incomplete | [master plan](implementation-plan/20260807-v1.0-shared-store-cache-seeding-implementation-plan.md) |
