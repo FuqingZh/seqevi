@@ -10,12 +10,15 @@ single-file DuckDB result for the current FASTA.
 
 ## Status
 
-SeqEvi 0.3.5 implements strict protein sequence identity, local SQLite/POSIX
-and shared HTTP/PostgreSQL/POSIX Stores, exact cache-miss orchestration, Linux
-external-tool containment, and immutable single-file DuckDB results. Python
-3.12 or newer is required; direct adapter execution requires Linux.
+The source tree is a SeqEvi 0.4.0 release candidate. It implements strict
+protein sequence identity, local SQLite/POSIX and shared HTTP/PostgreSQL Stores
+with POSIX or explicit native OCI artifact storage, exact cache-miss
+orchestration, Linux external-tool containment, and immutable single-file
+DuckDB results. Python 3.12 or newer is required; direct adapter execution
+requires Linux. SeqEvi 0.4.0 has not been tagged or published as a Python or
+GitHub release, deployed to production, or used to migrate historical bytes.
 
-SeqEvi 0.3.5 provides managed setup for dbCAN only. The `eggnog` and
+The 0.4.0 candidate provides managed setup for dbCAN only. The `eggnog` and
 `interpro-pfam` adapters remain supported through explicit runtimes and named
 host profiles; managed setup for them is later feature work.
 
@@ -107,6 +110,13 @@ seqevi annotate \
   --fasta proteins.fasta \
   --output results/dbcan.duckdb
 ```
+
+The bundled managed kit and its selectable digest are unchanged. Separately,
+an immutable SeqEvi 0.3.5 revision image was automatically published at
+`ghcr.io/fuqingzh/seqevi-dbcan@sha256:1914939f1776fee3faac5241fc84f99f4534f37e20cc4d4d48eedf491c38488a`
+from merged revision `f7781c4ce7d642ef46619e6f02c7be3745803ca4`. That
+publication did not register a new managed kit or publish SeqEvi 0.4.0; image
+publication now requires an explicit workflow dispatch.
 
 The dispatcher and cleanup boundary are covered by fixture tests. Real
 direct-candidate versus managed-v2 scientific equality and later-process replay
@@ -201,9 +211,11 @@ seqevi resource verify \
 - Exact, immutable evidence keys.
 - Explicit `eggnog`, `interpro-pfam`, and official-runtime-validated
   `dbcan-cazyme` adapters. dbCAN direct/local/shared scientific acceptance is
-  complete, and the managed runtime image publication record is accepted and
-  current. Annotation databases remain caller supplied.
-- Local SQLite/POSIX Store and shared PostgreSQL/POSIX Store service.
+  complete. The bundled managed kit is unchanged; the separately published
+  immutable 0.3.5 revision image is not a new selectable kit. Annotation
+  databases remain caller supplied.
+- Local SQLite/POSIX Store and shared PostgreSQL Store with legacy POSIX or
+  explicitly configured native OCI artifacts.
 - One self-describing DuckDB result per invocation; adapter-native normalized
   evidence remains Parquet inside the incremental Store.
 

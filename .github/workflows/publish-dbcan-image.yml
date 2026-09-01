@@ -1,16 +1,6 @@
 name: Publish dbCAN runtime image
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - containers/dbcan/**
-      - src/**
-      - pyproject.toml
-      - pdm.lock
-      - README.md
-      - LICENSE
-      - .github/workflows/publish-dbcan-image.yml
   workflow_dispatch:
 
 permissions:
