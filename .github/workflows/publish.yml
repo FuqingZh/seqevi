@@ -45,10 +45,10 @@ jobs:
         env:
           EXPECTED_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          test "$(python scripts/release_contract.py tag "v${EXPECTED_VERSION}")" = "${EXPECTED_VERSION}"
-          python scripts/release_contract.py artifacts \
+          test "$(pdm run python scripts/release_contract.py tag "v${EXPECTED_VERSION}")" = "${EXPECTED_VERSION}"
+          pdm run python scripts/release_contract.py artifacts \
             --dist-dir dist --expected-version "${EXPECTED_VERSION}"
-          python -m twine check dist/*
+          pdm run python -m twine check dist/*
       - name: Smoke-test wheel and source distribution
         env:
           EXPECTED_VERSION: ${{ steps.release.outputs.version }}

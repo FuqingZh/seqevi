@@ -166,7 +166,9 @@ def test_nightly_is_finite_validation_without_publication_authority() -> None:
     assert "ref: main" in workflow
     assert "fetch-depth: 0" in workflow
     assert "pdm run check" in workflow
-    assert "python -m twine check dist/*" in workflow
+    assert "pdm run python -m twine check dist/*" in workflow
+    assert "--expected-version" in workflow
+    assert "--development-source" in workflow
     assert "name: nightly-${{ steps.source.outputs.sha }}" in workflow
     assert "retention-days: 14" in workflow
     assert "id-token: write" not in workflow
@@ -185,5 +187,7 @@ def test_dbcan_publication_remains_manual_and_python_release_independent() -> No
     assert "release:" not in trigger_block
     assert "push:" not in trigger_block
     assert "steps.project.outputs.version" in workflow
+    assert "steps.project.outputs.tag_version" in workflow
+    assert 'tag_version="${version//+/-}"' in workflow
     assert "rev-${{ github.sha }}" in workflow
     assert "org.opencontainers.image.revision" in workflow

@@ -36,6 +36,7 @@ def test_source_and_package_inputs_run_all_ci_jobs() -> None:
         "pyproject.toml",
         "README.md",
         "pdm.lock",
+        "scripts/version.py",
         "scripts/ci_change_scope.py",
         ".github/workflows/ci.yml",
     ):

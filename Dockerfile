@@ -12,6 +12,8 @@ WORKDIR /opt/seqevi
 
 RUN python -m pip install --no-cache-dir "pdm==${PDM_VERSION}"
 
+RUN test -n "${VERSION}"
+
 COPY pyproject.toml pdm.lock README.md LICENSE ./
 COPY scripts/__init__.py scripts/version.py ./scripts/
 COPY src ./src

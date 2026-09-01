@@ -174,4 +174,6 @@ def test_publish_workflow_uses_ghcr_attestations_without_latest() -> None:
     assert "database_url" not in workflow.casefold()
     assert "resource_url" not in workflow.casefold()
     assert "steps.project.outputs.version" in workflow
+    assert "steps.project.outputs.tag_version" in workflow
+    assert 'tag_version="${version//+/-}"' in workflow
     assert "seqevi-0.2.0" not in workflow

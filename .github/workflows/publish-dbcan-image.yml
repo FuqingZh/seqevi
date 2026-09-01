@@ -28,7 +28,12 @@ jobs:
       - run: pdm build
       - name: Read project version
         id: project
-        run: echo "version=$(pdm show --version)" >> "${GITHUB_OUTPUT}"
+        run: |
+          version="$(pdm show --version)"
+          tag_version="${version//+/-}"
+          [[ "${tag_version}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag_version=${tag_version}" >> "${GITHUB_OUTPUT}"
       - name: Prepare exact-revision wheel context
         run: |
           mkdir -p "${RUNNER_TEMP}/seqevi-wheel"
@@ -78,7 +83,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/fuqingzh/seqevi-dbcan:${{ steps.project.outputs.version }}-rev-${{ github.sha }}
+            ghcr.io/fuqingzh/seqevi-dbcan:${{ steps.project.outputs.tag_version }}-rev-${{ github.sha }}
             ghcr.io/fuqingzh/seqevi-dbcan:rev-${{ github.sha }}
           sbom: true
           provenance: mode=max
