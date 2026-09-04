@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, NoReturn, TextIO
+from typing import Annotated, Literal, NoReturn, TextIO
 
 import typer
 from rich.console import Console, Group, RenderableType
@@ -809,6 +809,59 @@ def serve_command(
             help="Writable POSIX directory for content-addressed artifacts.",
         ),
     ],
+    artifact_backend: Annotated[
+        Literal["legacy-posix", "oci-registry"],
+        typer.Option(
+            "--artifact-backend",
+            envvar="SEQEVI_ARTIFACT_BACKEND",
+            help="Artifact storage backend for new shared artifacts.",
+        ),
+    ] = "legacy-posix",
+    oci_registry_id: Annotated[
+        str | None,
+        typer.Option("--oci-registry-id", envvar="SEQEVI_OCI_REGISTRY_ID"),
+    ] = None,
+    oci_registry_endpoint: Annotated[
+        str | None,
+        typer.Option("--oci-registry-endpoint", envvar="SEQEVI_OCI_REGISTRY_ENDPOINT"),
+    ] = None,
+    oci_registry_repository: Annotated[
+        str | None,
+        typer.Option(
+            "--oci-registry-repository",
+            envvar="SEQEVI_OCI_REGISTRY_REPOSITORY",
+        ),
+    ] = None,
+    oci_oras_executable: Annotated[
+        Path | None,
+        typer.Option(
+            "--oci-oras-executable",
+            envvar="SEQEVI_OCI_ORAS_EXECUTABLE",
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
+    oci_registry_config: Annotated[
+        Path | None,
+        typer.Option(
+            "--oci-registry-config",
+            envvar="SEQEVI_OCI_REGISTRY_CONFIG",
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
+    oci_registry_ca_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--oci-registry-ca-file",
+            envvar="SEQEVI_OCI_REGISTRY_CA_FILE",
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
     host: Annotated[
         str,
         typer.Option("--host", help="HTTP bind address."),
@@ -826,7 +879,7 @@ def serve_command(
         typer.Option("--maximum-artifact-bytes", min=1),
     ] = 512 * 1024 * 1024,
 ) -> None:
-    """Run the passive PostgreSQL/POSIX shared Store service."""
+    """Run the passive PostgreSQL shared Store service."""
 
     try:
         import uvicorn
@@ -840,6 +893,13 @@ def serve_command(
         settings = ServiceSettings(
             database_url=database_url,
             artifacts_dir=artifacts_dir,
+            artifact_backend=artifact_backend,
+            oci_registry_id=oci_registry_id,
+            oci_registry_endpoint=oci_registry_endpoint,
+            oci_registry_repository=oci_registry_repository,
+            oci_oras_executable=oci_oras_executable,
+            oci_registry_config=oci_registry_config,
+            oci_registry_ca_file=oci_registry_ca_file,
             maximum_batch_size=maximum_batch_size,
             maximum_artifact_bytes=maximum_artifact_bytes,
         )

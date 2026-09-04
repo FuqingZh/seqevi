@@ -37,21 +37,23 @@ def test_publish_workflow_preserves_trusted_publisher_boundaries() -> None:
 
 def test_systemd_unit_is_loopback_only_and_mount_guarded() -> None:
     unit = (ROOT / "deploy/systemd/seqevi-store.service").read_text(encoding="utf-8")
+    launcher = (ROOT / "deploy/systemd/run-store-container").read_text(encoding="utf-8")
 
-    assert "--network host" in unit
-    assert "serve --host 127.0.0.1 --port 18081" in unit
+    assert "ExecStart=%h/.local/libexec/seqevi/run-store-container" in unit
+    assert "--network host" in launcher
+    assert "serve --host 127.0.0.1 --port 18081" in launcher
     assert "Environment=DOCKER_HOST=unix:///var/run/docker.sock" in unit
     assert "/usr/bin/test -S /var/run/docker.sock" in unit
     assert "/usr/bin/docker info" in unit
     assert "verify-artifacts-mount" in unit
     assert "verify-image-reference" in unit
     assert unit.index("verify-image-reference") < unit.index("docker image inspect")
-    assert "--user ${SEQEVI_UID}:${SEQEVI_GID}" in unit
-    assert "SEQEVI_HEALTH_URL=http://127.0.0.1:18081/health" in unit
-    assert "--read-only" in unit
-    assert "--cap-drop ALL" in unit
-    assert "--security-opt no-new-privileges" in unit
-    assert "--env SEQEVI_DATABASE_URL" in unit
+    assert '--user "${SEQEVI_UID}:${SEQEVI_GID}"' in launcher
+    assert "SEQEVI_HEALTH_URL=http://127.0.0.1:18081/health" in launcher
+    assert "--read-only" in launcher
+    assert "--cap-drop ALL" in launcher
+    assert "--security-opt no-new-privileges" in launcher
+    assert "--env SEQEVI_DATABASE_URL" in launcher
     for setting in (
         "SEQEVI_DATABASE_POOL_SIZE",
         "SEQEVI_DATABASE_MAX_OVERFLOW",
@@ -60,8 +62,32 @@ def test_systemd_unit_is_loopback_only_and_mount_guarded() -> None:
         "SEQEVI_DATABASE_STATEMENT_TIMEOUT_SECONDS",
         "SEQEVI_DATABASE_TRANSACTION_TIMEOUT_SECONDS",
     ):
-        assert f"--env {setting}" in unit
+        assert f"--env {setting}" in launcher
     assert "EnvironmentFile=%h/.config/seqevi/seqevi-store.env" in unit
+
+
+def test_systemd_launcher_mounts_oci_inputs_only_for_explicit_oci_mode() -> None:
+    launcher = (ROOT / "deploy/systemd/run-store-container").read_text(encoding="utf-8")
+    environment = (ROOT / "deploy/systemd/seqevi-store.env.example").read_text(
+        encoding="utf-8"
+    )
+
+    assert "artifact_backend=${SEQEVI_ARTIFACT_BACKEND:-legacy-posix}" in launcher
+    assert "oci-registry)" in launcher
+    for setting in (
+        "SEQEVI_OCI_REGISTRY_ID",
+        "SEQEVI_OCI_REGISTRY_ENDPOINT",
+        "SEQEVI_OCI_REGISTRY_REPOSITORY",
+        "SEQEVI_OCI_ORAS_EXECUTABLE",
+        "SEQEVI_OCI_REGISTRY_CONFIG",
+        "SEQEVI_OCI_REGISTRY_CA_FILE",
+    ):
+        assert setting in launcher
+        assert setting in environment
+    assert "dst=/run/seqevi/oras,readonly" in launcher
+    assert "dst=/run/seqevi/registry-config.json,readonly" in launcher
+    assert "dst=/run/seqevi/registry-ca.pem,readonly" in launcher
+    assert "SEQEVI_ARTIFACT_BACKEND=legacy-posix" in environment
 
 
 def test_httpd_ingress_exposes_only_loopback_http_store() -> None:
@@ -184,7 +210,11 @@ def test_user_asset_install_preserves_secret_and_updates_example(
     assert (home / ".config/systemd/user/seqevi-store.service").read_bytes() == (
         ROOT / "deploy/systemd/seqevi-store.service"
     ).read_bytes()
-    for helper in ("verify-artifacts-mount", "verify-image-reference"):
+    for helper in (
+        "verify-artifacts-mount",
+        "verify-image-reference",
+        "run-store-container",
+    ):
         assert (home / f".local/libexec/seqevi/{helper}").read_bytes() == (
             ROOT / f"deploy/systemd/{helper}"
         ).read_bytes()

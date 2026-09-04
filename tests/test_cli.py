@@ -175,10 +175,102 @@ def test_serve_help_exposes_only_deployment_inputs() -> None:
     assert result.exit_code == 0
     assert "--database-url" in help_text
     assert "--artifacts-dir" in help_text
+    assert "--artifact-backend" in help_text
+    assert "--oci-registry-id" in help_text
+    assert "--oci-registry-endpoint" in help_text
+    assert "--oci-registry-repository" in help_text
+    assert "--oci-oras-executable" in help_text
+    assert "--oci-registry-config" in help_text
+    assert "--oci-registry-ca-file" in help_text
     assert "--maximum-batch-size" in help_text
     assert "--maximum-artifact-bytes" in help_text
     assert "--adapter" not in help_text
     assert "--fasta" not in help_text
+
+
+def test_serve_passes_validated_oci_environment_to_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import seqevi.service
+    import uvicorn
+
+    captured: list[object] = []
+    oras = tmp_path / "oras"
+    config = tmp_path / "config.json"
+    ca_file = tmp_path / "ca.pem"
+    for path in (oras, config, ca_file):
+        path.write_text("fixture", encoding="utf-8")
+
+    monkeypatch.setattr(
+        seqevi.service,
+        "create_service_app",
+        lambda settings: captured.append(settings) or object(),
+    )
+    monkeypatch.setattr(seqevi.service, "configure_claim_logging", lambda: None)
+    monkeypatch.setattr(uvicorn, "run", lambda *_args, **_kwargs: None)
+    result = runner.invoke(
+        app,
+        ["serve"],
+        env={
+            "SEQEVI_DATABASE_URL": "postgresql://seqevi@postgres/seqevi",
+            "SEQEVI_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+            "SEQEVI_ARTIFACT_BACKEND": "oci-registry",
+            "SEQEVI_OCI_REGISTRY_ID": "primary",
+            "SEQEVI_OCI_REGISTRY_ENDPOINT": "https://registry.example.org",
+            "SEQEVI_OCI_REGISTRY_REPOSITORY": "seqevi/artifacts",
+            "SEQEVI_OCI_ORAS_EXECUTABLE": str(oras),
+            "SEQEVI_OCI_REGISTRY_CONFIG": str(config),
+            "SEQEVI_OCI_REGISTRY_CA_FILE": str(ca_file),
+        },
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1
+    settings = captured[0]
+    assert isinstance(settings, seqevi.service.ServiceSettings)
+    assert settings.artifact_backend == "oci-registry"
+    registry = settings.registry_definition()
+    assert registry is not None
+    assert registry.model_dump() == {
+        "id": "primary",
+        "endpoint": "https://registry.example.org",
+        "repository": "seqevi/artifacts",
+    }
+    assert settings.oci_oras_executable == oras.resolve()
+    assert settings.oci_registry_config == config.resolve()
+    assert settings.oci_registry_ca_file == ca_file.resolve()
+
+
+def test_serve_keeps_legacy_backend_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import seqevi.service
+    import uvicorn
+
+    captured: list[object] = []
+    monkeypatch.setattr(
+        seqevi.service,
+        "create_service_app",
+        lambda settings: captured.append(settings) or object(),
+    )
+    monkeypatch.setattr(seqevi.service, "configure_claim_logging", lambda: None)
+    monkeypatch.setattr(uvicorn, "run", lambda *_args, **_kwargs: None)
+    result = runner.invoke(
+        app,
+        [
+            "serve",
+            "--database-url",
+            "postgresql://seqevi@postgres/seqevi",
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    settings = captured[0]
+    assert isinstance(settings, seqevi.service.ServiceSettings)
+    assert settings.artifact_backend == "legacy-posix"
+    assert settings.registry_definition() is None
 
 
 def test_annotate_cli_runs_injected_adapter(
