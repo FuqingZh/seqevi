@@ -241,6 +241,53 @@ def test_serve_passes_validated_oci_environment_to_service(
     assert settings.oci_registry_ca_file == ca_file.resolve()
 
 
+@pytest.mark.parametrize(
+    "relative_setting",
+    (
+        "SEQEVI_OCI_ORAS_EXECUTABLE",
+        "SEQEVI_OCI_REGISTRY_CONFIG",
+        "SEQEVI_OCI_REGISTRY_CA_FILE",
+    ),
+)
+def test_serve_rejects_relative_oci_service_paths_before_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_setting: str,
+) -> None:
+    import seqevi.service
+
+    started: list[object] = []
+    absolute_paths = {
+        "SEQEVI_OCI_ORAS_EXECUTABLE": str(tmp_path / "oras"),
+        "SEQEVI_OCI_REGISTRY_CONFIG": str(tmp_path / "config.json"),
+        "SEQEVI_OCI_REGISTRY_CA_FILE": str(tmp_path / "ca.pem"),
+    }
+    absolute_paths[relative_setting] = "relative-input"
+    monkeypatch.setattr(
+        seqevi.service,
+        "create_service_app",
+        lambda settings: started.append(settings) or object(),
+    )
+    result = runner.invoke(
+        app,
+        ["serve"],
+        env={
+            "SEQEVI_DATABASE_URL": "postgresql://seqevi@postgres/seqevi",
+            "SEQEVI_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+            "SEQEVI_ARTIFACT_BACKEND": "oci-registry",
+            "SEQEVI_OCI_REGISTRY_ID": "primary",
+            "SEQEVI_OCI_REGISTRY_ENDPOINT": "https://registry.example.org",
+            "SEQEVI_OCI_REGISTRY_REPOSITORY": "seqevi/artifacts",
+            **absolute_paths,
+        },
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, ValueError)
+    assert "service OCI file paths must be absolute" in str(result.exception)
+    assert started == []
+
+
 def test_serve_keeps_legacy_backend_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

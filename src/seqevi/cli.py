@@ -839,7 +839,6 @@ def serve_command(
             envvar="SEQEVI_OCI_ORAS_EXECUTABLE",
             file_okay=True,
             dir_okay=False,
-            resolve_path=True,
         ),
     ] = None,
     oci_registry_config: Annotated[
@@ -849,7 +848,6 @@ def serve_command(
             envvar="SEQEVI_OCI_REGISTRY_CONFIG",
             file_okay=True,
             dir_okay=False,
-            resolve_path=True,
         ),
     ] = None,
     oci_registry_ca_file: Annotated[
@@ -859,7 +857,6 @@ def serve_command(
             envvar="SEQEVI_OCI_REGISTRY_CA_FILE",
             file_okay=True,
             dir_okay=False,
-            resolve_path=True,
         ),
     ] = None,
     host: Annotated[
