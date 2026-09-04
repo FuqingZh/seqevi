@@ -201,6 +201,69 @@ def test_systemd_launcher_rejects_relative_host_oci_paths_before_docker(
     assert not docker_marker.exists()
 
 
+@pytest.mark.parametrize(
+    "directory_setting",
+    (
+        "SEQEVI_OCI_ORAS_EXECUTABLE",
+        "SEQEVI_OCI_REGISTRY_CONFIG",
+        "SEQEVI_OCI_REGISTRY_CA_FILE",
+    ),
+)
+def test_systemd_launcher_rejects_oci_directories_before_docker(
+    tmp_path: Path,
+    directory_setting: str,
+) -> None:
+    launcher = tmp_path / "run-store-container"
+    docker_marker = tmp_path / "docker-invoked"
+    launcher.write_text(
+        (ROOT / "deploy/systemd/run-store-container")
+        .read_text(encoding="utf-8")
+        .replace(
+            'exec /usr/bin/docker "$@"',
+            'touch "$SEQEVI_TEST_DOCKER_MARKER"',
+        ),
+        encoding="utf-8",
+    )
+    launcher.chmod(0o700)
+    oras = tmp_path / "oras"
+    config = tmp_path / "config.json"
+    ca_file = tmp_path / "ca.pem"
+    for path in (oras, config, ca_file):
+        path.write_text("fixture", encoding="utf-8")
+    oras.chmod(0o700)
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    oci_paths = {
+        "SEQEVI_OCI_ORAS_EXECUTABLE": str(oras),
+        "SEQEVI_OCI_REGISTRY_CONFIG": str(config),
+        "SEQEVI_OCI_REGISTRY_CA_FILE": str(ca_file),
+    }
+    oci_paths[directory_setting] = str(directory)
+    result = subprocess.run(
+        (str(launcher),),
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "SEQEVI_ARTIFACT_BACKEND": "oci-registry",
+            "SEQEVI_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+            "SEQEVI_UID": "1000",
+            "SEQEVI_GID": "1000",
+            "SEQEVI_IMAGE": "registry.example/seqevi@sha256:fixture",
+            "SEQEVI_OCI_REGISTRY_ID": "primary",
+            "SEQEVI_OCI_REGISTRY_ENDPOINT": "https://registry.example.org",
+            "SEQEVI_OCI_REGISTRY_REPOSITORY": "seqevi/artifacts",
+            "SEQEVI_TEST_DOCKER_MARKER": str(docker_marker),
+            **oci_paths,
+        },
+    )
+
+    assert result.returncode == 1
+    assert "OCI host file paths must be regular files" in result.stderr
+    assert not docker_marker.exists()
+
+
 def test_httpd_ingress_exposes_only_loopback_http_store() -> None:
     config = (ROOT / "deploy/httpd/seqevi-store.conf").read_text(encoding="utf-8")
 
