@@ -4,6 +4,16 @@ set -eu
 
 artifact_backend=${SEQEVI_ARTIFACT_BACKEND:-legacy-posix}
 
+require_absolute_oci_path() {
+    case "$1" in
+        /*) ;;
+        *)
+            echo "OCI host file paths must be absolute" >&2
+            exit 1
+            ;;
+    esac
+}
+
 set -- run --name seqevi-store --network host --read-only --init \
     --user "${SEQEVI_UID}:${SEQEVI_GID}" \
     --cap-drop ALL --security-opt no-new-privileges \
@@ -37,6 +47,8 @@ case "$artifact_backend" in
         : "${SEQEVI_OCI_REGISTRY_REPOSITORY:?OCI Registry repository is required}"
         : "${SEQEVI_OCI_ORAS_EXECUTABLE:?absolute host ORAS path is required}"
         : "${SEQEVI_OCI_REGISTRY_CONFIG:?absolute host Registry config path is required}"
+        require_absolute_oci_path "$SEQEVI_OCI_ORAS_EXECUTABLE"
+        require_absolute_oci_path "$SEQEVI_OCI_REGISTRY_CONFIG"
         test -x "$SEQEVI_OCI_ORAS_EXECUTABLE"
         test -r "$SEQEVI_OCI_REGISTRY_CONFIG"
         set -- "$@" \
@@ -49,6 +61,7 @@ case "$artifact_backend" in
             --env SEQEVI_OCI_ORAS_EXECUTABLE=/run/seqevi/oras \
             --env SEQEVI_OCI_REGISTRY_CONFIG=/run/seqevi/registry-config.json
         if [ -n "${SEQEVI_OCI_REGISTRY_CA_FILE:-}" ]; then
+            require_absolute_oci_path "$SEQEVI_OCI_REGISTRY_CA_FILE"
             test -r "$SEQEVI_OCI_REGISTRY_CA_FILE"
             set -- "$@" \
                 --mount "type=bind,src=${SEQEVI_OCI_REGISTRY_CA_FILE},dst=/run/seqevi/registry-ca.pem,readonly" \
