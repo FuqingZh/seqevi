@@ -90,6 +90,55 @@ def test_systemd_launcher_mounts_oci_inputs_only_for_explicit_oci_mode() -> None
     assert "SEQEVI_ARTIFACT_BACKEND=legacy-posix" in environment
 
 
+@pytest.mark.parametrize(
+    "oci_setting",
+    (
+        "SEQEVI_OCI_REGISTRY_ID",
+        "SEQEVI_OCI_REGISTRY_ENDPOINT",
+        "SEQEVI_OCI_REGISTRY_REPOSITORY",
+        "SEQEVI_OCI_ORAS_EXECUTABLE",
+        "SEQEVI_OCI_REGISTRY_CONFIG",
+        "SEQEVI_OCI_REGISTRY_CA_FILE",
+    ),
+)
+def test_systemd_launcher_rejects_oci_settings_in_legacy_mode_before_docker(
+    tmp_path: Path,
+    oci_setting: str,
+) -> None:
+    launcher = tmp_path / "run-store-container"
+    docker_marker = tmp_path / "docker-invoked"
+    launcher.write_text(
+        (ROOT / "deploy/systemd/run-store-container")
+        .read_text(encoding="utf-8")
+        .replace(
+            'exec /usr/bin/docker "$@"',
+            'touch "$SEQEVI_TEST_DOCKER_MARKER"',
+        ),
+        encoding="utf-8",
+    )
+    launcher.chmod(0o700)
+    result = subprocess.run(
+        (str(launcher),),
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "SEQEVI_ARTIFACT_BACKEND": "legacy-posix",
+            "SEQEVI_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+            "SEQEVI_UID": "1000",
+            "SEQEVI_GID": "1000",
+            "SEQEVI_IMAGE": "registry.example/seqevi@sha256:fixture",
+            "SEQEVI_TEST_DOCKER_MARKER": str(docker_marker),
+            oci_setting: "configured",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "OCI settings require SEQEVI_ARTIFACT_BACKEND=oci-registry" in result.stderr
+    assert not docker_marker.exists()
+
+
 def test_httpd_ingress_exposes_only_loopback_http_store() -> None:
     config = (ROOT / "deploy/httpd/seqevi-store.conf").read_text(encoding="utf-8")
 

@@ -21,6 +21,15 @@ set -- run --name seqevi-store --network host --read-only --init \
 
 case "$artifact_backend" in
     legacy-posix)
+        if [ -n "${SEQEVI_OCI_REGISTRY_ID:-}" ] \
+            || [ -n "${SEQEVI_OCI_REGISTRY_ENDPOINT:-}" ] \
+            || [ -n "${SEQEVI_OCI_REGISTRY_REPOSITORY:-}" ] \
+            || [ -n "${SEQEVI_OCI_ORAS_EXECUTABLE:-}" ] \
+            || [ -n "${SEQEVI_OCI_REGISTRY_CONFIG:-}" ] \
+            || [ -n "${SEQEVI_OCI_REGISTRY_CA_FILE:-}" ]; then
+            echo "OCI settings require SEQEVI_ARTIFACT_BACKEND=oci-registry" >&2
+            exit 1
+        fi
         ;;
     oci-registry)
         : "${SEQEVI_OCI_REGISTRY_ID:?OCI Registry id is required}"
