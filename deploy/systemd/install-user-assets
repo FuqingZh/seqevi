@@ -24,3 +24,5 @@ install -m 0755 "$source_dir/verify-artifacts-mount" \
     "$libexec_dir/verify-artifacts-mount"
 install -m 0755 "$source_dir/verify-image-reference" \
     "$libexec_dir/verify-image-reference"
+install -m 0755 "$source_dir/run-store-container" \
+    "$libexec_dir/run-store-container"

@@ -1,0 +1,88 @@
+#!/bin/sh
+
+set -eu
+
+artifact_backend=${SEQEVI_ARTIFACT_BACKEND:-legacy-posix}
+
+require_absolute_oci_path() {
+    case "$1" in
+        /*) ;;
+        *)
+            echo "OCI host file paths must be absolute" >&2
+            exit 1
+            ;;
+    esac
+}
+
+require_regular_oci_file() {
+    if [ ! -f "$1" ]; then
+        echo "OCI host file paths must be regular files" >&2
+        exit 1
+    fi
+}
+
+set -- run --name seqevi-store --network host --read-only --init \
+    --user "${SEQEVI_UID}:${SEQEVI_GID}" \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --tmpfs /tmp:rw,nosuid,nodev,noexec,size=64m \
+    --mount "type=bind,src=${SEQEVI_ARTIFACTS_DIR},dst=/var/lib/seqevi/artifacts" \
+    --env SEQEVI_DATABASE_URL \
+    --env SEQEVI_DATABASE_POOL_SIZE \
+    --env SEQEVI_DATABASE_MAX_OVERFLOW \
+    --env SEQEVI_DATABASE_POOL_TIMEOUT_SECONDS \
+    --env SEQEVI_DATABASE_LOCK_TIMEOUT_SECONDS \
+    --env SEQEVI_DATABASE_STATEMENT_TIMEOUT_SECONDS \
+    --env SEQEVI_DATABASE_TRANSACTION_TIMEOUT_SECONDS \
+    --env SEQEVI_ARTIFACTS_DIR=/var/lib/seqevi/artifacts \
+    --env SEQEVI_HEALTH_URL=http://127.0.0.1:18081/health
+
+case "$artifact_backend" in
+    legacy-posix)
+        if [ -n "${SEQEVI_OCI_REGISTRY_ID:-}" ] \
+            || [ -n "${SEQEVI_OCI_REGISTRY_ENDPOINT:-}" ] \
+            || [ -n "${SEQEVI_OCI_REGISTRY_REPOSITORY:-}" ] \
+            || [ -n "${SEQEVI_OCI_ORAS_EXECUTABLE:-}" ] \
+            || [ -n "${SEQEVI_OCI_REGISTRY_CONFIG:-}" ] \
+            || [ -n "${SEQEVI_OCI_REGISTRY_CA_FILE:-}" ]; then
+            echo "OCI settings require SEQEVI_ARTIFACT_BACKEND=oci-registry" >&2
+            exit 1
+        fi
+        ;;
+    oci-registry)
+        : "${SEQEVI_OCI_REGISTRY_ID:?OCI Registry id is required}"
+        : "${SEQEVI_OCI_REGISTRY_ENDPOINT:?OCI Registry endpoint is required}"
+        : "${SEQEVI_OCI_REGISTRY_REPOSITORY:?OCI Registry repository is required}"
+        : "${SEQEVI_OCI_ORAS_EXECUTABLE:?absolute host ORAS path is required}"
+        : "${SEQEVI_OCI_REGISTRY_CONFIG:?absolute host Registry config path is required}"
+        require_absolute_oci_path "$SEQEVI_OCI_ORAS_EXECUTABLE"
+        require_absolute_oci_path "$SEQEVI_OCI_REGISTRY_CONFIG"
+        require_regular_oci_file "$SEQEVI_OCI_ORAS_EXECUTABLE"
+        require_regular_oci_file "$SEQEVI_OCI_REGISTRY_CONFIG"
+        test -x "$SEQEVI_OCI_ORAS_EXECUTABLE"
+        test -r "$SEQEVI_OCI_REGISTRY_CONFIG"
+        set -- "$@" \
+            --mount "type=bind,src=${SEQEVI_OCI_ORAS_EXECUTABLE},dst=/run/seqevi/oras,readonly" \
+            --mount "type=bind,src=${SEQEVI_OCI_REGISTRY_CONFIG},dst=/run/seqevi/registry-config.json,readonly" \
+            --env SEQEVI_ARTIFACT_BACKEND=oci-registry \
+            --env SEQEVI_OCI_REGISTRY_ID \
+            --env SEQEVI_OCI_REGISTRY_ENDPOINT \
+            --env SEQEVI_OCI_REGISTRY_REPOSITORY \
+            --env SEQEVI_OCI_ORAS_EXECUTABLE=/run/seqevi/oras \
+            --env SEQEVI_OCI_REGISTRY_CONFIG=/run/seqevi/registry-config.json
+        if [ -n "${SEQEVI_OCI_REGISTRY_CA_FILE:-}" ]; then
+            require_absolute_oci_path "$SEQEVI_OCI_REGISTRY_CA_FILE"
+            require_regular_oci_file "$SEQEVI_OCI_REGISTRY_CA_FILE"
+            test -r "$SEQEVI_OCI_REGISTRY_CA_FILE"
+            set -- "$@" \
+                --mount "type=bind,src=${SEQEVI_OCI_REGISTRY_CA_FILE},dst=/run/seqevi/registry-ca.pem,readonly" \
+                --env SEQEVI_OCI_REGISTRY_CA_FILE=/run/seqevi/registry-ca.pem
+        fi
+        ;;
+    *)
+        echo "unsupported SEQEVI_ARTIFACT_BACKEND: $artifact_backend" >&2
+        exit 1
+        ;;
+esac
+
+set -- "$@" "$SEQEVI_IMAGE" serve --host 127.0.0.1 --port 18081
+exec /usr/bin/docker "$@"
